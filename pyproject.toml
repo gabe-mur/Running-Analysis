@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garmin-run-analysis"
+version = "0.1.0"
+description = "Local, weather-adjusted analysis of Garmin running TCX history"
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+    "numpy>=2.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "python-multipart>=0.0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.28"]
+
+[project.scripts]
+run-analysis = "run_analysis.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["run_analysis*"]
+
+[tool.setuptools.package-data]
+"run_analysis.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

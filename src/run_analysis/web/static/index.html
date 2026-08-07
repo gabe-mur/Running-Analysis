@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Running Coach</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#dashboard"><span class="brand-mark">RC</span>Running Coach</a>
+      <nav aria-label="Primary navigation">
+        <a data-route="dashboard" href="#dashboard">Dashboard</a>
+        <a data-route="progress" href="#progress">Progress</a>
+        <a data-route="runs" href="#runs">Runs</a>
+        <a data-route="next-run" href="#next-run">Week Plan</a>
+        <a data-route="settings" href="#settings">Settings</a>
+      </nav>
+      <button id="upload-button" class="primary-button" type="button">Upload Run</button>
+      <input id="upload-input" type="file" accept=".tcx,application/xml,text/xml" multiple hidden>
+    </header>
+    <main id="app-view" tabindex="-1"></main>
+    <aside id="upload-panel" class="upload-panel" hidden aria-live="polite">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Upload pipeline</p>
+          <h2>Processing TCX files</h2>
+        </div>
+        <button id="upload-close" class="icon-button" type="button" aria-label="Close">×</button>
+      </div>
+      <p id="upload-summary">Reading files…</p>
+      <ol id="upload-stages"></ol>
+    </aside>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

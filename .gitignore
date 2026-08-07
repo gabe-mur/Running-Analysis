@@ -1,0 +1,44 @@
+# Personal configuration and athlete metadata
+/config.yaml
+/config.local.yaml
+/run_overrides*.csv
+!/run_overrides.example.csv
+/.env
+/.env.*
+!/.env.example
+
+# Private activity data and generated local state
+/TCX/
+/uploads/
+/data/
+/output/
+/docs/local/
+*.tcx
+*.fit
+*.gpx
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.xlsx
+
+# Python environments, caches, coverage, and builds
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating-system metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp

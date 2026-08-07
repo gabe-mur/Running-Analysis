@@ -1,0 +1,141 @@
+# Copy this file to config.yaml and adjust it for the athlete.
+max_hr: 190
+resting_hr: 55
+target_hr: 145
+
+zones:
+  z1: [125, 138]
+  z2: [139, 152]
+  z3: [153, 165]
+  z4: [166, 178]
+  z5: [179, 190]
+
+reference_conditions:
+  temperature_f: 55
+  dewpoint_f: 45
+  wind_mph: 3
+  grade_percent: 0
+  within_run_minutes: 20
+
+segment_distance_miles: 0.25
+timezone_default: UTC
+
+paths:
+  database: data/run_analysis.sqlite
+  report: output/report.html
+  weather_cache: data/weather_cache
+  overrides: run_overrides.csv
+
+moving_time:
+  minimum_running_speed_mps: 0.8
+  stopped_speed_mps: 0.35
+  gps_stopped_speed_mps: 0.8
+  stopped_distance_meters: 1.5
+  maximum_interval_seconds: 30
+  minimum_stop_seconds: 5
+  maximum_plausible_speed_mps: 12
+
+elevation:
+  smoothing_window_meters: 60
+  grade_cost_window_meters: 60
+  minimum_gain_change_meters: 0.5
+  minimum_grade_distance_meters: 100
+  maximum_plausible_grade_percent: 12
+
+segmentation:
+  minimum_final_segment_fraction: 0.5
+  minimum_plausible_pace_min_mile: 3
+  maximum_plausible_pace_min_mile: 30
+  minimum_bearing_distance_meters: 20
+
+model:
+  window_seconds: 300
+  window_sensitivity_seconds: [60, 120, 180, 240, 300]
+  primary_window_seconds: 120
+  primary_window_stride_seconds: 60
+  primary_hr_weight_scale_bpm: 10
+  primary_time_weight_scale_minutes: 15
+  primary_hr_change_weight_scale_bpm: 8
+  primary_speed_change_weight_scale_fraction: 0.20
+  primary_maximum_effective_windows: 8
+  maximum_reference_extrapolation_minutes: 5
+  reference_extrapolation_uncertainty_scale_minutes: 1
+  fixed_heat_loss_fraction_per_c: 0.002
+  fixed_heat_loss_uncertainty_fraction_per_c: 0.002
+  heat_personal_match_max_days: 56
+  heat_personal_match_min_wbgt_delta_c: 3
+  heat_personal_minimum_se_fraction_per_c: 0.0005
+  grouped_cv_folds: 5
+  ridge_alpha: 1.0
+  minimum_cv_improvement_seconds_per_mile: 2.0
+  run_effect_max_effective_segments: 4
+  steady_benchmark_window_seconds: 120
+  steady_benchmark_reference_minutes: 20
+  steady_benchmark_maximum_reference_offset_minutes: 2.5
+  steady_benchmark_minimum_minutes: 10
+  steady_benchmark_maximum_minutes: 35
+  steady_benchmark_minimum_hr_bpm: 140
+  steady_benchmark_maximum_hr_bpm: 150
+  steady_benchmark_maximum_hr_change_bpm: 6
+  steady_benchmark_maximum_hr_range_bpm: 15
+  steady_benchmark_maximum_speed_change_fraction: 0.15
+  steady_benchmark_maximum_stopped_seconds: 5
+  minimum_run_miles: 1.5
+  maximum_stop_fraction: 0.35
+  minimum_hr_coverage: 0.8
+  minimum_gps_coverage: 0.8
+  device_distance_fallback_uncertainty_seconds_per_mile: 30
+  estimated_weather_location_uncertainty_seconds_per_mile: 10
+  minimum_reliable_segment_minutes: 5
+  maximum_reliable_segment_minutes: 60
+  minimum_reliable_hr_bpm: 125
+  maximum_reliable_hr_bpm: 165
+  maximum_reliable_segment_stop_fraction: 0.15
+  random_seed: 145
+
+activity_classification:
+  high_confidence_walk_pace_min_mile: 18
+  high_confidence_walk_cadence_max: 55
+  high_confidence_bike_pace_min_mile: 5.5
+  review_slow_pace_min_mile: 13
+  review_low_cadence_max: 70
+  minimum_review_score: 3
+  review_limit: 3
+
+coaching:
+  training_goal: general_fitness
+  long_run_progression_factor: 1.10
+  high_load_ratio: 1.30
+  moderate_intensity_leakage_fraction: 0.17
+  minimum_days_between_quality_sessions: 4
+  quality_recency_reference_days: 7
+  typical_rest_days_between_runs: 1
+  capacity_retention_half_life_days: 42
+  capacity_retention_grace_days: 28
+  minimum_running_days_28d_for_quality: 8
+  long_run_recency_reference_days: 10
+  reduced_volume_factor: 0.70
+  quality_sessions:
+    short_intervals: true
+    long_intervals: true
+    threshold: true
+    progression: true
+    hill_repeats: true
+
+weather:
+  # Opt in only after approving transmission of dates and privacy-jittered
+  # route centroids to Open-Meteo.
+  historical_enabled: false
+  forecast_enabled: false
+  automatic_run_time_hours_local: [7, 12, 19]
+  coordinate_precision: 2
+  privacy_jitter_radius_km: 2.0
+  estimated_location_max_days: 14
+  estimated_location_sources: {}
+  privacy_salt_path: data/weather_privacy_salt
+  provider: open_meteo
+  endpoint: https://archive-api.open-meteo.com/v1/archive
+  geocoding_endpoint: https://geocoding-api.open-meteo.com/v1/search
+  forecast_endpoint: https://api.open-meteo.com/v1/forecast
+  model: best_match
+  request_timeout_seconds: 30
