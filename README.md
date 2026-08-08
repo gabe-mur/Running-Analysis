@@ -27,9 +27,9 @@ The first launch installs everything and prepares the private local files.
 Later launches use the same command. Open
 [http://127.0.0.1:8000](http://127.0.0.1:8000), then:
 
-1. Update your heart-rate settings.
+1. Update your heart-rate and health settings.
 2. Upload your TCX files.
-3. Review activity types and health tags, then regenerate the plan.
+3. Review activity types and health tags, and set an optional goal in the settings. Then generate the plan.
 
 Press `Ctrl+C` to stop. If port 8000 is busy, run
 `python3 start.py --port 8001`.
