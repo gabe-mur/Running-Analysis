@@ -169,4 +169,4 @@ def test_extreme_overload_does_not_prescribe_quality_or_long_run() -> None:
     assert running
     assert all(item.workout_type == WorkoutType.EASY for item in running)
     assert all(item.distance_range_miles[1] <= 3.5 for item in running)
-    assert "session-level guardrails" in schedule.summary
+    assert "below your usual range" in schedule.summary

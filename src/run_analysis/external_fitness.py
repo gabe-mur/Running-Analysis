@@ -109,11 +109,11 @@ def summarize_external_fitness(
         else ConfidenceLevel.UNAVAILABLE
     )
     if vo2_trend == FitnessTrend.IMPROVING and race_trend == FitnessTrend.IMPROVING:
-        interpretation = "Garmin VO2 max and 5K prediction both improved within the trailing year."
+        interpretation = "Garmin VO₂ max and predicted 5K have both improved over the last year."
     elif not snapshots:
-        interpretation = "No Garmin VO2 max or race-prediction snapshots have been entered. TCX does not contain these history fields."
+        interpretation = "No Garmin snapshots have been added yet."
     else:
-        interpretation = "External fitness estimates are mixed or need more snapshots; they remain separate from pace-at-heart-rate evidence."
+        interpretation = "Garmin's estimates are mixed, or there are too few snapshots to show a trend."
     return ExternalFitnessSummary(
         snapshots=snapshots,
         vo2_max_trend=vo2_trend,

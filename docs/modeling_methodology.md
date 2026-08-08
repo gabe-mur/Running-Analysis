@@ -217,6 +217,34 @@ moderate-intensity leakage but does not enforce a universal 80/20 quota. The
 observational endurance literature uses several incompatible zone systems, so
 the interface keeps this athlete's definitions explicit.
 
+## Race-goal guardrails
+
+The optional 5K, 10K, half-marathon, and marathon goals are inspectable planner
+inputs, not promises of a finish time. A goal is accepted only after 10 usable,
+normal-health running performances exist. Each is projected to the selected
+distance with the Riegel 1.06 relationship; the median of the fastest three
+projections supplies a robust current-performance guardrail. Marathon
+projections receive a conservative 10-minute penalty because recreational
+marathon predictions commonly overstate performance even when shorter-distance
+predictions are well calibrated. This is deliberately a goal-validation rule,
+not a replacement for a race result or a physiological model.
+
+Developing goals require at least 9 weeks for 5K, 12 for 10K, 10 for a half
+marathon, and 18 for a marathon. These reflect the scale of established public
+beginner/conservative plans. When all 10 runs already support the requested
+pace, a shorter race-specific minimum is allowed. Dates more than a year away,
+dates too soon, implausible absolute paces, and paces too aggressive for the
+evidence and available time are rejected with an earliest date or supported
+pace. The allowed improvement margin is a deliberately conservative planning
+guardrail of 0.25% per available week, capped at 8%; it is not a promised
+adaptation rate. A marathon inside 26 weeks also requires a recent six-mile run.
+
+An accepted goal modifies the transparent workout scores and quality-session
+rotation. It never overrides pain, illness, acute-load, recent-workout, weather,
+or recovery-spacing guardrails. Goal pace appears as context inside relevant
+quality workouts and as the race-day target; controlled effort still takes
+precedence over a split.
+
 ## References
 
 - Minetti et al. (2002). [Energy cost of walking and running at extreme uphill
@@ -242,3 +270,11 @@ the interface keeps this athlete's definitions explicit.
   exercise testing](https://pubmed.ncbi.nlm.nih.gov/2287267/).
 - Firstbeat. [Automated Fitness Level (VO2max) Estimation with Heart Rate and
   Speed Data](https://assets.firstbeat.com/firstbeat/uploads/2015/10/white_paper_VO2max_11-11-2014.pdf).
+- Riegel (1981). [Athletic records and human endurance](https://pubmed.ncbi.nlm.nih.gov/7272663/).
+- Vickers & Vertosick (2016). [An empirical study of race times in recreational
+  endurance runners](https://doi.org/10.1186/s13102-016-0052-y).
+- NHS. [Couch to 5K running plan](https://www.nhs.uk/better-health/get-active/get-running-with-couch-to-5k/).
+- New York Road Runners. [5K low-mileage plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/5k-training-plan_low-2020-5k-pr-series_2-rd5.pdf),
+  [10K beginner plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/10k_training_plan_beginner_rd41.pdf),
+  [half-marathon conservative plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/hm-training-plan_conservative-rd1.pdf), and
+  [marathon conservative plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/2024/nyrr-marathon-conservative-training-plan_rd5.pdf).

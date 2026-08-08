@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 
 from .config import load_config, resolve_project_path
+from .privacy import private_file, private_tree
 
 
 @dataclass(slots=True)
@@ -17,10 +18,19 @@ class ProjectSetupSummary:
 
 def _record_directory(path: Path, root: Path, summary: ProjectSetupSummary) -> None:
     label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+    existed = path.exists()
+    # A custom file path may point directly at the repository root or outside
+    # it. Create that parent if needed, but never recursively chmod a broad
+    # directory that the app does not exclusively own.
+    if path == root or not path.is_relative_to(root):
+        path.mkdir(parents=True, exist_ok=True)
+        (summary.existing if existed else summary.created).append(label)
+        return
     if path.exists():
+        private_tree(path)
         summary.existing.append(label)
         return
-    path.mkdir(parents=True, exist_ok=True)
+    private_tree(path)
     summary.created.append(label)
 
 
@@ -47,7 +57,12 @@ def initialize_project(
             )
         selected_config.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(template, selected_config)
+        private_file(selected_config)
         summary.created.append(str(selected_config.relative_to(root)))
+    private_file(selected_config)
+    local_overlay = selected_config.with_name("config.local.yaml")
+    if local_overlay.exists():
+        private_file(local_overlay)
 
     config = load_config(selected_config)
     overrides = resolve_project_path(root, config["paths"]["overrides"])
@@ -65,6 +80,7 @@ def initialize_project(
                 encoding="utf-8",
             )
         summary.created.append(str(overrides.relative_to(root)))
+    private_file(overrides)
 
     directories = {
         root / "TCX",

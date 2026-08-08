@@ -37,7 +37,7 @@ def estimate_local_vo2(
             method="George steady-state jogging equation (not calculated)",
             confidence=ConfidenceLevel.UNAVAILABLE,
             trend=FitnessTrend.INSUFFICIENT_DATA,
-            interpretation="Profile inputs or a current standardized pace are unavailable.",
+            interpretation="Add the optional profile fields and enough comparable runs to calculate this estimate.",
         )
     birth_date = date.fromisoformat(str(profile["birth_date"]))
     age = _age_on(birth_date, as_of.date())
@@ -74,10 +74,7 @@ def estimate_local_vo2(
         trend=fitness_trend,
         demographic_baseline_ml_kg_min=round(demographic, 1) if demographic else None,
         demographic_uncertainty_95_ml_kg_min=11.2 if demographic else None,
-        interpretation=(
-            "This cross-check estimates aerobic capacity, but its change follows the same "
-            "pace/HR evidence and is not an independent vote on fitness."
-        ),
+        interpretation="A rough formula-based check using your adjusted pace and heart rate. It is not a separate fitness signal.",
         limitations=[
             "The George equation was validated using a controlled, level, steady-state treadmill jog; outdoor historical runs are only an approximation.",
             "The demographic Jackson baseline uses a broad population model and does not measure training response.",

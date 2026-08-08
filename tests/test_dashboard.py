@@ -24,7 +24,7 @@ def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -
     assert payload["progress"]["fitness_trend"] == "insufficient_data"
     assert payload["recommendation"]["workout_type"] == "easy"
     assert payload["recommendation"]["rule_trace"]
-    assert "starter placeholder" in payload["weekly_schedule"]["summary"].casefold()
+    assert "starter plan" in payload["weekly_schedule"]["summary"].casefold()
     assert [item["label"] for item in payload["fitness_interpretation"]["signals"]] == [
         "Aerobic efficiency",
         "Durability",

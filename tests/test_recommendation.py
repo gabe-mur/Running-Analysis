@@ -121,9 +121,9 @@ def test_high_z3_leakage_forces_easy_z1_z2() -> None:
     assert result.workout_type == WorkoutType.EASY
     assert result.target_zones == ["Z1", "Z2"]
     assert result.readiness.value == "caution"
-    assert "24.0%" in result.readiness_reason
-    assert "17.0%" in result.readiness_reason
-    assert "not concern about running safely" in result.readiness_reason
+    assert "24%" in result.readiness_reason
+    assert "17%" in result.readiness_reason
+    assert "Keep this run truly easy" in result.readiness_reason
 
 
 def test_recent_illness_and_poor_response_reduce_easy_volume() -> None:
@@ -214,7 +214,7 @@ def test_long_run_uses_rough_110_percent_reference_with_practical_rounding() -> 
     result = _recommend(_state(days_since_long_run=12, longest_run_30d_miles=8, recent_load=load))
     assert result.workout_type == WorkoutType.LONG
     assert result.distance_range_miles[1] == 9.0
-    assert "rounding" in result.warnings[0]
+    assert "rounded" in result.warnings[0]
 
 
 def test_quality_session_types_rotate_and_respect_disabled_settings() -> None:

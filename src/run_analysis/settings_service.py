@@ -11,6 +11,8 @@ import yaml
 from .config import _deep_merge, load_config
 from .modeling import InsufficientModelDataError, fit_models
 from .processing import process_activities
+from .privacy import private_file
+from .race_goals import assess_race_goal
 from .weather import update_weather
 from .web.schemas import (
     CoachingSettings,
@@ -53,6 +55,8 @@ def settings_response(config: dict[str, Any], stages: list[UploadStage] | None =
     weather = config["weather"]
     coaching = {
         "training_goal": "general_fitness",
+        "goal_date": None,
+        "goal_pace_min_mile": None,
         "long_run_progression_factor": 1.10,
         "high_load_ratio": 1.30,
         "moderate_intensity_leakage_fraction": 0.17,
@@ -142,7 +146,12 @@ def _patch_to_overlay(patch: SettingsPatch) -> dict[str, Any]:
     return overlay
 
 
-def save_settings_overlay(config_path: Path, patch: SettingsPatch) -> dict[str, Any]:
+def save_settings_overlay(
+    config_path: Path,
+    patch: SettingsPatch,
+    *,
+    connection=None,
+) -> dict[str, Any]:
     base = load_config(config_path)
     overlay_path = config_path.with_name("config.local.yaml")
     existing: dict[str, Any] = {}
@@ -151,9 +160,13 @@ def save_settings_overlay(config_path: Path, patch: SettingsPatch) -> dict[str, 
     updated_overlay = _deep_merge(existing, _patch_to_overlay(patch))
     candidate = _deep_merge(base, _patch_to_overlay(patch))
     validate_config(candidate)
+    if "coaching" in patch.model_fields_set:
+        assess_race_goal(connection, candidate)
     temporary = overlay_path.with_suffix(".yaml.tmp")
     temporary.write_text(yaml.safe_dump(updated_overlay, sort_keys=False), encoding="utf-8")
+    private_file(temporary)
     temporary.replace(overlay_path)
+    private_file(overlay_path)
     return load_config(config_path)
 
 

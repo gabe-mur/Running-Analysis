@@ -111,8 +111,8 @@ def test_assessment_is_a_run_specific_single_sentence() -> None:
         DriftAssessment(valid=False, confidence=ConfidenceLevel.LOW, reason="Stops"),
     )
 
-    assert assessment.startswith("This was a mostly aerobic run of 4.4 miles")
-    assert "80% of known HR time in Z1/Z2" in assessment
+    assert assessment.startswith("Mostly aerobic run")
+    assert "stopping" in assessment
     assert assessment.endswith(".") and ". " not in assessment
     assert "evaluated with" not in assessment
 

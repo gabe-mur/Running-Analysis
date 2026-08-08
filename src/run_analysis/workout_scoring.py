@@ -355,21 +355,21 @@ def analyze_intervals(
 def _interval_dimensions(analysis: IntervalAnalysis) -> tuple[WorkoutAnalysisDimension, ...]:
     if not analysis.available:
         missing = _dimension(
-            "Insufficient evidence", analysis.explanation, ConfidenceLevel.LOW,
-            [_metric("Detected work bouts", str(analysis.work_repetition_count), "At least two repeatable efforts are required.")],
+            "Not enough data", analysis.explanation, ConfidenceLevel.LOW,
+            [_metric("Detected work intervals", str(analysis.work_repetition_count), "At least two repeatable efforts are needed.")],
         )
         return missing, missing, missing, missing
     cv = analysis.work_speed_cv_percent
     execution_status = "Strong" if cv is not None and cv <= 3 else "Solid" if cv is not None and cv <= 6 else "Mixed"
     execution = _dimension(
         execution_status,
-        f"{analysis.work_repetition_count} work reps reconstructed; target compliance is not judged because no prescribed target is stored.",
+        f"Found {analysis.work_repetition_count} work reps. Rep times and pacing are shown below.",
         analysis.confidence,
         [
             _metric("Average rep", _clock(analysis.mean_work_time_seconds), f"Mean work pace {_pace_text(analysis.mean_work_pace_min_mile)}"),
-            _metric("Median rep", _clock(analysis.median_work_time_seconds), "Robust center of the work repetitions."),
+            _metric("Typical rep", _clock(analysis.median_work_time_seconds), "Middle rep time after sorting the reps."),
             _metric("Fastest / slowest", f"{_clock(analysis.fastest_work_time_seconds)} / {_clock(analysis.slowest_work_time_seconds)}", "Rep times are most comparable when rep distances match."),
-            _metric("Target compliance", "Not assessable", "The completed activity is not yet linked to a stored workout target."),
+            _metric("Planned target", "Not linked", "This completed run is not linked to a saved workout target."),
         ],
     )
     overspeed = analysis.final_rep_overspeed_percent
@@ -384,8 +384,8 @@ def _interval_dimensions(analysis: IntervalAnalysis) -> tuple[WorkoutAnalysisDim
     control = _dimension(
         control_status, control_summary, analysis.confidence,
         [
-            _metric("Pacing pattern", str(analysis.pacing_pattern or "Unknown").title(), f"{(analysis.fade_percent or 0):+.1f}% first-half to second-half fade (negative means progression)."),
-            _metric("Rep variability", f"{cv:.1f}%" if cv is not None else "Unavailable", "Coefficient of variation in speed."),
+            _metric("Pacing pattern", str(analysis.pacing_pattern or "Unknown").title(), f"{(analysis.fade_percent or 0):+.1f}% change from the first half to the second; a negative number means faster later."),
+            _metric("Rep variation", f"{cv:.1f}%" if cv is not None else "Unavailable", "Lower means the reps were more even."),
             _metric("First → last", f"{analysis.first_to_last_percent:+.1f}%" if analysis.first_to_last_percent is not None else "Unavailable", "Positive means the final rep was faster."),
             _metric("Final-rep overspeed", f"{overspeed:+.1f}%" if overspeed is not None else "Unavailable", "Compared with the preceding three reps."),
         ],
@@ -393,8 +393,8 @@ def _interval_dimensions(analysis: IntervalAnalysis) -> tuple[WorkoutAnalysisDim
     work_reps = [item for item in analysis.repetitions if item.kind == "work"]
     end_hrs = [item.end_hr_bpm for item in work_reps if item.end_hr_bpm]
     stimulus = _dimension(
-        "Observed" if work_reps else "Insufficient evidence",
-        "For short reps, pace and rep-end/maximum HR carry more weight than average HR-zone time.",
+        "Measured" if work_reps else "Not enough data",
+        "For short reps, pace and end-of-rep HR are more useful than average HR because heart rate lags effort.",
         analysis.confidence,
         [
             _metric("Work volume", f"{analysis.work_minutes:.1f} min · {analysis.work_distance_miles:.2f} mi", "Recoveries are excluded."),
@@ -404,8 +404,8 @@ def _interval_dimensions(analysis: IntervalAnalysis) -> tuple[WorkoutAnalysisDim
     )
     drops = [item.recovery_hr_drop_bpm for item in work_reps if item.recovery_hr_drop_bpm is not None]
     recovery = _dimension(
-        "Stable" if analysis.recovery_time_cv_percent is not None and analysis.recovery_time_cv_percent <= 15 else "Variable" if analysis.recovery_repetition_count else "Insufficient evidence",
-        "Recovery is evaluated separately from work execution.",
+        "Consistent" if analysis.recovery_time_cv_percent is not None and analysis.recovery_time_cv_percent <= 15 else "Variable" if analysis.recovery_repetition_count else "Not enough data",
+        "Shows whether recovery timing and heart-rate drop stayed consistent between reps.",
         analysis.confidence if analysis.recovery_repetition_count else ConfidenceLevel.LOW,
         [
             _metric("Recovery bouts", str(analysis.recovery_repetition_count), "Detected between work reps."),
@@ -488,49 +488,49 @@ def _generic_analysis(
     speed_cv = pstdev([1 / value for value in paces]) / mean([1 / value for value in paces]) * 100 if len(paces) >= 2 else None
     if workout in {WorkoutType.EASY, WorkoutType.RECOVERY, WorkoutType.LONG}:
         target = 0.90 if workout == WorkoutType.RECOVERY else 0.80
-        status = "On purpose" if easy_fraction is not None and easy_fraction >= target else "Mixed intensity" if easy_fraction is not None else "Partial evidence"
+        status = "Kept easy" if easy_fraction is not None and easy_fraction >= target else "Mixed intensity" if easy_fraction is not None else "Limited data"
         execution = _dimension(
             status,
-            "Easy and long running are judged primarily by aerobic-zone discipline, not raw pace.",
+            "Easy and long runs are judged mainly by heart-rate effort, not speed.",
             ConfidenceLevel.MODERATE if known else ConfidenceLevel.LOW,
             [_metric("Easy HR share", f"{easy_fraction * 100:.0f}%" if easy_fraction is not None else "Unavailable", "Z1/Z2 share of known HR time.")],
         )
     elif workout in {WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}:
         execution = _dimension(
-            "Sustained" if quality_fraction is not None and quality_fraction >= .40 else "Limited exposure" if quality_fraction is not None else "Partial evidence",
-            "Threshold and race execution uses sustained moderate/hard exposure plus pace stability; easy-zone adherence is not the target.",
+            "Sustained" if quality_fraction is not None and quality_fraction >= .40 else "Limited hard running" if quality_fraction is not None else "Limited data",
+            "Tempo and race efforts are judged by sustained moderate/hard running and steady pacing.",
             ConfidenceLevel.MODERATE if known else ConfidenceLevel.LOW,
             [_metric("Z3+ exposure", f"{quality_minutes:.1f} min · {quality_fraction * 100:.0f}%" if quality_fraction is not None else "Unavailable", "Moderate and hard HR time combined.")],
         )
     else:
         execution = _dimension(
             "Not applicable",
-            "This activity type contributes load and context but has no inferred running-workout target to pass or fail.",
+            "This activity counts toward your history and load but has no running-workout target.",
             ConfidenceLevel.UNAVAILABLE,
         )
     control = _dimension(
-        "Controlled" if speed_cv is not None and speed_cv <= 5 else "Variable" if speed_cv is not None else "Insufficient evidence",
-        "Full-mile pace consistency and cardiac drift are reported independently; pace variation may be intentional for non-steady sessions.",
+        "Controlled" if speed_cv is not None and speed_cv <= 5 else "Variable" if speed_cv is not None else "Not enough data",
+        "Compares full-mile pacing and heart-rate drift. Pace changes may be intentional in a workout.",
         ConfidenceLevel.MODERATE if speed_cv is not None else ConfidenceLevel.LOW,
         [_metric("Mile-to-mile variation", f"{speed_cv:.1f}%" if speed_cv is not None else "Unavailable", "Coefficient of variation in speed."),
-         _metric("Cardiac drift", f"{drift.decoupling_percent:+.1f}%" if drift.valid and drift.decoupling_percent is not None else "Not evaluated", drift.reason)],
+         _metric("Heart-rate drift", f"{drift.decoupling_percent:+.1f}%" if drift.valid and drift.decoupling_percent is not None else "Not measured", drift.reason)],
     )
     stimulus = _dimension(
         "Aerobic" if workout in {WorkoutType.EASY, WorkoutType.RECOVERY, WorkoutType.LONG} else "Quality / mixed" if workout in {WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE} else "Context only",
-        "Distance, duration, and HR load describe stimulus; they are not treated as execution quality.",
+        "Distance, duration, and heart-rate load show how much work you completed.",
         ConfidenceLevel.MODERATE,
         [_metric("Volume", f"{difficulty.distance_miles:.2f} mi · {difficulty.moving_minutes:.0f} min", "Moving distance and duration."),
          _metric("Zone load", f"{difficulty.zone_load:.0f}" if difficulty.zone_load is not None else "Unavailable", "Time-in-zone load points.")],
     )
     recovery = _dimension(
-        "Context dependent", "Between-workout recovery is handled by load and health context; this run alone cannot prove readiness.", ConfidenceLevel.LOW,
+        "Use recent context", "One run cannot show whether you are recovered; the weekly plan uses your recent load and health check-in.", ConfidenceLevel.LOW,
         [_metric("Stopped time", f"{difficulty.stopped_minutes:.1f} min", "Useful context, not automatically a failure.")],
     )
     return WorkoutAnalysis(
         workout_type=workout,
         definition="Four independent workout judgments; no composite score is calculated.",
         execution=execution, control=control, stimulus=stimulus, recovery=recovery,
-        progression_recommendation="Use this result with the weekly planner's current health and load context before progressing the workout.",
+        progression_recommendation="Use the weekly plan and how you feel before making the next workout harder.",
     )
 
 

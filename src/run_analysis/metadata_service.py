@@ -7,6 +7,7 @@ import csv
 import sqlite3
 
 from .web.schemas import ActivityHealthTag, RunMetadataPatch
+from .privacy import private_file
 
 
 FIELDS = ["activity_id", "include_in_model", "workout_type", "illness", "health_tag", "perceived_exertion", "notes"]
@@ -80,10 +81,14 @@ def update_run_metadata(
         "perceived_exertion": str(values["perceived_exertion"] or ""),
         "notes": str(values["notes"] or ""),
     }
+    # The default overrides file lives in the repository root. Protect the
+    # file itself without changing permissions on the whole repository.
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(rows[key] for key in sorted(rows))
+    private_file(temporary)
     temporary.replace(path)
+    private_file(path)

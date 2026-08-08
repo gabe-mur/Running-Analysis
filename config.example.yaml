@@ -104,6 +104,8 @@ activity_classification:
 
 coaching:
   training_goal: general_fitness
+  goal_date: null
+  goal_pace_min_mile: null
   long_run_progression_factor: 1.10
   high_load_ratio: 1.30
   moderate_intensity_leakage_fraction: 0.17

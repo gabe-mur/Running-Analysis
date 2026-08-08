@@ -16,6 +16,8 @@ import secrets
 import sqlite3
 import time
 
+from .privacy import private_directory, private_file
+
 from .db import initialize, transaction
 
 HOURLY_VARIABLES = (
@@ -60,13 +62,15 @@ class WeatherSummary:
 def load_or_create_privacy_salt(path: str | Path) -> bytes:
     salt_path = Path(path)
     if salt_path.exists():
+        private_file(salt_path)
         value = salt_path.read_bytes()
         if len(value) < 16:
             raise ValueError(f"Weather privacy salt is unexpectedly short: {salt_path}")
         return value
-    salt_path.parent.mkdir(parents=True, exist_ok=True)
+    private_directory(salt_path.parent)
     value = secrets.token_bytes(32)
     salt_path.write_bytes(value)
+    private_file(salt_path)
     return value
 
 
@@ -412,7 +416,7 @@ def _ensure_cache(
     endpoint = str(config["endpoint"])
     model = str(config.get("model", "best_match"))
     timeout = float(config.get("request_timeout_seconds", 30))
-    cache_directory.mkdir(parents=True, exist_ok=True)
+    private_directory(cache_directory)
     consecutive_failures = 0
     for (latitude, longitude, _year), required_days in requirements.items():
         missing: list[str] = []
@@ -446,6 +450,7 @@ def _ensure_cache(
         request_hash = hashlib.sha256(url.encode()).hexdigest()
         cache_file = cache_directory / f"{request_hash}.json"
         cache_file.write_text(json.dumps(response, indent=2) + "\n", encoding="utf-8")
+        private_file(cache_file)
         daily = _split_days(response)
         with transaction(connection):
             for day in missing:

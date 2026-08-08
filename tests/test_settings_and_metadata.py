@@ -45,7 +45,7 @@ def test_invalid_physiology_or_overlapping_zones_are_rejected(tmp_path: Path) ->
         "z2": ZoneRange(minimum_bpm=140, maximum_bpm=153),
         "z3": ZoneRange(minimum_bpm=154, maximum_bpm=166),
         "z4": ZoneRange(minimum_bpm=167, maximum_bpm=180),
-        "z5": ZoneRange(minimum_bpm=181, maximum_bpm=194),
+        "z5": ZoneRange(minimum_bpm=181, maximum_bpm=195),
     }
     with pytest.raises(ValueError, match="non-overlapping"):
         save_settings_overlay(tmp_path / "config.yaml", SettingsPatch(zones=zones))

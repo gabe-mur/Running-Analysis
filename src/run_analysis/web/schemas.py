@@ -780,7 +780,9 @@ class QualitySessionSettings(ApiModel):
 
 
 class CoachingSettings(ApiModel):
-    training_goal: str
+    training_goal: str = Field(pattern="^(general_fitness|5k|10k|half_marathon|marathon)$")
+    goal_date: date | None = None
+    goal_pace_min_mile: float | None = Field(default=None, ge=4, le=20)
     long_run_progression_factor: float = Field(ge=1, le=1.5)
     high_load_ratio: float = Field(gt=1, le=3)
     moderate_intensity_leakage_fraction: float = Field(ge=0, le=1)
@@ -796,6 +798,10 @@ class CoachingSettings(ApiModel):
 
     @model_validator(mode="after")
     def ordered_weekly_mileage(self) -> "CoachingSettings":
+        if self.training_goal != "general_fitness" and (
+            self.goal_date is None or self.goal_pace_min_mile is None
+        ):
+            raise ValueError("Race goals require both a goal date and goal pace")
         return self
 
 

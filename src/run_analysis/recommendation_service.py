@@ -250,7 +250,18 @@ def load_latest_weekly_schedule(connection: sqlite3.Connection) -> WeeklySchedul
     # Schedules saved before automatic by-day timing carried this obsolete
     # global preference.  Ignore it during the one-time schema transition.
     payload.pop("preferred_time", None)
-    return WeeklyScheduleResponse.model_validate(payload)
+    result = WeeklyScheduleResponse.model_validate(payload)
+    projected_low, projected_high = result.projected_distance_range_miles
+    target_low, target_high = result.target_distance_range_miles
+    if result.target_evidence.capacity_reference_miles <= 0:
+        summary = "This is a starter plan until more runs are available."
+    elif projected_high < target_low:
+        summary = "This week stays below your usual range."
+    elif projected_low > target_high:
+        summary = "This week is above your usual range, so review each workout before following it."
+    else:
+        summary = "This fits your recent training."
+    return result.model_copy(update={"summary": summary})
 
 
 def ensure_current_weekly_schedule(

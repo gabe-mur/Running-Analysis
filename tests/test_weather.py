@@ -221,10 +221,10 @@ def test_postal_code_location_is_persisted_for_no_gps_activity(tmp_path: Path) -
         return {
             "results": [
                 {
-                    "name": "Brooklyn",
+                    "name": "Chicago",
                     "admin1": "New York",
                     "country_code": "US",
-                    "postcodes": ["11211"],
+                    "postcodes": ["60601"],
                     "latitude": 40.71,
                     "longitude": -73.95,
                 }
@@ -237,14 +237,14 @@ def test_postal_code_location_is_persisted_for_no_gps_activity(tmp_path: Path) -
         resolved = save_activity_postal_code(
             connection,
             activity_id,
-            "11211",
+            "60601",
             config,
             downloader=fake_geocode,
         )
         stored = connection.execute(
             "SELECT * FROM activity_location_overrides WHERE activity_id=?", (activity_id,)
         ).fetchone()
-    assert "name=11211" in observed_url
-    assert resolved["locality"] == "Brooklyn"
-    assert stored["postal_code"] == "11211"
+    assert "name=60601" in observed_url
+    assert resolved["locality"] == "Chicago"
+    assert stored["postal_code"] == "60601"
     assert stored["latitude"] == pytest.approx(40.71)

@@ -49,6 +49,7 @@ model commands.
 | `run_analysis.processing` | moving-time classification, zones, metrics | Upload/feedback |
 | `run_analysis.weather` | privacy-jittered Open-Meteo retrieval and cache | Upload |
 | `run_analysis.objective_modeling` | standardized pace @145 and evidence chain | Progress/feedback |
+| `run_analysis.race_goals` | 10-run goal validation, distance/time guardrails, goal-specific biases | Settings/recommendation |
 
 ### What already answers each product job
 

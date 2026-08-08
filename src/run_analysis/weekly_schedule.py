@@ -14,6 +14,7 @@ from math import exp, floor
 from zoneinfo import ZoneInfo
 
 from .recommendation import recommend_next_run, typical_easy_distance
+from .race_goals import configured_race_goal
 from .web.schemas import (
     CurrentHealthStatus,
     FitnessState,
@@ -121,12 +122,8 @@ def derive_weekly_target(
         demonstrated_run_days_per_week=demonstrated,
         capacity_reference_miles=capacity_reference,
         rationale=(
-            "Mileage target blends the current seven days, a slowly decaying 42-day chronic level, "
-            "and the best sustained 28-day level from the trailing year. Demonstrated capacity is "
-            "retained through a short disruption, then decays gradually. Frequency advances only "
-            "after the higher pattern is demonstrated across roughly four weeks. One rest day "
-            "between runs is the default cadence; "
-            "consecutive days are used only when a higher demonstrated frequency calls for them."
+            "The range uses your recent mileage, longer-term consistency, and best sustained month. "
+            "A short break does not immediately reset what you have shown you can handle."
         ),
     )
     return target_runs, (target_low, target_high), evidence
@@ -398,11 +395,29 @@ def build_weekly_schedule(
         else []
     )
     offsets = [offset for offset in desired_offsets if not completed_activities_by_offset.get(offset)]
+    goal = configured_race_goal(config, on_date=daily_states[0].as_of.date())
+    race_offset: int | None = None
+    taper_horizon = False
+    if goal:
+        goal_profile, race_date, _ = goal
+        race_offset = (race_date - daily_states[0].as_of.date()).days
+        taper_horizon = 0 <= race_offset <= goal_profile.taper_days
+        if 0 <= race_offset < len(daily_states) and not completed_activities_by_offset.get(race_offset):
+            if race_offset not in offsets:
+                if offsets:
+                    replace = min(offsets, key=lambda value: (abs(value - race_offset), -value))
+                    offsets.remove(replace)
+                offsets.append(race_offset)
+                offsets.sort()
+            # Do not compress an ordinary scheduled workout onto the calendar
+            # day immediately before a race merely to preserve run count.
+            if race_offset - 1 in offsets:
+                offsets.remove(race_offset - 1)
     # Coordinate the buildup, but leave the final target session unassigned.
     # Its workout type must win the ordinary evidence score; being the last
     # visible day (or the end of the target cadence) is not long-run evidence.
     role_preferences = {offset: "easy" for offset in offsets[:-1]}
-    if len(offsets) >= 3:
+    if len(offsets) >= 3 and not taper_horizon:
         role_preferences[offsets[1]] = "quality"
     planned: list[RecommendationResponse] = []
     days: list[WeeklyScheduleDay] = []
@@ -430,7 +445,7 @@ def build_weekly_schedule(
                     planned_at=None,
                     recommendation=None,
                     day_role=role,
-                    rationale="Recorded activity completed; no second workout is prescribed for this day.",
+                    rationale="Your uploaded run replaces the planned workout for this day.",
                     completed_activities=completed,
                 )
             )
@@ -442,7 +457,7 @@ def build_weekly_schedule(
                     planned_at=None,
                     recommendation=None,
                     day_role="rest_day",
-                    rationale="Planned non-running day between the week's selected training opportunities.",
+                    rationale="Recovery between planned runs.",
                 )
             )
             continue
@@ -478,15 +493,13 @@ def build_weekly_schedule(
                 day_role=role,
                 rationale=(
                     (
-                        "Consecutive day selected intentionally because the latest run was "
-                        f"{float(consecutive_facts.get('relative_cost') or 0) * 100:.0f}% of a typical recent session at its highest observed cost ratio, "
-                        "was neither long nor quality, and accumulated distance remained below the high-load guardrail."
+                        "A back-to-back run is reasonable because the previous run was short and easy enough."
                     )
                     if offset == 0 and low_cost_consecutive
                     else
                     "Consecutive run day selected intentionally and evaluated with the prior planned session included."
                     if planned and len(planned) >= 2 and planned[-2].planned_for and (raw_state.as_of.date() - planned[-2].planned_for.date()).days == 1
-                    else "Automatically selected from recent frequency, projected load, workout recency, and recovery spacing."
+                    else "Fits your recent training and recovery."
                 ),
             )
         )
@@ -515,29 +528,17 @@ def build_weekly_schedule(
         for day in days
     )
     if target_evidence.capacity_reference_miles <= 0:
-        horizon_explanation = (
-            "No training history is available, so this is a conservative starter placeholder rather than a personalized capacity estimate. "
-        )
+        horizon_explanation = "This is a starter plan until more runs are available."
     elif deferred_count:
-        horizon_explanation = (
-            f"{deferred_count} additional session from the sustained-frequency reference falls after {daily_states[-1].as_of.date().isoformat()} because recovery spacing takes precedence; it is not included in the planned mileage. "
-        )
+        horizon_explanation = f"{deferred_count} more run{'s' if deferred_count != 1 else ''} {'fall' if deferred_count != 1 else 'falls'} after this view so the week is not crowded."
     elif guardrail_rest_count:
-        horizon_explanation = (
-            f"{guardrail_rest_count} selected training opportunit{'y was' if guardrail_rest_count == 1 else 'ies were'} converted to rest after load, health, recovery, or weather guardrails; this is why the visible plan is below the capacity reference. "
-        )
+        horizon_explanation = f"{guardrail_rest_count} planned day{'s were' if guardrail_rest_count != 1 else ' was'} changed to rest based on recovery, health, load, or weather."
     elif distance_high < target_distance_range[0]:
-        horizon_explanation = (
-            "All selected run days fit inside the horizon, but session-level guardrails keep planned mileage below the capacity reference. "
-        )
+        horizon_explanation = "This week stays below your usual range."
     elif distance_low > target_distance_range[1]:
-        horizon_explanation = (
-            "The planned mileage is above the capacity reference; inspect the individual rule traces before treating the schedule as appropriate. "
-        )
+        horizon_explanation = "This week is above your usual range, so review each workout before following it."
     else:
-        horizon_explanation = (
-            "The visible planned-mileage range overlaps the demonstrated-capacity reference. "
-        )
+        horizon_explanation = "This fits your recent training."
     return WeeklyScheduleResponse(
         generated_at=datetime.now(daily_states[0].as_of.tzinfo),
         start_date=daily_states[0].as_of.date(),
@@ -548,13 +549,6 @@ def build_weekly_schedule(
         completed_run_count=completed_run_count,
         run_count=len(run_results),
         projected_distance_range_miles=(round(distance_low, 1), round(distance_high, 1)),
-        summary=(
-            f"The visible horizon contains {completed_run_count} completed and {len(run_results)} planned runs totaling {distance_low:.1f}–{distance_high:.1f} miles. "
-            + horizon_explanation
-            + (
-                f"The {target_distance_range[0]:g}–{target_distance_range[1]:g} mile range is a demonstrated-capacity reference, not a requirement to compress mileage into these dates. "
-            )
-            + "Quality is considered in the scoring but remains subject to load, health, recovery, and weather guardrails."
-        ),
+        summary=horizon_explanation,
         days=days,
     )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 
@@ -26,15 +26,15 @@ from run_analysis.web.schemas import (
 def _write_config(root: Path, database: str = "data/test.sqlite") -> None:
     (root / "config.yaml").write_text(
         """
-max_hr: 194
-resting_hr: 49
+max_hr: 195
+resting_hr: 50
 target_hr: 145
 zones:
   z1: [128, 140]
   z2: [141, 153]
   z3: [154, 166]
   z4: [167, 180]
-  z5: [181, 194]
+  z5: [181, 195]
 timezone_default: America/New_York
 paths:
   database: %s
@@ -195,6 +195,28 @@ def test_new_user_can_enable_historical_weather_without_a_profile(tmp_path: Path
     assert response.json()["historical_weather_enabled"] is True
 
 
+def test_race_goal_settings_require_ten_usable_runs_before_save(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    coaching = client.get("/api/settings").json()["coaching"]
+    coaching.update(
+        {
+            "training_goal": "10k",
+            "goal_date": (date.today() + timedelta(weeks=12)).isoformat(),
+            "goal_pace_min_mile": 9.0,
+        }
+    )
+
+    response = client.patch("/api/settings", json={"coaching": coaching})
+
+    assert response.status_code == 422
+    assert "requires 10 usable" in response.json()["detail"]
+    assert not (tmp_path / "config.local.yaml").exists()
+
+
 def test_static_app_and_openapi_are_served(tmp_path: Path) -> None:
     _write_config(tmp_path)
     client = TestClient(create_app(tmp_path))
@@ -205,3 +227,16 @@ def test_static_app_and_openapi_are_served(tmp_path: Path) -> None:
     schema = client.get("/openapi.json").json()
     assert "/api/health" in schema["paths"]
     assert "HealthResponse" in schema["components"]["schemas"]
+
+
+def test_private_browser_headers_and_local_host_allowlist(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    client = TestClient(create_app(tmp_path))
+    response = client.get("/")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "connect-src 'self'" in response.headers["content-security-policy"]
+
+    rejected = client.get("/api/settings", headers={"host": "run-data.attacker.example"})
+    assert rejected.status_code == 400

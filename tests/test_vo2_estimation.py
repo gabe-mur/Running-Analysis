@@ -30,10 +30,10 @@ def test_published_vo2_cross_checks_are_labeled_and_bounded() -> None:
         fitness_trend=FitnessTrend.UNCERTAIN,
         config={
             "target_hr": 145,
-            "profile": {"birth_date": "1995-11-28", "sex": "male", "weight_lb": 140, "height_in": 68},
+            "profile": {"birth_date": "1990-01-01", "sex": "male", "weight_lb": 150, "height_in": 70},
         },
     )
-    assert estimate.value_ml_kg_min == pytest.approx(52.3, abs=0.1)
-    assert estimate.demographic_baseline_ml_kg_min == pytest.approx(53.3, abs=0.1)
+    assert estimate.value_ml_kg_min == pytest.approx(51.4, abs=0.1)
+    assert estimate.demographic_baseline_ml_kg_min == pytest.approx(50.9, abs=0.1)
     assert estimate.confidence == ConfidenceLevel.LOW
-    assert "not an independent" in estimate.interpretation
+    assert "not a separate fitness signal" in estimate.interpretation

@@ -9,6 +9,7 @@ import sqlite3
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..config import load_config, resolve_project_path
 from ..db import connect, initialize
@@ -150,6 +151,25 @@ def create_app(
     )
     app.state.project_root = root
     app.state.config_path = selected_config
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "::1", "testserver"],
+    )
+
+    @app.middleware("http")
+    async def private_response_headers(request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; "
+            "form-action 'self'; connect-src 'self'; img-src 'self' data:; "
+            "script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'"
+        )
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     api = APIRouter(prefix="/api")
 
@@ -381,16 +401,21 @@ def create_app(
 
     @api.patch("/settings", response_model=SettingsResponse, tags=["settings"])
     def patch_settings(patch: SettingsPatch) -> SettingsResponse:
+        base = load_config(selected_config)
+        database = resolve_project_path(root, base["paths"]["database"])
+        stages = []
         try:
-            config = save_settings_overlay(selected_config, patch)
+            if database.exists():
+                with connect(database) as connection:
+                    initialize(connection)
+                    config = save_settings_overlay(
+                        selected_config, patch, connection=connection
+                    )
+                    stages = recalculate_for_settings(connection, config, root, patch)
+            else:
+                config = save_settings_overlay(selected_config, patch)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        database = resolve_project_path(root, config["paths"]["database"])
-        stages = []
-        if database.exists():
-            with connect(database) as connection:
-                initialize(connection)
-                stages = recalculate_for_settings(connection, config, root, patch)
         return settings_response(config, stages)
 
     app.include_router(api)

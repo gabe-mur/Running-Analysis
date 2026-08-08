@@ -144,6 +144,6 @@ def test_device_distance_fitness_estimate_is_not_labeled_unscored(tmp_path: Path
     assert coverage.score_status == "uncertain_estimate"
     assert coverage.standardized_pace_min_mile == 11.0
     assert coverage.trend_weight == pytest.approx(0.65)
-    assert "inverse-variance" in coverage.reason
+    assert "Estimated from Garmin distance" in coverage.reason
     assert progress.steady_aerobic.series[0].benchmark_quality == "estimated_fixed_time"
     assert progress.steady_aerobic.series[0].measurement_quality == "device_distance_fallback"

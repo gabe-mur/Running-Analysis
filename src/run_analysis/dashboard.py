@@ -42,10 +42,10 @@ def _horizon(label: str, progress) -> FitnessHorizon:
 def _signal_status(trend: FitnessTrend) -> str:
     return {
         FitnessTrend.IMPROVING: "Improved",
-        FitnessTrend.DECLINING: "Down",
-        FitnessTrend.STABLE: "Stable",
-        FitnessTrend.UNCERTAIN: "Ambiguous / stable",
-        FitnessTrend.INSUFFICIENT_DATA: "Insufficient evidence",
+        FitnessTrend.DECLINING: "Declined",
+        FitnessTrend.STABLE: "About the same",
+        FitnessTrend.UNCERTAIN: "No clear change",
+        FitnessTrend.INSUFFICIENT_DATA: "Not enough data",
     }[trend]
 
 
@@ -90,7 +90,7 @@ def _quality_fitness_signal(
         else ConfidenceLevel.HIGH
     )
     trend = FitnessTrend.INSUFFICIENT_DATA
-    status = "Insufficient recent evidence"
+    status = "Not enough data"
     comparison_detail = ""
     latest_interval = next(
         (
@@ -122,14 +122,14 @@ def _quality_fitness_signal(
                 trend, status = FitnessTrend.DECLINING, "Down in comparable intervals"
             comparison_detail = f" {pace_metric.value} versus the closest structurally similar interval session."
     elif count >= 2:
-        trend, status = FitnessTrend.UNCERTAIN, "Baseline established"
+        trend, status = FitnessTrend.UNCERTAIN, "No clear trend yet"
 
     rejected = len(candidates) - count
-    detail = (
-        f"{count} usable normal-health quality sessions in the last {window_days} days"
-        f"{f'; {rejected} labeled sessions lacked workout-specific evidence' if rejected else ''}."
-        f"{comparison_detail} Confidence advances at 3 and 5 usable sessions."
-    )
+    detail = f"{count} comparable hard workout{'s' if count != 1 else ''} in the last {window_days} days."
+    if comparison_detail:
+        detail += comparison_detail
+    elif rejected:
+        detail += f" {rejected} other labeled workout{'s' if rejected != 1 else ''} could not be compared fairly."
     return FitnessSignal(
         label="High-intensity fitness",
         trend=trend,
@@ -151,18 +151,12 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
     )
     capacity_direction = FitnessTrend.IMPROVING if capacity_up else FitnessTrend.STABLE
     capacity_summary = (
-        f"Over the last {capacity.window_days} days you ran {current.distance_miles:.1f} miles across "
-        f"{current.run_count} runs, versus {previous.distance_miles:.1f} miles across "
-        f"{previous.run_count} runs in the prior {capacity.window_days} days. Longest run: "
-        f"{current.longest_run_miles:.1f} vs {previous.longest_run_miles:.1f} miles."
+        f"Last {capacity.window_days} days: {current.distance_miles:.1f} miles in {current.run_count} runs. "
+        f"Previous {capacity.window_days}: {previous.distance_miles:.1f} miles in {previous.run_count} runs."
     )
     illness_context = None
     if state.recent_illness_or_recovery:
-        illness_context = (
-            "Recent runs are tagged illness/recovery. They still count as completed "
-            "training load and contribute to aerobic efficiency at reduced reliability weight, making "
-            "a short-term dip less diagnostic of durable fitness loss."
-        )
+        illness_context = "Recent illness/recovery runs still count toward training, but have less influence on the fitness trend."
     external = short.external_fitness
     external_up = (
         external.vo2_max_trend == FitnessTrend.IMPROVING
@@ -188,13 +182,19 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         )
     elif short_horizon.trend == FitnessTrend.IMPROVING and capacity_up:
         headline = "Aerobic efficiency and running capacity are both improving."
-        summary = f"The pace-at-heart-rate signal and {capacity.window_days}-day training-capacity measures agree."
+        summary = "You are running more efficiently and sustaining more training."
+    elif short_horizon.trend in {FitnessTrend.STABLE, FitnessTrend.UNCERTAIN} and capacity_up:
+        headline = "Training capacity is up; aerobic efficiency has no clear change."
+        summary = "You are running more or farther, with no clear change in pace at the same heart rate."
+    elif short_horizon.trend == FitnessTrend.STABLE:
+        headline = "Your fitness looks steady."
+        summary = "Pace at the same heart rate and your recent training capacity are both about the same."
+    elif short_horizon.trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
+        headline = "There is no clear fitness change yet."
+        summary = "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
     else:
-        headline = "Fitness is mixed across time horizons."
-        summary = (
-            "Use aerobic efficiency, current recovery, and training capacity as separate evidence; "
-            "none is a complete measure of fitness by itself."
-        )
+        headline = "Your recent fitness signals are mixed."
+        summary = "Aerobic efficiency, recovery, and training volume are pointing in different directions."
     if longest_change >= 1:
         durability_direction = FitnessTrend.IMPROVING
         durability_status = "Improved"
@@ -207,40 +207,40 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
     if state.recent_illness_or_recovery:
         recent_direction = FitnessTrend.DECLINING
         recent_status = "Recovering"
-        recent_detail = "Recent health-tagged runs indicate temporarily suppressed form; current check-in controls coaching."
+        recent_detail = "Recent illness or recovery runs may be temporarily affecting performance."
     elif state.recent_performance_anomaly == "unusually_costly":
         recent_direction = FitnessTrend.DECLINING
         recent_status = "Suppressed"
-        recent_detail = "The latest standardized response was unusually costly relative to recent runs."
+        recent_detail = "The latest comparable run took more effort than usual."
     elif state.recent_performance_anomaly == "within_recent_range":
         recent_direction = FitnessTrend.STABLE
         recent_status = "Within recent range"
-        recent_detail = "The latest standardized response sits within ordinary recent variation."
+        recent_detail = "The latest comparable run was within your recent range."
     else:
         recent_direction = FitnessTrend.UNCERTAIN
-        recent_status = "Ambiguous"
-        recent_detail = "There is not enough comparable recent evidence to classify current form."
+        recent_status = "Not enough data"
+        recent_detail = "There are too few comparable recent runs to judge current form."
     signals = [
         FitnessSignal(
             label="Aerobic efficiency",
             trend=short_horizon.trend,
             status=_signal_status(short_horizon.trend),
             confidence=short_horizon.confidence,
-            detail=f"{short_horizon.window_days}-day standardized pace-at-145 comparison.",
+            detail=f"Pace at the same heart rate over the last {short_horizon.window_days} days.",
         ),
         FitnessSignal(
             label="Durability",
             trend=durability_direction,
             status=durability_status,
             confidence=ConfidenceLevel.MODERATE,
-            detail=f"Longest run changed from {previous.longest_run_miles:.1f} to {current.longest_run_miles:.1f} miles across the compared {capacity.window_days}-day periods.",
+            detail=f"Longest run: {current.longest_run_miles:.1f} miles now vs {previous.longest_run_miles:.1f} previously.",
         ),
         FitnessSignal(
             label="Training capacity",
             trend=capacity_direction,
             status=_signal_status(capacity_direction),
             confidence=ConfidenceLevel.MODERATE,
-            detail=f"Volume and frequency across the current versus prior {capacity.window_days}-day period: {current.distance_miles:.1f} vs {previous.distance_miles:.1f} miles.",
+            detail=f"{current.distance_miles:.1f} miles now vs {previous.distance_miles:.1f} in the previous period.",
         ),
         FitnessSignal(
             label="Recent form",

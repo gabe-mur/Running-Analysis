@@ -220,7 +220,7 @@ def assess_cardiac_drift(
         decoupling_percent=decoupling,
         valid=True,
         confidence=ConfidenceLevel.MODERATE,
-        reason="First/second-half speed-to-HR decoupling; interpret cautiously on changing terrain.",
+        reason="Compares pace per heartbeat in the first and second halves; hills and planned pace changes can affect it.",
     )
 
 
@@ -400,8 +400,6 @@ def _feedback_text(
     assert difficulty is not None
     positives: list[str] = []
     cautions: list[str] = []
-    pace_text = _pace_display(summary.moving_pace_min_mile) if summary.moving_pace_min_mile else "unknown pace"
-    hr_text = f"{summary.average_hr_bpm:.0f} bpm" if summary.average_hr_bpm else "incomplete HR data"
     known_hr_minutes = (
         difficulty.zone_breakdown.easy_minutes
         + difficulty.zone_breakdown.moderate_minutes
@@ -418,32 +416,22 @@ def _feedback_text(
         ActivityHealthTag.OTHER_ABNORMAL: " with abnormal health context",
     }.get(metadata.health_tag, "")
     if metadata.workout_type == WorkoutType.HIKE:
-        assessment = f"This was a {difficulty.distance_miles:.1f}-mile hike{health_phrase} that added {difficulty.moving_minutes:.0f} minutes of time on feet without being treated as running-fitness evidence."
+        assessment = f"A hike{health_phrase}: useful time on your feet, kept separate from running fitness."
     elif metadata.workout_type == WorkoutType.BIKE:
-        assessment = f"This was {difficulty.moving_minutes:.0f} minutes of cycling{health_phrase}, useful cardiovascular work that remains separate from running pace comparisons."
+        assessment = f"A bike ride{health_phrase}: useful aerobic work, kept separate from running pace."
     elif metadata.workout_type == WorkoutType.INTERVALS and workout_analysis and workout_analysis.interval_analysis:
         intervals = workout_analysis.interval_analysis
         if intervals.available:
-            assessment = (
-                f"This interval session completed {intervals.work_repetition_count} work reps averaging "
-                f"{_pace_display(intervals.mean_work_pace_min_mile) if intervals.mean_work_pace_min_mile else 'an unknown pace'}; "
-                f"{workout_analysis.control.summary[0].lower() + workout_analysis.control.summary[1:]}"
-            )
+            assessment = f"Completed {intervals.work_repetition_count} interval reps; {workout_analysis.control.summary[0].lower() + workout_analysis.control.summary[1:]}"
         else:
-            assessment = "This was an interval session, but the available lap and pace stream did not support reliable rep reconstruction."
+            assessment = "Interval workout, but the available data could not reconstruct the reps reliably."
     elif metadata.workout_type in {WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}:
         quality_minutes = difficulty.zone_breakdown.moderate_minutes + difficulty.zone_breakdown.hard_minutes
         label = "race" if metadata.workout_type == WorkoutType.RACE else "tempo/threshold run"
-        assessment = (
-            f"This {difficulty.distance_miles:.1f}-mile {label}{health_phrase} averaged {pace_text} at {hr_text} "
-            f"and accumulated {quality_minutes:.0f} minutes in Z3 or higher."
-        )
+        assessment = f"{label.title()}{health_phrase}, with {quality_minutes:.0f} minutes at moderate or hard effort."
     elif metadata.workout_type == WorkoutType.RUN_WALK and workout_analysis and workout_analysis.interval_analysis:
         intervals = workout_analysis.interval_analysis
-        assessment = (
-            f"This {difficulty.distance_miles:.1f}-mile run/walk{health_phrase} contained "
-            f"{intervals.work_repetition_count} identifiable running bouts and still contributes its full distance and load."
-        )
+        assessment = f"Run/walk{health_phrase} with {intervals.work_repetition_count} identifiable running segments."
     else:
         if easy_share is None:
             intensity_phrase = "an aerobic run with incomplete HR coverage"
@@ -453,37 +441,32 @@ def _feedback_text(
             intensity_phrase = "a mostly aerobic run"
         else:
             intensity_phrase = "a mixed-intensity run"
-        session_label = "a long aerobic run" if difficulty.is_long_run else intensity_phrase
-        assessment = (
-            f"This was {session_label} of "
-            f"{difficulty.distance_miles:.1f} miles{health_phrase} at {pace_text} and {hr_text}"
-        )
-        if easy_share is not None:
-            assessment += f", with {easy_share:.0%} of known HR time in Z1/Z2"
+        session_label = "Long aerobic run" if difficulty.is_long_run else intensity_phrase.removeprefix("a ").capitalize()
+        assessment = f"{session_label}{health_phrase}"
         if difficulty.stopped_minutes >= 5:
-            assessment += f"; {difficulty.stopped_minutes:.0f} stopped minutes make it less useful as a steady-state comparison."
+            assessment += ", with enough stopping to limit pace comparisons."
         elif drift.valid and drift.decoupling_percent is not None and drift.decoupling_percent > 5:
-            assessment += f"; second-half speed-to-HR efficiency faded by {drift.decoupling_percent:.1f}%."
+            assessment += ", but heart-rate cost rose in the second half."
         elif drift.valid and drift.decoupling_percent is not None and abs(drift.decoupling_percent) <= 3:
-            assessment += "; second-half aerobic efficiency remained stable."
+            assessment += " with steady effort through the second half."
         else:
             assessment += "."
     if difficulty.is_long_run:
         positives.append(f"{difficulty.distance_miles:.1f} miles of durability work")
     elif difficulty.is_quality_session:
-        positives.append(f"{difficulty.zone_breakdown.moderate_minutes + difficulty.zone_breakdown.hard_minutes:.0f} minutes at Z3 or higher")
+        positives.append(f"{difficulty.zone_breakdown.moderate_minutes + difficulty.zone_breakdown.hard_minutes:.0f} minutes at moderate or hard effort")
     else:
         positives.append(f"{difficulty.moving_minutes:.0f} moving minutes completed")
     if metadata.health_tag != ActivityHealthTag.NORMAL:
         cautions.append(f"Health context: {metadata.health_tag.value.replace('_', ' ')}")
     if summary.data_quality in {DataQuality.POOR, DataQuality.UNAVAILABLE}:
-        cautions.append("Sensor coverage limits intensity and fitness interpretation")
+        cautions.append("Some sensor data is missing, so the analysis is limited")
     if difficulty.stopped_minutes >= 5:
         cautions.append(f"{difficulty.stopped_minutes:.0f} stopped minutes make elapsed pace less comparable")
     if drift.valid and drift.decoupling_percent is not None and drift.decoupling_percent > 5:
-        cautions.append("Second-half speed-to-HR efficiency fell by more than 5%")
+        cautions.append("Heart rate rose relative to pace in the second half")
     if summary.fitness_observation is None:
-        cautions.append("No comparable standardized pace observation was available")
+        cautions.append("This run could not support a fair pace-at-HR comparison")
     return assessment, positives, cautions
 
 

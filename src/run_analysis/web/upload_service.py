@@ -21,6 +21,7 @@ from ..importer import import_files
 from ..modeling import InsufficientModelDataError, fit_models
 from ..overrides import sync_overrides
 from ..processing import process_activities
+from ..privacy import private_directory, private_file
 from ..recommendation_service import generate_weekly_schedule, load_current_status
 from ..weather import update_weather
 from .schemas import UploadResponse, UploadedFileResult, UploadStage, WeeklyScheduleRequest
@@ -53,11 +54,11 @@ def validate_upload(payload: UploadPayload) -> None:
 
 def _persist_upload(root: Path, payload: UploadPayload) -> Path:
     digest = hashlib.sha256(payload.content).hexdigest()
-    upload_dir = root / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = private_directory(root / "uploads")
     destination = upload_dir / f"{digest[:16]}-{_safe_filename(payload.filename)}"
     if not destination.exists():
         destination.write_bytes(payload.content)
+    private_file(destination)
     return destination
 
 

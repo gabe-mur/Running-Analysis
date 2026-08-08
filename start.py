@@ -45,7 +45,6 @@ def main() -> None:
     parser = ArgumentParser(description="Set up and start the local Running Coach")
     parser.add_argument("--setup-only", action="store_true", help="Prepare the app without starting it")
     parser.add_argument("--dev", action="store_true", help="Install test/development dependencies")
-    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
@@ -64,7 +63,7 @@ def main() -> None:
                 str(ROOT),
                 "serve",
                 "--host",
-                args.host,
+                "127.0.0.1",
                 "--port",
                 str(args.port),
             ]

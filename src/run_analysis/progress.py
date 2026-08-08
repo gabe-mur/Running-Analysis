@@ -305,35 +305,28 @@ def _activity_coverage(
             gps_percent = float(result.get("gps_coverage_fraction") or 0.0) * 100.0
             added_uncertainty = float(result.get("fallback_uncertainty_95_min_mile") or 0.0) * 60.0
             reason = (
-                f"Scored from Garmin device-distance and HR windows with {gps_percent:.0f}% GPS coverage; "
-                f"an added ±{added_uncertainty:.0f} sec/mi uncertainty reduces inverse-variance influence, "
-                f"and health/workout context contributes a separate {trend_weight:.0%} weight."
+                f"Estimated from Garmin distance because GPS covered {gps_percent:.0f}% of the run. "
+                f"Allow about {added_uncertainty:.0f} sec/mi of extra variation."
             )
         elif result and trend_weight == 1:
             status = "trend_evidence"
-            reason = "Scored at full weight in the modeled fitness trend."
+            reason = "Used normally in the fitness trend."
         elif result and included:
             status = "reduced_weight"
-            reason = (
-                f"Scored at {trend_weight:.0%} context weight because health is "
-                f"{health_tag.replace('_', ' ')} and workout type is {workout.value.replace('_', ' ')}."
-            )
+            reason = f"Used with less influence because it is tagged {health_tag.replace('_', ' ')}."
         elif result:
             status = "context_only"
-            reason = f"Scored for display; {workout.value.replace('_', ' ')} does not vote in the running trend."
+            reason = f"Shown here, but {workout.value.replace('_', ' ')} is not compared with ordinary aerobic runs."
         elif workout == WorkoutType.INTERVALS:
             status = "workout_specific"
-            reason = (
-                "Scored in the interval execution/control/stimulus/recovery analysis; intentionally excluded "
-                "from the steady aerobic pace@145 trend."
-            )
+            reason = "Analyzed as an interval workout, not as a steady aerobic run."
         elif workout in {WorkoutType.HIKE, WorkoutType.BIKE}:
             status = "non_running"
-            reason = f"Kept in history/load as {workout.value}; no running-fitness score."
+            reason = f"Counts in history and activity load as {workout.value}, not running fitness."
         else:
             status = "unscored"
             raw_reason = str(row["exclusion_reason"] or "no reliable aerobic windows")
-            reason = "No modeled fitness point: " + raw_reason.replace("_", " ").replace(";", "; ") + "."
+            reason = "Not used for fitness: " + raw_reason.replace("_", " ").replace(";", "; ") + "."
         output.append(
             FitnessCoverageItem(
                 activity_id=int(row["id"]),
@@ -389,7 +382,7 @@ def build_progress(
     pace_change_uncertainty = None
     trend = FitnessTrend.INSUFFICIENT_DATA
     confidence = ConfidenceLevel.UNAVAILABLE
-    definition = f"Robust trailing {window_days}-day estimate of reference-condition pace at target HR"
+    definition = f"Estimated pace at the same heart rate and conditions over the last {window_days} days"
     current_standardized = previous_standardized = None
     if analysis.get("available"):
         current = analysis["current"]
@@ -411,7 +404,6 @@ def build_progress(
             FitnessTrend.DECLINING,
         }:
             trend = FitnessTrend.UNCERTAIN
-        definition = str(analysis["definition"])
 
     steady_analysis = build_fitness_analytics(steady_rows, window_days) if steady_rows else {"available": False}
     steady_current_pace = None
@@ -442,9 +434,7 @@ def build_progress(
             steady_trend = FitnessTrend.UNCERTAIN
     steady_summary = FitnessBenchmarkSummary(
         definition=(
-            "Fixed-time corroboration at minute 20: a strict continuous 120-second HR 140–150 "
-            "window is used when available. Otherwise the nearest reliable window is HR-normalized "
-            "and retained with larger stability/sensor uncertainty; weather and grade are standardized to HR 145."
+            "A simple check of pace near 145 bpm around minute 20. It supports the main trend but does not replace it."
         ),
         trend=steady_trend,
         confidence=steady_confidence,
@@ -477,9 +467,9 @@ def build_progress(
         distance_change_percent=distance_change,
         load_change_percent=load_change,
         interpretation=(
-            "Pace and training load moved in different dimensions; inspect both before attributing change to fitness."
+            "Training volume and aerobic efficiency can change independently."
             if pace_change is not None and load_change is not None
-            else "Comparison is limited by missing standardized pace or HR-derived load."
+            else "There is not enough comparable pace or heart-rate data for a complete comparison."
         ),
     )
 

@@ -86,9 +86,7 @@ def test_horizon_never_pulls_long_run_earlier_to_fill_seven_days() -> None:
     assert all(day.day_role != "long_run" for day in schedule.days)
     assert schedule.run_count == 3
     assert schedule.target_run_count == 4
-    assert "additional session" in schedule.summary
-    assert "not included in the planned mileage" in schedule.summary
-    assert "capacity reference" in schedule.summary
+    assert "1 more run falls after this view" in schedule.summary
 
 
 def test_final_visible_run_is_not_forced_long_by_horizon_position() -> None:
@@ -274,3 +272,31 @@ def test_normalization_week_sequences_easy_quality_easy_long_after_run_yesterday
         "rest_day",
         "long_run",
     ]
+
+
+def test_race_inside_horizon_is_scheduled_without_previous_day_compression() -> None:
+    base = _state(running_days_28d=10)
+    states = [
+        base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
+        for offset in range(7)
+    ]
+    race_date = states[3].as_of.date().isoformat()
+    config = {
+        **CONFIG,
+        "coaching": {
+            **CONFIG["coaching"],
+            "training_goal": "5k",
+            "goal_date": race_date,
+            "goal_pace_min_mile": 9.0,
+        },
+    }
+    schedule = build_weekly_schedule(
+        states,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        config,
+        target_run_count=3,
+    )
+
+    assert schedule.days[2].recommendation is None
+    assert schedule.days[3].recommendation is not None
+    assert schedule.days[3].recommendation.workout_type == WorkoutType.RACE
