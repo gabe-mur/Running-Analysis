@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from .activity_assembly import finish_activity, quality
+from .activity_assembly import finish_activity
 from .timeparse import parse_datetime
 from .models import Activity, Lap, ParsedTCX, Trackpoint
 

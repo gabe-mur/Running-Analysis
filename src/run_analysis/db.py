@@ -454,24 +454,14 @@ def _migrate_v6(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_v7(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS external_fitness_snapshots (
-            id INTEGER PRIMARY KEY,
-            measured_at TEXT NOT NULL,
-            vo2_max REAL,
-            predicted_5k_seconds INTEGER,
-            predicted_10k_seconds INTEGER,
-            predicted_half_marathon_seconds INTEGER,
-            predicted_marathon_seconds INTEGER,
-            source TEXT NOT NULL DEFAULT 'Garmin',
-            created_at_utc TEXT NOT NULL,
-            UNIQUE(measured_at, source)
-        );
-        CREATE INDEX IF NOT EXISTS idx_external_fitness_date
-            ON external_fitness_snapshots(measured_at);
-        """
-    )
+    """Formerly created ``external_fitness_snapshots``.
+
+    That table held manually entered Garmin VO2-max and race-predictor values.
+    The feature was removed because those numbers are a black box that cannot
+    be audited, so new databases no longer get the table. Existing ones keep an
+    unread empty table rather than being altered: dropping data on upgrade is
+    not worth saving a few kilobytes.
+    """
 
 
 def _migrate_v8(connection: sqlite3.Connection) -> None:

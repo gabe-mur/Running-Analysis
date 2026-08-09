@@ -221,8 +221,15 @@ def supported_goal_pace(
 
     equivalent = []
     for pace, distance in performances:
+        # Riegel divides by the source distance. The query that feeds this
+        # filters short runs out, but the function is public and its caller
+        # promises never to raise, so a zero cannot be allowed through.
+        if distance <= 0:
+            continue
         target_minutes = pace * distance * (profile.distance_miles / distance) ** 1.06
         equivalent.append((target_minutes + profile.prediction_penalty_minutes) / profile.distance_miles)
+    if not equivalent:
+        raise ValueError("No usable performances to extrapolate from")
     return median(sorted(equivalent)[:3])
 
 
@@ -285,7 +292,18 @@ def goal_progress(
             goal_pace_min_mile=goal_pace,
         )
 
-    supported = supported_goal_pace(performances, profile)
+    try:
+        supported = supported_goal_pace(performances, profile)
+    except ValueError:
+        return GoalProgress(
+            status=GoalStatus.INSUFFICIENT_EVIDENCE,
+            headline=f"{profile.label} in {weeks:.0f} weeks",
+            detail="None of your recorded runs can be extrapolated to this distance yet.",
+            goal_label=profile.label,
+            race_date=race_date,
+            weeks_remaining=weeks,
+            goal_pace_min_mile=goal_pace,
+        )
     gap_seconds = (supported - goal_pace) * 60.0
     allowance = min(MAXIMUM_IMPROVEMENT, max(0.0, weeks) * IMPROVEMENT_PER_WEEK)
     reachable = supported * (1.0 - allowance)

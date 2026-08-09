@@ -380,3 +380,14 @@ def test_the_progress_read_out_and_the_validator_agree_on_supported_pace() -> No
         )[:3]
     )
     assert supported_goal_pace(performances, profile) == pytest.approx(expected)
+
+
+def test_a_zero_distance_run_cannot_crash_the_goal_read_out() -> None:
+    """goal_progress promises never to raise; Riegel divides by distance."""
+    from run_analysis.race_goals import RACE_GOALS, supported_goal_pace
+
+    profile = RACE_GOALS["5k"]
+    with pytest.raises(ValueError):
+        supported_goal_pace([(9.0, 0.0)], profile)
+    # A usable run alongside a bad one still produces an answer.
+    assert supported_goal_pace([(9.0, 0.0), (9.0, 3.0)], profile) > 0
