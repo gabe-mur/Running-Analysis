@@ -1,9 +1,10 @@
 # Local Running Coach
 
-A private, local app for understanding Garmin running history and planning the
-next seven days. It analyzes aerobic efficiency, training load, durability,
-individual workouts, weather, and recovery context without an LLM or
-subscription.
+A private, local app that reads your own watch files and tells you what your
+running is actually doing — whether your aerobic fitness is moving, how hard
+you have really been training, and what to run next. Everything is computed on
+your computer by fixed, inspectable rules. No account, no subscription, no LLM,
+and nothing leaves the machine unless you switch on weather lookups.
 
 ## What you need
 
@@ -43,9 +44,16 @@ click **Open** in the dialog. You only have to do this the first time.
 ### Then
 
 1. Drop your run files anywhere on the page, or use **Upload Runs**.
-2. Go to **Settings → Setup** and confirm your heart-rate numbers. Until you
-   do, the app is using defaults that may not describe you, and it will say so.
-3. Check the **Weekly Plan**.
+2. Open **Settings → Setup** and confirm your heart-rate numbers. Until you do,
+   the app is using defaults that may not describe you, and it will say so.
+   The same walkthrough is where you set an optional race goal, which changes
+   what the plan prioritises.
+3. On **Run analysis**, open any run and use **Edit run details** to correct
+   the workout type or flag illness or injury. Runs tagged that way still count
+   toward your training load but carry less weight in the fitness trend.
+4. Tell the app **how you feel** at the top of the **Weekly Plan**. That, and
+   uploading a run, are what cause the plan to rebuild — you never have to
+   generate it by hand.
 
 ### Prefer a terminal?
 
@@ -53,27 +61,48 @@ click **Open** in the dialog. You only have to do this the first time.
 port (it also finds a free one by itself), `--no-browser` suppresses the
 browser, and `--dev` adds the test dependencies.
 
-## What it shows
+## The five screens
 
-- **Dashboard:** aerobic efficiency, durability, training capacity, recent
-  form, load, and the next workout.
-- **Progress:** standardized pace-at-heart-rate trends with uncertainty.
-- **Run analysis:** pace, HR, splits/laps, zones, stops, cadence and stride,
-  weather, workout scoring, and editable metadata.
-- **Weekly plan:** an explainable seven-day schedule based on recent and sustained
-  load, workout difficulty, spacing, long-run history, health, weather, and an
-  optional validated 5K, 10K, half-marathon, or marathon goal.
+- **Dashboard** — one training status (*building, maintaining, rebuilding,
+  recovering, strained, underloaded*, or *not enough data*) with the rules that
+  produced it shown in order, plus separate read-outs for aerobic efficiency,
+  durability, training capacity, and recent form.
+- **Progress** — your pace at a fixed heart rate over time, adjusted for
+  weather, hills, and how far into the run you were, with the uncertainty
+  drawn rather than hidden. Also an estimated VO₂ max, a verdict on your
+  easy/moderate/hard balance, and progress toward your goal.
+- **Run analysis** — every run, and for each one: splits, heart-rate zones,
+  cadence and stride length, stops, weather, drift, a reconstructed workout
+  structure for intervals, and what to run next.
+- **Weekly plan** — an explainable seven days built from recent and sustained
+  load, workout difficulty, spacing, long-run history, how you feel, the
+  forecast, and an optional validated 5K, 10K, half-marathon, or marathon goal.
+- **Settings**, with a guided **Setup** inside it for the handful of numbers
+  everything else depends on.
 
-The app keeps fitness, session difficulty, and accumulated load separate. A
-slow long run is not automatically treated as worse fitness than a short fast
-run.
+## What makes it different
+
+It separates fitness, session difficulty, and accumulated load, so a slow long
+run is not mistaken for lost fitness.
+
+It says how much it knows. Every figure carries a confidence level, runs that
+cannot support a fair comparison are excluded and say why, and where a
+calculation rests on an assumption — an estimated maximum heart rate, a
+population constant — it names it.
+
+It will not invent an answer. When the evidence is thin it says so instead of
+producing a confident number, and it never turns a free-text note into a
+diagnosis.
 
 ## Privacy
 
-Run files, settings, health tags, databases, and reports stay on your computer
-and are ignored by Git. Historical weather and planned forecasts are separate,
-disabled-by-default options. If enabled, the app sends dates or planned times
-and rounded, privacy-jittered route centroids to Open-Meteo—not raw routes.
+Run files, settings, health tags, the database, and any reports stay on your
+computer and are excluded from Git. There is no account and no server.
+
+Historical weather and forecasts are the only features that reach the internet,
+and both are opt-in. When enabled, the app sends a date or planned time and a
+rounded, randomly offset approximate location to Open-Meteo. Your route is
+never sent, and the blur radius is yours to set in Setup.
 
 See [Privacy](docs/privacy.md), [Modeling methodology](docs/modeling_methodology.md),
 and [Application architecture](docs/application_architecture.md) for details.
