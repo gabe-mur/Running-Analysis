@@ -18,6 +18,17 @@ and nothing leaves the machine unless you switch on weather lookups.
   app imports and displays fewer than that; it just will not claim a trend it
   cannot support.
 
+## Download it
+
+On this page, click the green **Code** button near the top, then
+**Download ZIP**. Unzip it, and you will have a folder called
+`Running-Analysis-main`.
+
+Put that folder somewhere you intend to keep — your Documents folder is fine,
+your Downloads folder is not. The app stores your runs, settings, and analysis
+*inside* this folder, so deleting it deletes your history. You can rename or
+move it later without breaking anything.
+
 ## Open the app
 
 Double-click the launcher for your computer:
