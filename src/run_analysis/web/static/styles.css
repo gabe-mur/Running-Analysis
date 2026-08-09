@@ -480,6 +480,7 @@ body.dragging::after { content: "Drop TCX files to analyze"; position: fixed; in
 .zone-table tr.zone-highlight td { color: var(--accent); font-weight: 650; }
 .zone-effect strong { font-size: 1.8rem; }
 .setup-toggles { display: grid; gap: .8rem; margin: 1rem 0; }
+.setup-save { display: flex; flex-wrap: wrap; align-items: center; gap: .8rem; margin-top: 1.5rem; }
 .toggle { flex-direction: row !important; align-items: center; gap: .6rem !important; color: #eef2f6 !important; }
 
 /* The nudge. Amber, because a default standing in for an answer is exactly
@@ -495,6 +496,13 @@ body.dragging::after { content: "Drop TCX files to analyze"; position: fixed; in
 /* Advanced settings. Collapsed by default because these are the constants the
    published figures were validated against, and an everyday settings page that
    opens on them invites tuning nobody asked for. */
+/* A second Save beside the title. The page is long enough that the bottom
+   button is off-screen while you are editing the top of it. Both submit the
+   same form and share one status line, so a save reported in only one place
+   cannot look like it failed. */
+.heading-actions { flex: none; margin: 0; }
+#settings-status-top:not(:empty), #settings-status:not(:empty) { margin-left: .2rem; }
+
 .advanced-settings { margin-top: 1.5rem; }
 .advanced-settings summary { display: flex; align-items: baseline; gap: .8rem; cursor: pointer; }
 .advanced-settings summary b { color: #eef2f6; }

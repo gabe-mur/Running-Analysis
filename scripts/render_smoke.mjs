@@ -61,6 +61,48 @@ const cases = [
 // the stylesheet gives it meaning. A rename that lands in one and not the
 // other produces no error at all -- just uncoloured, un-laid-out markup. So
 // every emitted state class is checked against a real rule in styles.css.
+// Views render fine with a missing import; the ReferenceError only fires when
+// a handler runs. That is how "Save settings" silently did nothing for a
+// while. Cross-check every helper a module calls against what it imports.
+{
+  const fs = await import("node:fs/promises");
+  const files = (await fs.readdir(`${dir}/views`)).map((n) => `views/${n}`).concat(["charts.js", "components.js", "goal.js", "format.js", "api.js", "dom.js", "uploads.js"]);
+  const format = await fs.readFile(`${dir}/format.js`, "utf8");
+  const exported = new Set([
+    ...[...format.matchAll(/export (?:function|const) ([A-Za-z_$][\w$]*)/g)].map((m) => m[1]),
+    // `export { a, b, c };` blocks put several names on one line.
+    ...[...format.matchAll(/export\s*\{([^}]*)\}/g)]
+      .flatMap((m) => m[1].split(","))
+      .map((name) => name.trim().split(" as ").pop().trim())
+      .filter(Boolean),
+  ]);
+  let missing = 0;
+  for (const file of files) {
+    let src;
+    try { src = await fs.readFile(`${dir}/${file}`, "utf8"); } catch { continue; }
+    const imported = new Set(
+      [...src.matchAll(/import\s*\{([^}]*)\}\s*from/g)]
+        .flatMap((m) => m[1].split(",").map((n) => n.trim().split(" as ").pop().trim()))
+        .filter(Boolean),
+    );
+    const declared = new Set([...src.matchAll(/(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+    // A helper passed in as a parameter is not a missing import.
+    for (const [, params] of src.matchAll(/(?:function\s*[A-Za-z_$][\w$]*\s*|\(\s*)\(?([^()]*)\)\s*(?:=>|\{)/g)) {
+      for (const part of params.split(",")) {
+        const name = part.trim().split(/[\s=:]/)[0].replace(/[{}.]/g, "");
+        if (name) declared.add(name);
+      }
+    }
+    for (const name of exported) {
+      if (new RegExp(`[^.\\w]${name}\\s*\\(`).test(src) && !imported.has(name) && !declared.has(name)) {
+        console.log(`WARN ${file}: calls ${name}() but never imports it`);
+        missing++;
+      }
+    }
+  }
+  if (missing) { console.log(`${missing} missing import(s)`); process.exitCode = 1; }
+}
+
 const css = await (await import("node:fs/promises")).readFile(
   new URL("../src/run_analysis/web/static/styles.css", import.meta.url), "utf8");
 const STATEFUL = ["trend", "trend-arrow", "trend-status", "fitness-signal", "training-status"];

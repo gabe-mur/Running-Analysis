@@ -1,6 +1,6 @@
 import { api, appSettings, invalidateSettings, primeSettings } from "../api.js";
 import { view, loading } from "../dom.js";
-import { fitnessWindowLabel, pace, titleCase } from "../format.js";
+import { durationSeconds, fitnessWindowLabel, pace, titleCase } from "../format.js";
 
 export async function renderSettings() {
   loading("Settings");
@@ -41,7 +41,10 @@ export async function renderSettings() {
   };
   view.innerHTML = `
     <section class="page settings-page">
-      <div class="page-heading"><div><p class="eyebrow">Stored locally</p><h1>Settings</h1><p>Everything here stays on this computer. Only weather lookups you turn on contact Open-Meteo.</p></div></div>
+      <form id="settings-form">
+      <div class="page-heading"><div><p class="eyebrow">Stored locally</p><h1>Settings</h1><p>Everything here stays on this computer. Only weather lookups you turn on contact Open-Meteo.</p></div>
+        <div class="settings-actions heading-actions"><button class="primary-button" type="submit">Save settings</button><span id="settings-status-top"></span></div>
+      </div>
       <article class="wide-card setup-entry ${setup.complete ? "" : "pending"}">
         <div>
           <p class="eyebrow">Setup</p>
@@ -52,7 +55,7 @@ export async function renderSettings() {
         </div>
         <a class="primary-button" href="#setup">${setup.complete ? "Review setup" : "Finish setup"}</a>
       </article>
-      <form id="settings-form"><div class="settings-grid">
+      <div class="settings-grid">
         <fieldset><legend>Heart rate</legend><label>Maximum HR<input type="number" name="max_hr" value="${settings.max_hr}"></label><label>Resting HR<input type="number" name="resting_hr" value="${settings.resting_hr}"></label><label>Comparison HR<input type="number" name="target_hr" value="${settings.target_hr}"></label><p>The app compares runs at this same heart rate.</p></fieldset>
         <fieldset><legend>Optional VO₂ estimate</legend><label>Birth date<input type="date" name="profile_birth_date" value="${settings.profile?.birth_date ?? ""}"></label><label>Sex used by the equation<select name="profile_sex"><option value="male" ${settings.profile?.sex === "male" ? "selected" : ""}>Male</option><option value="female" ${settings.profile?.sex === "female" ? "selected" : ""}>Female</option></select></label><label>Weight (lb)<input type="number" step="0.1" name="profile_weight_lb" value="${settings.profile?.weight_lb ?? ""}"></label><label>Height (in)<input type="number" step="0.1" name="profile_height_in" value="${settings.profile?.height_in ?? ""}"></label><p>Used only for the local formula check. It is not Garmin's estimate.</p></fieldset>
         <fieldset><legend>Running zones</legend>${zoneInputs}</fieldset>
@@ -80,6 +83,24 @@ export async function renderSettings() {
       <div class="settings-actions"><button class="primary-button" type="submit">Save settings</button><span id="settings-status"></span></div></form>
     </section>`;
   const form = view.querySelector("#settings-form");
+
+  // Race fields are meaningless for general fitness, so they empty and grey out
+  // as soon as the goal changes instead of sitting there looking authoritative.
+  const goalSelect = form.querySelector('select[name="training_goal"]');
+  const raceFields = [form.querySelector('input[name="goal_date"]'), form.querySelector('input[name="goal_pace"]')].filter(Boolean);
+  function syncRaceFields({ clear } = { clear: false }) {
+    if (!goalSelect) return;
+    const general = goalSelect.value === "general_fitness";
+    raceFields.forEach((input) => {
+      if (!input) return;
+      if (general && clear) input.value = "";
+      input.disabled = general;
+      input.closest("label")?.classList.toggle("disabled-field", general);
+    });
+  }
+  goalSelect?.addEventListener("change", () => syncRaceFields({ clear: true }));
+  syncRaceFields();
+
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(form); const numeric = (name) => Number(data.get(name));
@@ -90,12 +111,23 @@ export async function renderSettings() {
       moving_time: Object.fromEntries(Object.keys(settings.moving_time).map((name) => [name, numeric(`moving_${name}`)])),
       coaching: {
         ...Object.fromEntries(Object.keys(settings.coaching).filter((name) => !["training_goal", "goal_date", "goal_pace_min_mile", "quality_sessions"].includes(name)).map((name) => [name, numeric(`coaching_${name}`)])),
-        training_goal: data.get("training_goal"), goal_date: data.get("goal_date") || null,
-        goal_pace_min_mile: durationSeconds(data.get("goal_pace")) ? durationSeconds(data.get("goal_pace")) / 60 : null,
+        training_goal: data.get("training_goal"),
+        // A race date and pace only mean something for a race. Keeping them
+        // when the goal is general fitness leaves a goal the app half-believes.
+        goal_date: data.get("training_goal") === "general_fitness" ? null : data.get("goal_date") || null,
+        goal_pace_min_mile:
+          data.get("training_goal") === "general_fitness" || !durationSeconds(data.get("goal_pace"))
+            ? null
+            : durationSeconds(data.get("goal_pace")) / 60,
         quality_sessions: Object.fromEntries(Object.keys(settings.coaching.quality_sessions).map((name) => [name, data.get(`quality_${name}`) === "on"])),
       },
     };
-    const status = form.querySelector("#settings-status"); const button = form.querySelector("button[type=submit]");
+    const statusNodes = [...form.querySelectorAll("#settings-status, #settings-status-top")];
+    const status = {
+      set textContent(value) { statusNodes.forEach((node) => { node.textContent = value; }); },
+    };
+    const buttons = [...form.querySelectorAll("button[type=submit]")];
+    const button = { set disabled(value) { buttons.forEach((node) => { node.disabled = value; }); } };
     const profileBirthDate = data.get("profile_birth_date");
     const profileWeight = data.get("profile_weight_lb");
     const profileHeight = data.get("profile_height_in");
@@ -109,7 +141,16 @@ export async function renderSettings() {
       return;
     }
     if (profileHasAnyValue) {
-      payload.profile = { birth_date: profileBirthDate, sex: data.get("profile_sex"), weight_lb: Number(profileWeight), height_in: Number(profileHeight) };
+      // Spread the stored profile first: this form does not show
+      // max_hr_source, and rebuilding the object without it silently reset a
+      // measured maximum to "estimated" and widened the VO2 interval.
+      payload.profile = {
+        ...(settings.profile ?? {}),
+        birth_date: profileBirthDate,
+        sex: data.get("profile_sex"),
+        weight_lb: Number(profileWeight),
+        height_in: Number(profileHeight),
+      };
     }
     status.textContent = "Validating and recalculating…"; button.disabled = true;
     try {
@@ -122,7 +163,7 @@ export async function renderSettings() {
     finally { button.disabled = false; }
   });
 
-  view.querySelector("#reset-advanced").addEventListener("click", async (event) => {
+  view.querySelector("#reset-advanced")?.addEventListener("click", async (event) => {
     const status = view.querySelector("#reset-status");
     // Destructive-ish and one click away, so it asks. It cannot touch personal
     // settings, and the confirmation says so rather than being vague.
