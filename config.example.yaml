@@ -91,14 +91,19 @@ model:
   minimum_reliable_hr_bpm: 125
   maximum_reliable_hr_bpm: 165
   maximum_reliable_segment_stop_fraction: 0.15
+  # Heart rate drops during a stop and needs minutes of running to catch
+  # back up. Windows overlapping that recovery look artificially efficient.
+  post_pause_minimum_stop_seconds: 60
+  post_pause_suppression_moving_seconds: 180
   random_seed: 145
 
 activity_classification:
   high_confidence_walk_pace_min_mile: 18
-  high_confidence_walk_cadence_max: 55
+  high_confidence_walk_cadence_max_spm: 110
   high_confidence_bike_pace_min_mile: 5.5
   review_slow_pace_min_mile: 13
-  review_low_cadence_max: 70
+  very_low_cadence_max_spm: 130
+  review_low_cadence_max_spm: 140
   minimum_review_score: 3
   review_limit: 3
 

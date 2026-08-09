@@ -25,7 +25,7 @@ class Segment:
     moving_pace_min_mile: float | None
     average_hr_bpm: float | None
     maximum_hr_bpm: int | None
-    average_cadence: float | None
+    average_cadence_spm: float | None
     elevation_gain_m: float | None
     elevation_loss_m: float | None
     net_elevation_change_m: float | None
@@ -147,9 +147,11 @@ def _add_piece(
             if candidates:
                 local_max = max(candidates)
                 builder.maximum_hr = local_max if builder.maximum_hr is None else max(builder.maximum_hr, local_max)
+        # Total steps per minute via the one canonical conversion, never the
+        # raw one-sided device value.
         cadence = _interpolated_average(
-            interval.start.cadence,
-            interval.end.cadence,
+            interval.start.cadence_spm,
+            interval.end.cadence_spm,
             start_fraction,
             end_fraction,
         )
@@ -248,7 +250,7 @@ def _finish(
         moving_pace_min_mile=pace,
         average_hr_bpm=builder.hr_weighted / builder.hr_seconds if builder.hr_seconds else None,
         maximum_hr_bpm=builder.maximum_hr,
-        average_cadence=builder.cadence_weighted / builder.cadence_seconds if builder.cadence_seconds else None,
+        average_cadence_spm=builder.cadence_weighted / builder.cadence_seconds if builder.cadence_seconds else None,
         elevation_gain_m=gain,
         elevation_loss_m=loss,
         net_elevation_change_m=net,

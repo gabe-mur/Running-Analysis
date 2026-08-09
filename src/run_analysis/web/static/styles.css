@@ -4,6 +4,8 @@
   background: #0a0e14; color: #eef2f6;
   --panel: #111821; --panel-soft: #0e151e; --line: #25303c; --muted: #98a6b5;
   --accent: #79d5b3; --accent-strong: #37bd8d; --warning: #f2c66d; --danger: #ff9088;
+  /* The 'no clear change' state: deliberately neutral, never absent. */
+  --flat: #eef2f6; --flat-rail: #7d8b9a;
 }
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 76% -20%, #17342f 0, transparent 36rem), #0a0e14; }
@@ -12,8 +14,41 @@ button, input, select, textarea { font: inherit; }
 .brand { color: #fff; text-decoration: none; font-weight: 750; letter-spacing: -.02em; display: flex; align-items: center; gap: .7rem; }
 .brand-mark { display: grid; place-items: center; width: 2rem; height: 2rem; border: 1px solid #38715f; border-radius: .55rem; color: var(--accent); font-size: .72rem; }
 nav { display: flex; gap: 1.35rem; flex: 1; }
-nav a { color: var(--muted); text-decoration: none; font-size: .93rem; padding: .6rem 0; border-bottom: 2px solid transparent; }
-nav a:hover, nav a.active { color: #fff; border-bottom-color: var(--accent-strong); }
+/* Each section owns a hue, and the nav underline carries the same one as the
+   dashboard card that opens it. Two ways in, one colour.
+
+   Progress takes the app's hero green because it is the headline question this
+   whole app exists to answer. Dashboard cannot also be green -- it was a
+   darker shade of the same hue, which read as a rendering artefact rather than
+   a distinction -- so it gets all three section colours at once, which is
+   literally what the page is: the place the three meet.
+
+   Underlines are always drawn, desaturated to match the muted label, so the
+   nav shows its structure at rest and only resolves into colour on the item
+   you are pointing at or already on. */
+nav a { position: relative; color: var(--muted); text-decoration: none; font-size: .93rem; padding: .6rem 0 .7rem; transition: color .15s ease; }
+nav a::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--route-underline, var(--route-hue, var(--muted)));
+  /* Dimmed, not desaturated. Greyscale threw away the hue, which was the
+     one thing the underline was there to carry. */
+  opacity: .55;
+  filter: brightness(.68) saturate(.95);
+  transition: opacity .16s ease, filter .16s ease;
+}
+nav a[data-route="dashboard"] { --route-hue: #cfd9e2; --route-underline: linear-gradient(90deg, var(--accent-strong), #6f8fc4, #9a78bd); }
+nav a[data-route="progress"]  { --route-hue: var(--accent-strong); }
+nav a[data-route="runs"]      { --route-hue: #6f8fc4; }
+nav a[data-route="next-run"]  { --route-hue: #9a78bd; }
+nav a[data-route="settings"]  { --route-hue: #7d8b9a; }
+nav a:hover, nav a.active { color: #fff; }
+nav a:hover::after, nav a.active::after { opacity: 1; filter: none; }
+nav a.active::after { height: 2.5px; }
+nav a:focus-visible { outline: 2px solid var(--route-hue, var(--accent-strong)); outline-offset: 3px; border-radius: 2px; }
 button { border: 1px solid #3b7666; border-radius: .55rem; padding: .65rem .9rem; background: #173d34; color: #c8f7e6; cursor: pointer; }
 button:disabled { opacity: .45; cursor: wait; }
 .icon-button { border: 0; background: transparent; color: var(--muted); font-size: 1.6rem; padding: .2rem; }
@@ -28,27 +63,109 @@ h2 { letter-spacing: -.025em; }
 .status { display: inline-flex; margin-top: 1rem; border: 1px solid var(--line); padding: .55rem .75rem; border-radius: 999px; color: var(--muted); }
 .status.ready { border-color: #32735f; color: var(--accent); }
 .contract-grid, .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: clamp(3rem, 8vw, 6rem); }
-article, .wide-card { padding: 1.45rem; border: 1px solid var(--line); border-radius: .8rem; background: linear-gradient(145deg, rgba(21,30,41,.96), rgba(13,19,27,.96)); }
+article, .wide-card, .next-run-panel, .context-panel { padding: 1.45rem; border: 1px solid var(--line); border-radius: .8rem; background: linear-gradient(145deg, rgba(21,30,41,.96), rgba(13,19,27,.96)); }
 article p:last-child { color: var(--muted); line-height: 1.55; }
 .contract-grid article { min-height: 210px; }
 .contract-grid h2 { margin: .5rem 0 .75rem; font-size: 1.3rem; }
-.dashboard-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 3rem; }
-.dashboard-card { min-height: 360px; display: flex; flex-direction: column; padding: 1.5rem; border: 1px solid var(--line); border-radius: .85rem; color: inherit; text-decoration: none; background: linear-gradient(145deg, #151e29, #0d131b); transition: transform .15s ease, border-color .15s ease; }
-.dashboard-card:hover { transform: translateY(-2px); border-color: #456173; }
-.dashboard-card.fitness-card { background: radial-gradient(circle at 100% 0, #1b4438, transparent 24rem), #111921; }
-.dashboard-card.next-card { border-color: #386e5c; }
-.dashboard-card h2 { margin: .4rem 0; font-size: clamp(1.7rem, 3vw, 2.5rem); }
-.dashboard-card > strong { color: var(--muted); margin-bottom: auto; }
-.dashboard-card > small { color: var(--muted); line-height: 1.45; margin-top: 1rem; }
+.dashboard-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+/* The three destination cards.
+   They were drifting: one had a green border, one had a gradient, one had
+   nothing, so the differences read as accident rather than meaning. Now they
+   share one structure -- eyebrow question, answer, two stats, a named exit --
+   and differ only in hue. The hue is a wayfinding cue that matches the section
+   it opens, so colour tells you where you are going before you read the label.
+   Nothing is a status colour here; green/amber stay reserved for verdicts. */
+.dashboard-card {
+  position: relative;
+  min-height: 360px;
+  display: flex;
+  flex-direction: column;
+  padding: 1.5rem;
+  padding-bottom: 3.35rem;
+  border: 1px solid var(--line);
+  border-radius: .85rem;
+  color: inherit;
+  text-decoration: none;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 100% 0, var(--card-tint, transparent) 0, transparent 62%),
+    linear-gradient(155deg, #16202b, #0d131b);
+  transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+/* A hairline of the card's own hue along the top: enough to group the cards
+   without the heavy full border that used to swallow the hover state. */
+.dashboard-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, var(--card-rule, transparent), transparent 70%);
+}
+.dashboard-card.card-progress { --card-tint: rgba(55,189,141,.26); --card-rule: var(--accent-strong); }
+.dashboard-card.card-run      { --card-tint: rgba(96,124,178,.30); --card-rule: #6f8fc4; }
+.dashboard-card.card-plan     { --card-tint: rgba(150,116,183,.28); --card-rule: #9a78bd; }
+.dashboard-card:hover, .dashboard-card:focus-visible {
+  transform: translateY(-2px);
+  border-color: var(--card-rule, #456173);
+  box-shadow: 0 14px 34px rgba(0,0,0,.38);
+}
+/* The exit label. Anchored to the bottom edge so all three line up however
+   much content sits above them, and it moves on hover so the whole card
+   reads as one clickable object rather than a box containing a link. */
+.panel-action {
+  position: absolute;
+  left: 1.5rem;
+  bottom: 1.35rem;
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  color: var(--card-rule, var(--accent));
+  font-size: .82rem;
+  font-weight: 650;
+  letter-spacing: .01em;
+  transition: transform .16s ease;
+}
+.dashboard-card:hover .panel-action { transform: translateX(3px); }
 .dashboard-stat { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; padding: .7rem 0; border-bottom: 1px solid var(--line); }
 .dashboard-stat b { color: #fff; }
 .dashboard-stat span { color: var(--muted); font-size: .8rem; }
 .dashboard-load { margin-top: 1rem; }
 .detailed-signals { grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
-.fitness-signal { border-left: 3px solid var(--muted); }
-.fitness-signal.improving { border-left-color: var(--accent); }
-.fitness-signal.declining { border-left-color: var(--warning); }
-.fitness-signal.insufficient_data { border-left-color: #607080; }
+/* One three-colour vocabulary for every direction cue in the app: green for
+   improving, neutral for no clear change, amber for attention. Colour lands on
+   the rail, the arrow, and the verdict word -- never on the card surface, so a
+   measurement never reads as a status badge. */
+.fitness-signal { border-left: 3px solid var(--flat-rail); }
+.fitness-signal.good { border-left-color: var(--accent); }
+.fitness-signal.bad { border-left-color: var(--warning); }
+.fitness-signal.neutral { border-left-color: var(--flat-rail); }
+.fitness-signal.none { border-left-color: #4a5765; }
+/* <i> italicises by default, which slants the glyph. The arrows must read as
+   upright direction marks, not emphasis. */
+.trend-arrow { display: inline-block; min-width: 1.05em; font-weight: 800; font-style: normal; color: var(--flat); }
+.trend-arrow.good, .trend-status.good, .trend.good { color: var(--accent); }
+.trend-arrow.bad, .trend-status.bad, .trend.bad { color: var(--warning); }
+.trend-arrow.neutral, .trend-status.neutral, .trend.neutral { color: var(--flat); }
+.trend-arrow.none, .trend-status.none, .trend.none { color: var(--muted); }
+.trend-status { font-weight: 720; }
+.trend { display: inline-flex; flex-direction: row; align-items: baseline; gap: .35rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* The dashboard headline. It is a classification, not a score, so it is set as
+   a word rather than a number and takes the same three colours. */
+.training-status { letter-spacing: -.03em; }
+.training-status.good { color: var(--accent); }
+.training-status.bad { color: var(--warning); }
+.training-status.neutral { color: #fff; }
+.training-status.none { color: var(--muted); }
+.status-detail { color: #cfd9e2 !important; }
+.status-why { margin-top: 1.75rem; padding: 1rem clamp(1.2rem, 4vw, 2rem); }
+.status-why summary { display: flex; align-items: baseline; gap: .8rem; }
+.status-why summary b { color: #eef2f6; }
+.rule-trace { display: grid; gap: .5rem; margin: .8rem 0 0; padding-left: 1.2rem; }
+.rule-trace li { color: var(--muted); }
+.rule-trace li b { display: block; font-weight: 600; }
+.rule-trace li small { font-variant-numeric: tabular-nums; font-size: .8rem; }
+.rule-trace li.fired b { color: var(--accent); font-weight: 700; }
 .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 2rem; margin-bottom: 2rem; }
 .page-heading h1 { font-size: clamp(2.5rem, 5vw, 4rem); margin-bottom: .5rem; }
 .page-heading p { color: var(--muted); margin: 0; }
@@ -69,7 +186,72 @@ article p:last-child { color: var(--muted); line-height: 1.55; }
 .headline-pace { display: flex; flex-direction: column; align-items: end; }
 .headline-pace strong { font-size: 2rem; }
 .headline-pace span { color: var(--muted); }
-.assessment { margin: 1rem 0; background: linear-gradient(135deg, rgba(29,64,54,.8), rgba(13,23,28,.95)); }
+/* The verdict on the run just finished, beside what to do next. Equal weight:
+   a finished run raises one question, and it is about tomorrow. */
+.run-summary-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 1rem; margin: 1rem 0; align-items: stretch; }
+/* A panel tinted with its section's hue. Defined once: the gradient and the
+   hairline were being copied per panel, and a fourth copy is how they start
+   disagreeing. Each user sets two variables and nothing else. */
+.assessment, .context-panel, .goal-panel, .schedule-summary {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 100% 0, var(--card-tint) 0, transparent 62%),
+    linear-gradient(155deg, #16202b, #0d131b);
+}
+.assessment::before, .context-panel::before, .goal-panel::before, .schedule-summary::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, var(--card-rule), transparent 70%);
+}
+/* The verdict on this run. Run analysis is the blue section, so it carries
+   blue -- it was still wearing the old green. */
+.assessment { margin: 0; --card-rule: #6f8fc4; --card-tint: rgba(111,143,196,.26); }
+/* Same card, different destination, so it borrows the plan hue from the
+   dashboard rather than inventing a third treatment. Only the two variables
+   change; the gradient and hairline are inherited from .assessment. */
+.next-run-panel {
+  display: flex;
+  flex-direction: column;
+  /* Room for the action label pinned to the bottom edge. */
+  padding-bottom: 3.35rem;
+  color: inherit;
+  text-decoration: none;
+  --card-rule: #9a78bd;
+  --card-tint: rgba(150,116,183,.28);
+  transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.next-run-panel:hover, .next-run-panel:focus-visible {
+  transform: translateY(-2px);
+  border-color: var(--card-rule);
+  box-shadow: 0 14px 34px rgba(0,0,0,.38);
+}
+.next-run-panel h2 { margin: .3rem 0 .5rem; font-size: clamp(1.35rem, 2.2vw, 1.75rem); line-height: 1.3; text-wrap: balance; }
+.next-run-detail { color: var(--muted); margin: 0 0 auto; }
+.next-run-week { display: flex; flex-direction: column; gap: .2rem; padding-top: .9rem; margin-top: .9rem; border-top: 1px solid var(--line); }
+.next-run-week span { color: var(--muted); font-size: .78rem; }
+.next-run-week strong { font-size: 1.05rem; }
+.next-run-panel .panel-action { left: 1.45rem; bottom: 1.35rem; }
+.next-run-panel:hover .panel-action { transform: translateX(3px); }
+/* Built exactly like the plan panel; only the destination hue differs, which
+   keeps the "colour tells you where this goes" rule intact. */
+.context-panel {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 3.35rem;
+  color: inherit;
+  text-decoration: none;
+  --card-rule: var(--accent-strong);
+  --card-tint: rgba(55,189,141,.24);
+  transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.context-panel:hover, .context-panel:focus-visible { transform: translateY(-2px); border-color: var(--card-rule); box-shadow: 0 14px 34px rgba(0,0,0,.38); }
+.context-panel h2 { margin: .3rem 0 .5rem; font-size: clamp(1.35rem, 2.2vw, 1.75rem); line-height: 1.3; text-wrap: balance; }
+.context-panel .panel-action { left: 1.45rem; bottom: 1.35rem; }
+.context-panel:hover .panel-action { transform: translateX(3px); }
+@media (max-width: 900px) { .run-summary-grid { grid-template-columns: 1fr; } }
 .assessment h2 { max-width: 900px; line-height: 1.4; }
 .feedback-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .feedback-columns ul { margin: 0; padding-left: 1.2rem; line-height: 1.7; }
@@ -90,7 +272,7 @@ details summary { cursor: pointer; color: var(--accent); }
 .contribution-list small { color: var(--muted); grid-column: 1 / -1; }
 .metric-grid { grid-template-columns: repeat(4, 1fr); margin-top: 1rem; }
 .metric-grid article { min-height: 130px; display: flex; flex-direction: column; }
-.metric-grid span, .metric-grid small { color: var(--muted); }
+.metric-grid > article > span, .metric-grid > article > small { color: var(--muted); }
 .metric-grid strong { font-size: 1.5rem; margin: .6rem 0 auto; }
 .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .zone-row { display: grid; grid-template-columns: 4.5rem 1fr 2.5rem; gap: .7rem; align-items: center; margin: .55rem 0; }
@@ -123,8 +305,7 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .fitness-chart text { fill: var(--muted); font-size: 11px; }
 .grid-line { stroke: #222e3a; stroke-width: 1; }
 .chart-line { fill: none; }
-.trend-7 { stroke: var(--accent); stroke-width: 2.4; }
-.trend-28 { stroke: #7b92a5; stroke-width: 3.5; opacity: .7; }
+.trend-28 { stroke: var(--accent); stroke-width: 3.2; }
 .fitness-chart circle { fill: #0a0e14; stroke: var(--accent); stroke-width: 2; cursor: pointer; }
 .fitness-chart circle:hover { fill: var(--accent); }
 .fitness-chart circle.reduced-evidence { stroke: var(--warning); stroke-dasharray: 2 2; opacity: .85; }
@@ -136,7 +317,7 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .chart-legend { position: absolute; right: .4rem; top: .2rem; display: flex; gap: .8rem; color: var(--muted); font-size: .7rem; }
 .chart-legend span { display: flex; align-items: center; gap: .3rem; }
 .chart-legend i { width: 1.1rem; height: 2px; background: var(--accent); }
-.chart-legend .trend28-key { height: 3px; background: #7b92a5; }
+.chart-legend .trend28-key { height: 3px; background: var(--accent); }
 .chart-legend .point-key { width: .45rem; height: .45rem; border: 1px solid var(--accent); border-radius: 50%; background: transparent; }
 .chart-legend .estimated-key { width: .45rem; height: .45rem; border: 2px dotted #8da9d8; border-radius: 50%; background: transparent; }
 .chart-legend .reduced-key { width: .45rem; height: .45rem; border: 1px dashed var(--warning); border-radius: 50%; background: transparent; }
@@ -147,8 +328,10 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .coverage-card a { color: var(--accent); text-decoration: none; }
 .coverage-reason { white-space: normal; min-width: 18rem; color: var(--muted); }
 .comparison-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; }
-.comparison-grid span { display: flex; flex-direction: column; color: var(--muted); padding: .75rem; background: #0b121a; border-radius: .55rem; }
-.comparison-grid strong { color: #fff; margin-top: .3rem; }
+/* Direct children only: a .trend span nested inside must not pick up the
+   card's column layout, padding, or muted colour. */
+.comparison-grid > span { display: flex; flex-direction: column; color: var(--muted); padding: .75rem; background: #0b121a; border-radius: .55rem; }
+.comparison-grid > span > strong { color: #fff; margin-top: .3rem; font-size: 1.35rem; letter-spacing: -.02em; }
 .intensity-bar { display: flex; height: .8rem; overflow: hidden; background: #1c2630; border-radius: 99px; }
 .intensity-bar b { background: var(--accent-strong); }
 .intensity-bar i { background: var(--warning); }
@@ -161,7 +344,7 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .planning-row label { display: flex; flex-direction: column; gap: .4rem; font-weight: 700; }
 .planning-row small { color: var(--muted); padding-bottom: .7rem; }
 .planning-row input { padding: .75rem; border: 1px solid var(--line); border-radius: .55rem; background: #090e14; color: #fff; color-scheme: dark; }
-.schedule-summary { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
+.schedule-summary { display: flex; justify-content: space-between; align-items: start; gap: 1rem; --card-rule: #9a78bd; --card-tint: rgba(150,116,183,.26); }
 .week-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: .7rem; margin-top: 1rem; }
 .schedule-day { min-height: 19rem; padding: 1rem; }
 .schedule-day h2 { font-size: 1.15rem; }
@@ -201,8 +384,8 @@ textarea { resize: vertical; padding: .75rem; border: 1px solid var(--line); bor
 .interval-card tbody tr.interval-recovery { color: var(--muted); }
 .progression { border-color: #387663; background: #101a1c; }
 .signal-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: .7rem; margin: 1rem 0; }
-.signal-grid span { display: flex; flex-direction: column; gap: .35rem; padding: .9rem; border: 1px solid var(--line); border-radius: .6rem; background: #0b121a; }
-.signal-grid small, .context-note { color: var(--muted); }
+.signal-grid > span { display: flex; flex-direction: column; gap: .35rem; padding: .9rem; border: 1px solid var(--line); border-radius: .6rem; background: #0b121a; }
+.signal-grid > span > small, .context-note { color: var(--muted); }
 .context-note { border-left: 2px solid var(--warning); padding-left: .8rem; }
 .external-fitness { margin-top: 1rem; }
 .inline-metric-form { display: grid; grid-template-columns: repeat(3, minmax(8rem, 1fr)) auto; gap: .7rem; align-items: end; margin: 1rem 0; }
@@ -210,8 +393,31 @@ textarea { resize: vertical; padding: .75rem; border: 1px solid var(--line); bor
 .inline-metric-form input { padding: .65rem; border: 1px solid var(--line); border-radius: .5rem; background: #090e14; color: #fff; color-scheme: dark; }
 .inline-metric-form button { min-height: 2.65rem; }
 .inline-metric-form span { grid-column: 1 / -1; color: var(--warning); }
+.cadence-grid { grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); }
+.cadence-grid strong { font-size: 1.3rem; }
+.cadence-observations { display: grid; gap: .5rem; margin: 1.1rem 0 0; padding-left: 1.15rem; }
+.cadence-observations li { color: #cfd9e2; }
 .vo2-grid .inline-metric-form { grid-template-columns: 1fr 1fr; }
 .vo2-grid .inline-metric-form button { grid-column: 1 / -1; }
+/* The VO2 estimate: figure on the left, its trajectory on the right. Shown
+   openly and labelled estimated, rather than hidden behind a disclosure. */
+.vo2-card { margin-top: 1rem; }
+.vo2-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: clamp(1.2rem, 3vw, 2.4rem); align-items: start; }
+.vo2-value { display: flex; align-items: baseline; gap: .5rem; margin: .2rem 0 .1rem; }
+.vo2-value strong { font-size: clamp(2.4rem, 6vw, 3.4rem); font-weight: 780; letter-spacing: -.04em; line-height: 1; font-variant-numeric: tabular-nums; }
+.vo2-value span { color: var(--muted); font-size: .9rem; }
+.vo2-range { color: var(--muted); margin: 0 0 .9rem; font-variant-numeric: tabular-nums; }
+.cross-check-caveat { color: var(--warning); }
+.vo2-trend { display: flex; flex-direction: column; gap: .4rem; }
+.vo2-chart { width: 100%; height: auto; }
+.vo2-band { fill: var(--accent); opacity: .14; }
+.vo2-line { fill: none; stroke: var(--accent); stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
+.vo2-point { fill: var(--accent); }
+.vo2-grid-line { stroke: var(--line); stroke-width: 1; }
+.vo2-tick { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.chart-empty { color: var(--muted); }
+.plan-versus { margin: .3rem 0 .5rem; font-variant-numeric: tabular-nums; }
+@media (max-width: 60rem) { .vo2-layout { grid-template-columns: 1fr; } }
 .prescription { display: flex; justify-content: space-between; align-items: start; gap: 2rem; margin-top: 1rem; padding: clamp(1.4rem, 4vw, 2.5rem); border-color: #387663; background: radial-gradient(circle at 100% 0, #225143, transparent 30rem), #101a1c; }
 .prescription.caution { border-color: #786437; background: radial-gradient(circle at 100% 0, #4a3c21, transparent 30rem), #171714; }
 .prescription.not_ready { border-color: #784343; background: radial-gradient(circle at 100% 0, #4a2424, transparent 30rem), #191313; }
@@ -237,6 +443,116 @@ textarea { resize: vertical; padding: .75rem; border: 1px solid var(--line); bor
 .settings-actions { display: flex; gap: 1rem; align-items: center; width: fit-content; margin: 1rem 0 0 auto; padding: .7rem; border: 1px solid var(--line); border-radius: .7rem; background: rgba(10,14,20,.94); }
 body.dragging::after { content: "Drop TCX files to analyze"; position: fixed; inset: 1rem; z-index: 100; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 1rem; background: rgba(8,16,17,.92); color: var(--accent); font-size: clamp(1.5rem, 4vw, 3rem); font-weight: 750; pointer-events: none; }
 @keyframes load { from { transform: translateX(-40%); opacity: .4; } 50% { opacity: 1; } to { transform: translateX(40%); opacity: .4; } }
+/* Guided setup. Each block is one question with its consequence stated, so
+   the page reads as a conversation rather than a form. */
+.setup-page .setup-block { margin-top: 1rem; }
+.setup-page h2 { margin: .3rem 0 .6rem; font-size: 1.5rem; }
+.setup-steps { list-style: none; display: grid; gap: .55rem; margin: 1rem 0 0; padding: 0; }
+.setup-step { display: grid; grid-template-columns: 1.5rem 1fr; gap: .7rem; align-items: start; }
+.setup-step i { display: grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; border: 1px solid var(--line); font-style: normal; font-size: .78rem; font-weight: 800; color: var(--muted); }
+.setup-step.done i { border-color: var(--accent); color: var(--accent); }
+.setup-step.blocked i { border-color: var(--warning); color: var(--warning); }
+.setup-step b { display: block; font-weight: 650; }
+.setup-step small { color: var(--muted); line-height: 1.45; }
+.setup-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; margin: 1rem 0; }
+.setup-fields label, .setup-toggles label { display: flex; flex-direction: column; gap: .35rem; color: var(--muted); font-size: .85rem; }
+.setup-fields input, .setup-fields select, .setup-toggles input[type="number"] { padding: .55rem .65rem; border: 1px solid var(--line); border-radius: .5rem; background: #0b1118; color: #eef2f6; }
+.setup-fields small, .setup-toggles small { color: var(--muted); font-size: .76rem; line-height: 1.45; }
+.setup-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; margin-top: 1rem; }
+.form-status { color: var(--muted); font-size: .82rem; }
+.form-status.ok { color: var(--accent); }
+
+/* Method choice. The consequence of each option is on the card, because the
+   difference between Karvonen and percent-of-max is not self-evident. */
+.method-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .7rem; margin: 1rem 0; }
+.method-option { display: block; padding: .85rem; border: 1px solid var(--line); border-radius: .65rem; background: #0d141c; cursor: pointer; }
+.method-option.chosen { border-color: var(--accent-strong); background: #10231d; }
+.method-option input { margin-right: .45rem; }
+.method-option b { font-weight: 650; }
+.method-option small { display: block; margin-top: .3rem; color: var(--muted); line-height: 1.45; }
+.zone-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .7rem; margin-bottom: .5rem; }
+.zone-inputs label { display: flex; flex-direction: column; gap: .3rem; color: var(--muted); font-size: .8rem; }
+.zone-pair { display: flex; gap: .3rem; }
+.zone-pair input { width: 100%; min-width: 0; padding: .45rem; border: 1px solid var(--line); border-radius: .45rem; background: #0b1118; color: #eef2f6; }
+.zone-preview { display: grid; grid-template-columns: minmax(0, 14rem) minmax(0, 1fr); gap: 1.2rem; margin-top: 1.2rem; padding-top: 1.2rem; border-top: 1px solid var(--line); }
+.zone-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.zone-table td { padding: .35rem .5rem; border-bottom: 1px solid var(--line); }
+.zone-table tr.zone-highlight td { color: var(--accent); font-weight: 650; }
+.zone-effect strong { font-size: 1.8rem; }
+.setup-toggles { display: grid; gap: .8rem; margin: 1rem 0; }
+.toggle { flex-direction: row !important; align-items: center; gap: .6rem !important; color: #eef2f6 !important; }
+
+/* The nudge. Amber, because a default standing in for an answer is exactly
+   the kind of thing this app is supposed to admit to rather than hide. */
+.setup-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 1.5rem; padding: 1rem 1.25rem; border: 1px solid #6a5730; border-left: 3px solid var(--warning); border-radius: .7rem; background: #1b1710; color: inherit; text-decoration: none; }
+.setup-banner:hover { border-color: var(--warning); }
+.setup-banner b { display: block; }
+.setup-banner small { color: var(--muted); }
+.setup-banner .panel-action { position: static; color: var(--warning); }
+
+@media (max-width: 900px) { .zone-preview { grid-template-columns: 1fr; } }
+
+/* Advanced settings. Collapsed by default because these are the constants the
+   published figures were validated against, and an everyday settings page that
+   opens on them invites tuning nobody asked for. */
+.advanced-settings { margin-top: 1.5rem; }
+.advanced-settings summary { display: flex; align-items: baseline; gap: .8rem; cursor: pointer; }
+.advanced-settings summary b { color: #eef2f6; }
+.advanced-settings > .chart-note { margin: .9rem 0 1.2rem; max-width: 78ch; }
+.reset-row { align-items: center; gap: .8rem; flex-wrap: wrap; margin-top: 1.2rem; padding-top: 1.2rem; border-top: 1px solid var(--line); }
+.reset-row small { color: var(--muted); font-size: .78rem; max-width: 48ch; line-height: 1.45; }
+
+/* The goal read-out. Same content on the weekly plan and on Progress: as a
+   side panel it is a link onward, as a band it is the frame for the chart
+   below it. One component so the two can never disagree. */
+.plan-summary-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 1rem; align-items: stretch; margin: 1.25rem 0; }
+.plan-summary-grid .schedule-summary { margin: 0; }
+.goal-panel { display: flex; flex-direction: column; padding: 1.45rem; border: 1px solid var(--line); border-radius: .8rem; color: inherit; text-decoration: none; --card-rule: var(--accent-strong); --card-tint: rgba(55,189,141,.22); }
+.goal-panel.panel { padding-bottom: 3.35rem; transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease; }
+.goal-panel.panel:hover, .goal-panel.panel:focus-visible { transform: translateY(-2px); border-color: var(--card-rule); box-shadow: 0 14px 34px rgba(0,0,0,.38); }
+.goal-panel.panel:hover .panel-action { transform: translateX(3px); }
+.goal-panel .panel-action { left: 1.45rem; bottom: 1.35rem; }
+.goal-panel.wide { margin-top: 1.25rem; }
+.goal-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.goal-heading .eyebrow { margin: 0; }
+.goal-panel h2 { margin: .35rem 0 .7rem; font-size: clamp(1.35rem, 2.2vw, 1.8rem); text-wrap: balance; }
+.goal-detail { margin: 0; color: var(--muted); line-height: 1.55; max-width: 72ch; }
+.goal-paces { display: flex; flex-wrap: wrap; gap: 1.4rem; margin: 0 0 .85rem; }
+.goal-paces span { display: flex; flex-direction: column; gap: .15rem; }
+.goal-paces small { color: var(--muted); font-size: .74rem; text-transform: uppercase; letter-spacing: .06em; }
+.goal-paces strong { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+@media (max-width: 950px) { .plan-summary-grid { grid-template-columns: 1fr; } }
+
+/* The route into setup, at the top of Settings. Setup asks the handful of
+   questions everything else depends on; Settings is the full surface. A nav
+   entry for both implied they were peers. */
+.setup-entry { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+.setup-entry.pending { border-left: 3px solid var(--warning); }
+.setup-entry h2 { margin: .3rem 0 0; font-size: 1.35rem; letter-spacing: -.02em; }
+/* Amber marks the state, on the rail and the title. The eyebrow stays the
+   ordinary green section label it is everywhere else. */
+.setup-entry.pending h2 { color: var(--warning); }
+/* :not(.eyebrow) matters. A bare `p` descendant selector outranks the
+   .eyebrow class, so the label silently lost its colour. */
+.setup-entry p:not(.eyebrow) { margin: .35rem 0 0; color: var(--muted); max-width: 62ch; line-height: 1.5; }
+.setup-entry .primary-button { flex: none; text-decoration: none; }
+/* Solid hero green, resolving to an outline on hover -- the same gesture the
+   other primary actions use, so a link that acts like a button reads as one. */
+a.primary-button { display: inline-flex; align-items: center; border: 1px solid #3b7666; border-radius: .55rem; padding: .65rem .9rem; background: #173d34; color: #c8f7e6; transition: border-color .16s ease, box-shadow .16s ease; }
+a.primary-button:hover, a.primary-button:focus-visible { border-color: var(--accent); box-shadow: 0 8px 22px rgba(0,0,0,.34); }
+
+/* Present on every screen, and quiet. Loud enough to be read once, not so loud
+   it competes with the training content it qualifies. */
+/* The verdict sentence carries the card; it is read, not scanned, so it gets
+   body-text contrast rather than the muted treatment of a caption. */
+.balance-detail { color: #cfd9e2 !important; line-height: 1.55; max-width: 70ch; }
+/* Drag-and-drop already worked document-wide; it was simply undiscoverable.
+   Sits beside the button it is an alternative to, and stands down on narrow
+   screens where dropping a file is not a gesture anyone has. */
+.upload-hint { margin: 0; color: var(--muted); font-size: .78rem; text-align: right; max-width: 11rem; line-height: 1.35; }
+@media (max-width: 900px) { .upload-hint { display: none; } }
+.site-footer { border-top: 1px solid var(--line); padding: 1.6rem clamp(1.2rem, 4vw, 4rem) 2.4rem; }
+.site-footer p { width: min(1180px, 100%); margin: 0 auto; color: var(--muted); font-size: .78rem; line-height: 1.6; max-width: 90ch; }
 .upload-panel { position: fixed; right: 1.2rem; bottom: 1.2rem; z-index: 20; width: min(620px, calc(100% - 2.4rem)); max-height: 80vh; overflow: auto; padding: 1.35rem; border: 1px solid #3b7666; border-radius: .8rem; background: #0e1e1b; box-shadow: 0 20px 80px rgba(0,0,0,.5); }
 .upload-panel[hidden] { display: none; }
 .panel-heading { display: flex; justify-content: space-between; }

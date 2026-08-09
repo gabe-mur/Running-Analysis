@@ -20,8 +20,19 @@ def _normal_cdf(value: float) -> float:
 
 
 def _window_estimate(
-    scored: list[dict[str, Any]], end: datetime, days: int, minimum_runs: int = 1
+    scored: list[dict[str, Any]],
+    end: datetime,
+    days: int,
+    minimum_runs: int = 1,
+    *,
+    robust: bool = True,
 ) -> dict[str, Any] | None:
+    """Weighted trailing estimate.
+
+    ``robust=False`` disables the Huber residual reweighting and is used to
+    check that the robust layer is not masking genuine step changes; see
+    ``scripts/huber_sensitivity.py``.
+    """
     start = end - timedelta(days=days)
     selected = [row for row in scored if start < _date(row) <= end]
     if len(selected) < minimum_runs:
@@ -44,7 +55,7 @@ def _window_estimate(
     ]
     weights = list(base_weights)
     estimate = sum(weight * value for weight, value in zip(weights, values)) / sum(weights)
-    for _ in range(8):
+    for _ in range(8 if robust else 0):
         residuals = [value - estimate for value in values]
         center = median(residuals)
         scale = max(
@@ -52,8 +63,8 @@ def _window_estimate(
             1.4826 * median(abs(residual - center) for residual in residuals),
         )
         cutoff = 1.345 * scale
-        robust = [min(1.0, cutoff / max(abs(residual), 1e-12)) for residual in residuals]
-        weights = [base * factor for base, factor in zip(base_weights, robust)]
+        huber_factors = [min(1.0, cutoff / max(abs(residual), 1e-12)) for residual in residuals]
+        weights = [base * factor for base, factor in zip(base_weights, huber_factors)]
         estimate = sum(weight * value for weight, value in zip(weights, values)) / sum(weights)
 
     weight_sum = sum(weights)
@@ -113,7 +124,11 @@ def _comparison(
 
 
 def build_fitness_analytics(
-    runs: list[dict[str, Any]], window_days: int = 28
+    runs: list[dict[str, Any]],
+    window_days: int = 28,
+    target_hr_bpm: float | None = None,
+    *,
+    robust: bool = True,
 ) -> dict[str, Any]:
     """Build a descriptive fitness state without refitting environmental effects."""
     scored = sorted(
@@ -125,19 +140,21 @@ def build_fitness_analytics(
 
     historical = []
     for row in scored:
-        estimate = _window_estimate(scored, _date(row), window_days, minimum_runs=3)
+        estimate = _window_estimate(scored, _date(row), window_days, minimum_runs=3, robust=robust)
         if estimate is None:
             continue
         estimate = {**estimate, "as_of_utc": _date(row).isoformat()}
         historical.append(estimate)
 
     anchor = _date(scored[-1])
-    current = _window_estimate(scored, anchor, window_days, minimum_runs=1)
+    current = _window_estimate(scored, anchor, window_days, minimum_runs=1, robust=robust)
     assert current is not None
     prior_window = _window_estimate(
-        scored, anchor - timedelta(days=window_days), window_days, minimum_runs=1
+        scored, anchor - timedelta(days=window_days), window_days, minimum_runs=1, robust=robust
     )
-    prior_90 = _window_estimate(scored, anchor - timedelta(days=90), window_days, minimum_runs=1)
+    prior_90 = _window_estimate(
+        scored, anchor - timedelta(days=90), window_days, minimum_runs=1, robust=robust
+    )
     change_prior = _comparison(current, prior_window, f"preceding {window_days} days")
     change_90 = _comparison(current, prior_90, f"{window_days}-day fitness 90 days earlier")
 
@@ -196,7 +213,11 @@ def build_fitness_analytics(
     return {
         "available": True,
         "window_days": window_days,
-        "definition": f"Robust trailing {window_days}-day estimate of reference-condition pace at 145 bpm",
+        "target_hr_bpm": target_hr_bpm,
+        "definition": (
+            f"Robust trailing {window_days}-day estimate of reference-condition pace"
+            + (f" at {target_hr_bpm:g} bpm" if target_hr_bpm else " at the comparison heart rate")
+        ),
         "as_of_utc": anchor.isoformat(),
         "current": current,
         "change_prior_window": change_prior,
@@ -215,12 +236,14 @@ def build_fitness_analytics(
 
 
 def build_fitness_analytics_set(
-    runs: list[dict[str, Any]], windows: tuple[int, ...] = (14, 28, 42, 56, 90)
+    runs: list[dict[str, Any]],
+    windows: tuple[int, ...] = (14, 28, 42, 56, 90),
+    target_hr_bpm: float | None = None,
 ) -> dict[str, Any]:
     return {
         "default_window_days": 28,
         "available_windows": list(windows),
         "by_window": {
-            str(days): build_fitness_analytics(runs, days) for days in windows
+            str(days): build_fitness_analytics(runs, days, target_hr_bpm) for days in windows
         },
     }

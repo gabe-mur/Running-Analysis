@@ -157,15 +157,38 @@ def command_report(args: Namespace) -> int:
 
 
 def command_serve(args: Namespace) -> int:
-    """Run the local coach web application."""
+    """Run the local coach web application.
+
+    Reloading is on by default. Static assets are re-read from disk on every
+    request while Python modules are loaded once, so a server left running
+    across an edit serves current markup against stale data — which surfaces
+    as a confusing client-side error rather than as the restart it is.
+    Watching the source removes that whole class of confusion.
+    """
+
+    import os
 
     import uvicorn
 
-    from .web.app import create_app
+    from .web.app import CONFIG_PATH_ENV, PROJECT_ROOT_ENV, create_app
 
     initialize_project(args.project_root, args.config)
-    app = create_app(args.project_root, args.config)
-    uvicorn.run(app, host=args.host, port=args.port)
+    if args.no_reload:
+        uvicorn.run(create_app(args.project_root, args.config), host=args.host, port=args.port)
+        return 0
+
+    # The reloader re-imports in a fresh worker, so the target has to be an
+    # import string and its arguments have to travel by environment.
+    os.environ[PROJECT_ROOT_ENV] = str(Path(args.project_root).resolve())
+    os.environ[CONFIG_PATH_ENV] = str(args.config)
+    uvicorn.run(
+        "run_analysis.web.app:create_app_from_env",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        reload=True,
+        reload_dirs=[str(Path(__file__).resolve().parent)],
+    )
     return 0
 
 
@@ -314,6 +337,11 @@ def build_parser() -> ArgumentParser:
     serve_parser = subparsers.add_parser("serve", help="Run the local Running Coach web app")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Address to listen on")
     serve_parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    serve_parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Do not watch the source for changes (reloading is on by default)",
+    )
     serve_parser.set_defaults(handler=command_serve)
 
     all_parser = subparsers.add_parser(

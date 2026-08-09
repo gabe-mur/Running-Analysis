@@ -17,7 +17,7 @@ import re
 
 from ..config import load_config, resolve_project_path
 from ..db import connect, initialize
-from ..importer import import_files
+from ..importer import SUPPORTED_SUFFIXES, import_files
 from ..modeling import InsufficientModelDataError, fit_models
 from ..overrides import sync_overrides
 from ..processing import process_activities
@@ -40,12 +40,14 @@ class UploadPayload:
 def _safe_filename(filename: str) -> str:
     name = Path(filename).name
     cleaned = _SAFE_FILENAME.sub("-", name).strip("-.")
-    return cleaned or "activity.tcx"
+    return cleaned or "activity.dat"
 
 
 def validate_upload(payload: UploadPayload) -> None:
-    if not payload.filename.casefold().endswith(".tcx"):
-        raise ValueError(f"Only .tcx files are supported: {payload.filename}")
+    if not payload.filename.casefold().endswith(SUPPORTED_SUFFIXES):
+        raise ValueError(
+            f"Only {', '.join(SUPPORTED_SUFFIXES)} files are supported: {payload.filename}"
+        )
     if not payload.content:
         raise ValueError(f"The uploaded file is empty: {payload.filename}")
     if len(payload.content) > MAX_UPLOAD_BYTES:
@@ -207,10 +209,7 @@ def run_upload_pipeline(
                 schedule = generate_weekly_schedule(
                     connection,
                     config,
-                    WeeklyScheduleRequest(
-                        health_status=current.health_status,
-                        notes=current.notes,
-                    ),
+                    WeeklyScheduleRequest(health_status=current.health_status),
                     root,
                 )
                 stages.append(

@@ -12,6 +12,7 @@ import sqlite3
 
 from .db import initialize, transaction
 from .models import Activity
+from .fit import parse_fit
 from .tcx import parse_tcx
 
 
@@ -27,8 +28,32 @@ class ImportSummary:
     trackpoints_added: int = 0
 
 
-def discover_tcx_files(root: str | Path) -> list[Path]:
-    return sorted(path for path in Path(root).rglob("*") if path.is_file() and path.suffix.lower() == ".tcx")
+#: Every extension the importer knows how to read, mapped to its parser.
+#: ``.gz`` is included because Strava hands back whatever was uploaded, and a
+#: gzipped FIT is a common shape for that.
+SUPPORTED_SUFFIXES = (".tcx", ".fit", ".fit.gz")
+
+
+def parser_for(path: Path):
+    """Choose a parser by extension, or ``None`` when the file is not ours."""
+    name = path.name.casefold()
+    if name.endswith(".fit") or name.endswith(".fit.gz"):
+        return parse_fit
+    if name.endswith(".tcx"):
+        return parse_tcx
+    return None
+
+
+def discover_activity_files(root: str | Path) -> list[Path]:
+    return sorted(
+        path
+        for path in Path(root).rglob("*")
+        if path.is_file() and parser_for(path) is not None
+    )
+
+
+#: Retained under the old name because it is part of the CLI's vocabulary.
+discover_tcx_files = discover_activity_files
 
 
 def sha256_file(path: Path) -> str:
@@ -66,6 +91,16 @@ def _within(left: float | None, right: float | None, absolute: float, relative: 
     return abs(left - right) <= max(absolute, relative * max(abs(left), abs(right)))
 
 
+#: How far apart two recordings of the same run may start. A watch's file
+#: creation time and its first data point can differ by several seconds.
+NEAR_DUPLICATE_START_SECONDS = 60.0
+
+#: Per-quantity tolerance for the cross-format check. Both distance and
+#: duration must agree within this, which is what keeps it from merging two
+#: genuinely different runs.
+NEAR_DUPLICATE_TOLERANCE = 0.02
+
+
 def _find_duplicate(connection: sqlite3.Connection, activity: Activity) -> tuple[int, str] | None:
     if activity.activity_id:
         row = connection.execute(
@@ -90,6 +125,33 @@ def _find_duplicate(connection: sqlite3.Connection, activity: Activity) -> tuple
             activity.lap_recorded_time_s, row["lap_recorded_time_s"], 10.0, 0.01
         ):
             return int(row["id"]), "matching_start_distance_time"
+
+    # The same run exported in two formats does not agree to the metre. A watch
+    # writes the FIT; Strava re-derives distance for the TCX, and the file
+    # creation time can sit a few seconds off the first data point. The tight
+    # test above then misses, and the run is counted twice -- inflating
+    # mileage, load, and demonstrated capacity with no error anywhere.
+    #
+    # This tier is deliberately loose on each quantity but requires two
+    # independent agreements at once. Nobody starts two runs of the same sport
+    # within a minute of each other that also match on distance and duration.
+    rows = connection.execute(
+        """
+        SELECT id, total_distance_m, lap_recorded_time_s
+        FROM activities
+        WHERE sport = ? AND start_time_utc_epoch BETWEEN ? AND ?
+        """,
+        (activity.sport, epoch - NEAR_DUPLICATE_START_SECONDS, epoch + NEAR_DUPLICATE_START_SECONDS),
+    ).fetchall()
+    for row in rows:
+        if activity.total_distance_m is None or activity.lap_recorded_time_s is None:
+            continue
+        if _within(
+            activity.total_distance_m, row["total_distance_m"], 0.0, NEAR_DUPLICATE_TOLERANCE
+        ) and _within(
+            activity.lap_recorded_time_s, row["lap_recorded_time_s"], 0.0, NEAR_DUPLICATE_TOLERANCE
+        ):
+            return int(row["id"]), "near_duplicate_across_formats"
     return None
 
 
@@ -231,8 +293,8 @@ def _insert_activity(connection: sqlite3.Connection, activity: Activity) -> int:
             activity_id, lap_index, track_index, point_index, timestamp_utc,
             latitude, longitude, gps_valid, altitude_m, distance_m,
             heart_rate_bpm, cadence, run_cadence, cadence_source, speed_mps,
-            parse_flags_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pause_after_s, parse_flags_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -251,6 +313,7 @@ def _insert_activity(connection: sqlite3.Connection, activity: Activity) -> int:
                 point.run_cadence,
                 point.cadence_source,
                 point.speed_mps,
+                point.pause_after_s,
                 json.dumps(point.parse_flags),
             )
             for point in activity.trackpoints
@@ -268,7 +331,7 @@ def import_files(
 ) -> ImportSummary:
     initialize(connection)
     root = Path(project_root).resolve()
-    files = list(paths) if paths is not None else discover_tcx_files(root)
+    files = list(paths) if paths is not None else discover_activity_files(root)
     summary = ImportSummary(discovered_files=len(files))
     for source_path in files:
         path = source_path.resolve()
@@ -279,8 +342,12 @@ def import_files(
         if existing and existing["sha256"] == digest and not force:
             summary.unchanged_files += 1
             continue
+        parse = parser_for(path)
+        if parse is None:
+            summary.unchanged_files += 1
+            continue
         try:
-            parsed = parse_tcx(path, default_timezone=default_timezone)
+            parsed = parse(path, default_timezone=default_timezone)
         except Exception as error:
             with transaction(connection):
                 if existing:

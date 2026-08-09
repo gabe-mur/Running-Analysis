@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from enum import StrEnum
 from math import ceil
 from statistics import median
 import sqlite3
@@ -172,4 +173,155 @@ def assess_race_goal(
             f"Validated from Riegel-equivalent performances across the latest 10 usable runs; "
             f"{profile.label} composition will influence quality, long-run, and taper scoring without overriding load or health guardrails."
         ),
+    )
+
+
+#: The disclosed planning guardrail, reused so the progress read-out and the
+#: goal validator can never disagree about what counts as reachable.
+IMPROVEMENT_PER_WEEK = 0.0025
+MAXIMUM_IMPROVEMENT = 0.08
+
+#: Within this much of the goal pace, the difference is inside the noise of a
+#: ten-run median and calling it a shortfall would be false precision.
+ON_TRACK_TOLERANCE_SECONDS = 10.0
+
+
+class GoalStatus(StrEnum):
+    NO_GOAL = "no_goal"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    AHEAD = "ahead"
+    ON_TRACK = "on_track"
+    BEHIND = "behind"
+
+
+@dataclass(frozen=True, slots=True)
+class GoalProgress:
+    """Where the athlete stands against their stated goal, or why it cannot say."""
+
+    status: GoalStatus
+    headline: str
+    detail: str
+    goal_label: str | None = None
+    race_date: date | None = None
+    weeks_remaining: float | None = None
+    goal_pace_min_mile: float | None = None
+    supported_pace_min_mile: float | None = None
+    gap_seconds_per_mile: float | None = None
+
+
+def supported_goal_pace(
+    performances: list[tuple[float, float]], profile: RaceGoalProfile
+) -> float:
+    """Riegel-equivalent pace for the goal distance from recent runs.
+
+    Extracted so the progress read-out and the goal validator compute the same
+    number; two implementations of "what your running currently supports"
+    would eventually disagree in front of the athlete.
+    """
+
+    equivalent = []
+    for pace, distance in performances:
+        target_minutes = pace * distance * (profile.distance_miles / distance) ** 1.06
+        equivalent.append((target_minutes + profile.prediction_penalty_minutes) / profile.distance_miles)
+    return median(sorted(equivalent)[:3])
+
+
+def goal_progress(
+    connection: sqlite3.Connection | None,
+    config: dict,
+    *,
+    as_of: date | None = None,
+) -> GoalProgress:
+    """Progress toward the configured race goal.
+
+    Unlike :func:`assess_race_goal`, this never raises. It is a read-out, and a
+    read-out that throws when the goal is unset or the history is thin is
+    useless in exactly the situations an athlete most wants an answer.
+    """
+
+    today = as_of or date.today()
+    coaching = config.get("coaching") or {}
+    goal_key = str(coaching.get("training_goal", "general_fitness"))
+    profile = RACE_GOALS.get(goal_key)
+
+    if profile is None:
+        return GoalProgress(
+            status=GoalStatus.NO_GOAL,
+            headline="Training for general fitness",
+            detail=(
+                "No race goal is set, so the plan optimises for consistent aerobic "
+                "training rather than a date. Set one in Settings to have distance "
+                "and quality sessions shaped around it."
+            ),
+        )
+
+    configured = configured_race_goal(config, on_date=today)
+    if configured is None:
+        return GoalProgress(
+            status=GoalStatus.NO_GOAL,
+            headline=f"{profile.label} — no date set",
+            detail=(
+                f"A {profile.label.lower()} is selected, but without a race date and "
+                "target pace there is nothing to measure progress against. Add both in "
+                "Settings."
+            ),
+            goal_label=profile.label,
+        )
+
+    _, race_date, goal_pace = configured
+    weeks = (race_date - today).days / 7.0
+    performances = _recent_training_paces(connection) if connection is not None else []
+    if len(performances) < 10:
+        return GoalProgress(
+            status=GoalStatus.INSUFFICIENT_EVIDENCE,
+            headline=f"{profile.label} in {weeks:.0f} weeks",
+            detail=(
+                f"{len(performances)} usable runs on record; ten are needed before a "
+                "current equivalent pace can be estimated."
+            ),
+            goal_label=profile.label,
+            race_date=race_date,
+            weeks_remaining=weeks,
+            goal_pace_min_mile=goal_pace,
+        )
+
+    supported = supported_goal_pace(performances, profile)
+    gap_seconds = (supported - goal_pace) * 60.0
+    allowance = min(MAXIMUM_IMPROVEMENT, max(0.0, weeks) * IMPROVEMENT_PER_WEEK)
+    reachable = supported * (1.0 - allowance)
+    week_label = f"{weeks:.0f} week{'s' if round(weeks) != 1 else ''}"
+
+    if gap_seconds <= ON_TRACK_TOLERANCE_SECONDS:
+        status = GoalStatus.AHEAD
+        detail = (
+            f"Your last ten runs already support about {format_pace(supported)} for "
+            f"{profile.label.lower()} distance, which meets your {format_pace(goal_pace)} "
+            f"target with {week_label} still to go."
+        )
+    elif goal_pace >= reachable:
+        status = GoalStatus.ON_TRACK
+        detail = (
+            f"Your running currently supports about {format_pace(supported)}. Closing "
+            f"the remaining {gap_seconds:.0f} sec/mi over {week_label} is within the "
+            "improvement this plan is willing to assume."
+        )
+    else:
+        status = GoalStatus.BEHIND
+        detail = (
+            f"Your running currently supports about {format_pace(supported)}, and "
+            f"{format_pace(goal_pace)} needs more than {week_label} of ordinary "
+            f"progression can be counted on to deliver. {format_pace(reachable)} is the "
+            "fastest target this date supports."
+        )
+
+    return GoalProgress(
+        status=status,
+        headline=f"{profile.label} in {week_label}",
+        detail=detail,
+        goal_label=profile.label,
+        race_date=race_date,
+        weeks_remaining=weeks,
+        goal_pace_min_mile=goal_pace,
+        supported_pace_min_mile=supported,
+        gap_seconds_per_mile=gap_seconds,
     )

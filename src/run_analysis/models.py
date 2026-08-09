@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .cadence import cadence_spm
+
 
 @dataclass(slots=True)
 class Trackpoint:
@@ -22,7 +24,17 @@ class Trackpoint:
     run_cadence: int | None
     cadence_source: str | None
     speed_mps: float | None
+    #: Seconds of pause the device itself recorded immediately after this
+    #: point. Only FIT states this; TCX has no equivalent, so it stays None
+    #: there and stopped time continues to be inferred from movement.
+    pause_after_s: float | None = None
     parse_flags: list[str] = field(default_factory=list)
+
+    @property
+    def cadence_spm(self) -> float | None:
+        """Total steps per minute. Raw ``cadence``/``cadence_source`` are kept
+        as recorded so the conversion stays auditable."""
+        return cadence_spm(self.cadence, self.cadence_source)
 
 
 @dataclass(slots=True)

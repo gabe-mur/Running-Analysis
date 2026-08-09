@@ -8,7 +8,12 @@ from typing import Any
 import json
 import sqlite3
 
-from .movement import MovementInterval, attach_elevation_deltas, classify_movement
+from .movement import (
+    MovementInterval,
+    attach_elevation_deltas,
+    classify_movement,
+    pause_restart_offsets,
+)
 from .physiology import grade_energy_ratio
 from .processing import _load_points
 from .weather import interpolate_hourly, wind_components
@@ -42,6 +47,47 @@ def _hourly_for_activity(connection: sqlite3.Connection, activity_id: int) -> di
             if len(values) == len(order):
                 combined[key] = [values[index] for index in order]
     return combined
+
+
+#: Fallbacks when a configuration predates post-pause suppression.
+DEFAULT_POST_PAUSE_MINIMUM_STOP_SECONDS = 60.0
+DEFAULT_POST_PAUSE_SUPPRESSION_MOVING_SECONDS = 180.0
+
+
+def _overlaps_post_pause_recovery(
+    moving_start_s: float,
+    moving_end_s: float,
+    pause_restarts: list[float] | None,
+    settings: dict,
+) -> bool:
+    """Whether a window overlaps the heart-rate recovery after a long stop."""
+
+    if not pause_restarts:
+        return False
+    suppression = float(
+        settings.get(
+            "post_pause_suppression_moving_seconds",
+            DEFAULT_POST_PAUSE_SUPPRESSION_MOVING_SECONDS,
+        )
+    )
+    if suppression <= 0:
+        return False
+    return any(
+        moving_start_s < restart + suppression and moving_end_s > restart
+        for restart in pause_restarts
+    )
+
+
+def _pause_restarts(intervals: list[MovementInterval], config: dict) -> list[float]:
+    return pause_restart_offsets(
+        intervals,
+        float(
+            config["model"].get(
+                "post_pause_minimum_stop_seconds",
+                DEFAULT_POST_PAUSE_MINIMUM_STOP_SECONDS,
+            )
+        ),
+    )
 
 
 class _WindowAccumulator:
@@ -119,8 +165,9 @@ class _WindowAccumulator:
         self,
         activity: sqlite3.Row,
         hourly: dict,
-        moving_midpoint_s: float,
+        moving_start_s: float,
         config: dict,
+        pause_restarts: list[float] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         if self.grade_micro_distance >= min(20.0, self.grade_window_m / 3.0):
             self._flush_grade()
@@ -177,9 +224,15 @@ class _WindowAccumulator:
         gps_fraction = self.gps_distance_m / self.distance_m
         device_fraction = self.device_distance_m / self.distance_m
         grade_coverage = self.grade_cost_distance / self.distance_m
-        position_minutes = moving_midpoint_s / 60.0
+        position_minutes = (moving_start_s + self.moving_s / 2.0) / 60.0
         reason = None
-        if position_minutes < float(settings["minimum_reliable_segment_minutes"]):
+        if _overlaps_post_pause_recovery(
+            moving_start_s, moving_start_s + self.moving_s, pause_restarts, settings
+        ):
+            # Heart rate has not caught back up to the effort, so this window
+            # would understate the true cost of the pace.
+            reason = "post_pause_hr_recovery"
+        elif position_minutes < float(settings["minimum_reliable_segment_minutes"]):
             reason = "warmup_hr_lag"
         elif position_minutes > float(settings["maximum_reliable_segment_minutes"]):
             reason = "long_duration_drift"
@@ -297,6 +350,7 @@ def _windows_for_intervals(
     config: dict,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     elevation = config["elevation"]
+    restarts = _pause_restarts(intervals, config)
     accumulator = _WindowAccumulator(
         float(elevation["grade_cost_window_meters"]),
         float(elevation["maximum_plausible_grade_percent"]),
@@ -307,8 +361,9 @@ def _windows_for_intervals(
     for interval in intervals:
         accumulator.add(interval)
         if accumulator.moving_s >= window_seconds:
-            midpoint = completed_moving_s + accumulator.moving_s / 2.0
-            row, reason = accumulator.finish(activity, hourly, midpoint, config)
+            row, reason = accumulator.finish(
+                activity, hourly, completed_moving_s, config, restarts
+            )
             if row:
                 output.append(row)
             else:
@@ -338,6 +393,7 @@ def _overlapping_windows_for_intervals(
     counters: dict[str, int] = {}
     start_target = 0.0
     elevation = config["elevation"]
+    restarts = _pause_restarts(intervals, config)
     while start_target + window_seconds <= total_moving + 1e-9:
         accumulator = _WindowAccumulator(
             float(elevation["grade_cost_window_meters"]),
@@ -355,8 +411,9 @@ def _overlapping_windows_for_intervals(
             completed = next_completed
             if accumulator.moving_s >= window_seconds:
                 break
-        midpoint = start_target + accumulator.moving_s / 2.0
-        row, reason = accumulator.finish(activity, hourly, midpoint, config)
+        row, reason = accumulator.finish(
+            activity, hourly, start_target, config, restarts
+        )
         if row:
             output.append(row)
         else:

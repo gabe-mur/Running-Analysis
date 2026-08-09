@@ -7,9 +7,11 @@ import sqlite3
 from pathlib import Path
 
 from .fitness_state import build_fitness_state
+from .onboarding import setup_state
 from .progress import build_progress
 from .recommendation import recommend_next_run
 from .recommendation_service import ensure_current_weekly_schedule, load_current_status
+from .training_status import build_training_status
 from .run_feedback import get_run_feedback, list_runs
 from .web.schemas import DashboardResponse
 from .web.schemas import (
@@ -18,6 +20,7 @@ from .web.schemas import (
     FitnessInterpretation,
     FitnessSignal,
     FitnessTrend,
+    SetupNudge,
     WorkoutType,
 )
 
@@ -139,56 +142,192 @@ def _quality_fitness_signal(
     )
 
 
+#: Weekly-mileage change below this is treated as noise in demonstrated capacity.
+CAPACITY_CHANGE_THRESHOLD_MILES = 2.0
+
+
+def _capacity_signal(load, window_days: int) -> tuple[FitnessSignal, FitnessTrend]:
+    """Training capacity from retained demonstrated capacity, not period mileage.
+
+    Period mileage answers "how much did you run lately"; that is training
+    volume and gets its own signal. Capacity is what the athlete has shown they
+    can sustain, which survives a short gap by design and is the number the
+    coaching rules already plan against.
+    """
+
+    current = load.capacity_reference_miles
+    previous = load.previous_capacity_reference_miles
+    if not current:
+        return (
+            FitnessSignal(
+                label="Training capacity",
+                trend=FitnessTrend.INSUFFICIENT_DATA,
+                status="Not enough data",
+                confidence=ConfidenceLevel.UNAVAILABLE,
+                detail="There is not enough running history to establish demonstrated capacity.",
+            ),
+            FitnessTrend.INSUFFICIENT_DATA,
+        )
+    # A zero baseline means there was no history a window ago, not that
+    # capacity grew from nothing. build_progress always supplies a number, so
+    # without this an athlete three weeks into running is told they have
+    # "Improved" against a baseline that never existed.
+    if not previous:
+        direction, status = FitnessTrend.UNCERTAIN, "No comparison yet"
+    else:
+        change = current - previous
+        if change >= CAPACITY_CHANGE_THRESHOLD_MILES:
+            direction, status = FitnessTrend.IMPROVING, "Improved"
+        elif change <= -CAPACITY_CHANGE_THRESHOLD_MILES:
+            direction, status = FitnessTrend.DECLINING, "Down"
+        else:
+            direction, status = FitnessTrend.STABLE, "Holding"
+    detail = f"Retained demonstrated capacity: {current:.1f} mi/week"
+    if previous:
+        detail += (
+            f", versus {previous:.1f} mi/week {window_days} days ago."
+            " A short gap does not immediately erase what you have shown you can sustain."
+        )
+    else:
+        detail += f". There is no comparable capacity from {window_days} days ago yet."
+    return (
+        FitnessSignal(
+            label="Training capacity",
+            trend=direction,
+            status=status,
+            confidence=ConfidenceLevel.MODERATE if load.confidence != ConfidenceLevel.LOW else ConfidenceLevel.LOW,
+            detail=detail,
+        ),
+        direction,
+    )
+
+
+def _volume_signal(comparison, window_days: int) -> FitnessSignal:
+    """Recent period mileage and run count. Volume, deliberately not capacity."""
+    current = comparison.current
+    previous = comparison.previous
+    change = comparison.distance_change_percent
+    if change is None or previous.distance_miles <= 0:
+        direction, status = FitnessTrend.INSUFFICIENT_DATA, "Not enough data"
+    elif change >= 10:
+        direction, status = FitnessTrend.IMPROVING, "Up"
+    elif change <= -10:
+        direction, status = FitnessTrend.DECLINING, "Down"
+    else:
+        direction, status = FitnessTrend.STABLE, "About the same"
+    return FitnessSignal(
+        label="Training volume",
+        trend=direction,
+        status=status,
+        confidence=ConfidenceLevel.MODERATE,
+        detail=(
+            f"Last {window_days} days: {current.distance_miles:.1f} miles in {current.run_count} runs. "
+            f"Previous {window_days}: {previous.distance_miles:.1f} miles in {previous.run_count} runs."
+        ),
+    )
+
+
+#: Normal runs after a health-tagged one that show current form has moved on.
+NORMAL_RUNS_TO_CLEAR_RECOVERY = 3
+
+
+def _recent_form(state) -> tuple[FitnessTrend, str, str]:
+    """Current form, using how the athlete has actually responded since.
+
+    A health-tagged run inside the illness window is context, not a verdict
+    that lasts three weeks. Once several normal runs have followed it, their
+    measured response is better evidence of current form than the calendar,
+    so the recovery label steps aside and the observed response speaks.
+    """
+
+    normal_since = state.normal_runs_since_health_event
+    still_recovering = (
+        state.recent_illness_or_recovery and normal_since < NORMAL_RUNS_TO_CLEAR_RECOVERY
+    )
+    if still_recovering:
+        detail = "Recent illness or recovery runs may be temporarily affecting performance."
+        if normal_since:
+            detail += (
+                f" {normal_since} normal run{'s' if normal_since != 1 else ''} since then;"
+                f" {NORMAL_RUNS_TO_CLEAR_RECOVERY - normal_since} more will let recent responses"
+                " speak for current form."
+            )
+        return FitnessTrend.DECLINING, "Recovering", detail
+    # Past illness stays visible as context even once form has been re-measured.
+    suffix = (
+        f" A health-tagged run remains in the last 21 days, but {normal_since} normal runs have followed it."
+        if state.recent_illness_or_recovery
+        else ""
+    )
+    if state.recent_performance_anomaly == "unusually_costly":
+        return (
+            FitnessTrend.DECLINING,
+            "Suppressed",
+            "The latest comparable run took more effort than usual." + suffix,
+        )
+    if state.recent_performance_anomaly == "within_recent_range":
+        return (
+            FitnessTrend.STABLE,
+            "Within recent range",
+            "The latest comparable run was within your recent range." + suffix,
+        )
+    if state.recent_performance_anomaly == "unusually_strong":
+        return (
+            FitnessTrend.IMPROVING,
+            "Responding well",
+            "The latest comparable run took less effort than usual." + suffix,
+        )
+    return (
+        FitnessTrend.UNCERTAIN,
+        "Not enough data",
+        "There are too few comparable recent runs to judge current form." + suffix,
+    )
+
+
 def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessInterpretation:
     current = capacity.period_comparison.current
     previous = capacity.period_comparison.previous
-    distance_change = capacity.period_comparison.distance_change_percent
     longest_change = current.longest_run_miles - previous.longest_run_miles
-    capacity_up = bool(
-        (distance_change is not None and distance_change >= 10)
-        or longest_change >= 1
-        or current.run_count >= previous.run_count + 3
+    capacity_signal, capacity_direction = _capacity_signal(
+        capacity.current_load, capacity.window_days
     )
-    capacity_direction = FitnessTrend.IMPROVING if capacity_up else FitnessTrend.STABLE
+    volume_signal = _volume_signal(capacity.period_comparison, capacity.window_days)
+    capacity_up = capacity_direction == FitnessTrend.IMPROVING
+    # Not the capacity signal's own detail: repeating it verbatim under the
+    # grid that already shows it is noise.
     capacity_summary = (
-        f"Last {capacity.window_days} days: {current.distance_miles:.1f} miles in {current.run_count} runs. "
-        f"Previous {capacity.window_days}: {previous.distance_miles:.1f} miles in {previous.run_count} runs."
+        f"Last {capacity.window_days} days: {current.distance_miles:.1f} miles in "
+        f"{current.run_count} runs, against a retained capacity of "
+        f"{capacity.current_load.capacity_reference_miles:.1f} mi/week."
+        if capacity.current_load.capacity_reference_miles
+        else f"Last {capacity.window_days} days: {current.distance_miles:.1f} miles in {current.run_count} runs."
     )
     illness_context = None
     if state.recent_illness_or_recovery:
         illness_context = "Recent illness/recovery runs still count toward training, but have less influence on the fitness trend."
-    external = short.external_fitness
-    external_up = (
-        external.vo2_max_trend == FitnessTrend.IMPROVING
-        and external.race_prediction_trend == FitnessTrend.IMPROVING
-    )
     short_horizon = _horizon(f"Current {short.window_days}-day aerobic efficiency", short)
     # Kept as a compatibility field for existing API clients. The dashboard no longer
     # mixes a second lookback into its fitness interpretation.
     long_horizon = _horizon(f"Current {long.window_days}-day aerobic efficiency", long)
-    if short_horizon.trend == FitnessTrend.DECLINING and capacity_up and external_up:
-        headline = "Long-term fitness evidence is up; short-term efficiency is down."
-        summary = (
-            "Garmin VO2 max, Garmin race prediction, volume, and durability point upward. "
-            "The recent pace-at-heart-rate dip remains real, but is better interpreted as "
-            "current condition/recovery evidence than as a verdict that months of fitness were lost."
-        )
-    elif short_horizon.trend == FitnessTrend.DECLINING and capacity_up:
+    if short_horizon.trend == FitnessTrend.DECLINING and capacity_up:
         headline = "Short-term efficiency is down; running capacity is up."
         summary = (
             "These are not contradictory. Pace at the same heart rate has recently been "
-            "slower, while your ability to sustain more running and longer runs has grown. "
+            "slower, while the weekly load you have demonstrated you can sustain has grown. "
             "Illness and accumulated fatigue can affect the first signal without erasing the second."
         )
     elif short_horizon.trend == FitnessTrend.IMPROVING and capacity_up:
         headline = "Aerobic efficiency and running capacity are both improving."
-        summary = "You are running more efficiently and sustaining more training."
+        summary = "You are running more efficiently, and the load you can sustain has grown."
     elif short_horizon.trend in {FitnessTrend.STABLE, FitnessTrend.UNCERTAIN} and capacity_up:
         headline = "Training capacity is up; aerobic efficiency has no clear change."
-        summary = "You are running more or farther, with no clear change in pace at the same heart rate."
+        summary = (
+            "The weekly load you can sustain has grown, with no clear change in pace "
+            "at the same heart rate."
+        )
     elif short_horizon.trend == FitnessTrend.STABLE:
         headline = "Your fitness looks steady."
-        summary = "Pace at the same heart rate and your recent training capacity are both about the same."
+        summary = "Pace at the same heart rate and your demonstrated capacity are both about the same."
     elif short_horizon.trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
         headline = "There is no clear fitness change yet."
         summary = "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
@@ -204,22 +343,7 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
     else:
         durability_direction = FitnessTrend.STABLE
         durability_status = "Stable"
-    if state.recent_illness_or_recovery:
-        recent_direction = FitnessTrend.DECLINING
-        recent_status = "Recovering"
-        recent_detail = "Recent illness or recovery runs may be temporarily affecting performance."
-    elif state.recent_performance_anomaly == "unusually_costly":
-        recent_direction = FitnessTrend.DECLINING
-        recent_status = "Suppressed"
-        recent_detail = "The latest comparable run took more effort than usual."
-    elif state.recent_performance_anomaly == "within_recent_range":
-        recent_direction = FitnessTrend.STABLE
-        recent_status = "Within recent range"
-        recent_detail = "The latest comparable run was within your recent range."
-    else:
-        recent_direction = FitnessTrend.UNCERTAIN
-        recent_status = "Not enough data"
-        recent_detail = "There are too few comparable recent runs to judge current form."
+    recent_direction, recent_status, recent_detail = _recent_form(state)
     signals = [
         FitnessSignal(
             label="Aerobic efficiency",
@@ -235,18 +359,13 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
             confidence=ConfidenceLevel.MODERATE,
             detail=f"Longest run: {current.longest_run_miles:.1f} miles now vs {previous.longest_run_miles:.1f} previously.",
         ),
-        FitnessSignal(
-            label="Training capacity",
-            trend=capacity_direction,
-            status=_signal_status(capacity_direction),
-            confidence=ConfidenceLevel.MODERATE,
-            detail=f"{current.distance_miles:.1f} miles now vs {previous.distance_miles:.1f} in the previous period.",
-        ),
+        capacity_signal,
+        volume_signal,
         FitnessSignal(
             label="Recent form",
             trend=recent_direction,
             status=recent_status,
-            confidence=ConfidenceLevel.MODERATE if state.recent_illness_or_recovery else state.trend_confidence,
+            confidence=ConfidenceLevel.MODERATE if recent_status == "Recovering" else state.trend_confidence,
             detail=recent_detail,
         ),
         quality_signal,
@@ -263,7 +382,6 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         caveats=[
             "The dashboard verdict uses the robust all-window model; the strict two-minute benchmark is a validation signal, not the primary estimate.",
             "More mileage and longer runs demonstrate greater training capacity, not automatically faster pace at a fixed heart rate.",
-            external.interpretation,
             "A respiratory illness can temporarily alter performance; this app records that context but does not diagnose recovery.",
         ],
     )
@@ -290,11 +408,24 @@ def build_dashboard(
     recommendation = recommend_next_run(state, status, config)
     latest = list_runs(connection, limit=1)
     feedback = get_run_feedback(connection, config, latest[0].activity_id) if latest else None
+    setup = setup_state(connection, config)
+    pending = [step for step in setup.steps if not step.complete]
+    nudge = SetupNudge(
+        complete=setup.complete,
+        remaining=len(pending),
+        detail=(
+            pending[0].title + ". " + pending[0].detail
+            if pending
+            else "Every setting has been confirmed."
+        ),
+    )
     return DashboardResponse(
         progress=progress,
+        training_status=build_training_status(state, config),
         fitness_interpretation=_interpret_fitness(progress, long_progress, capacity_progress, state, quality_signal),
         last_run=feedback,
         recommendation=recommendation,
         current_status=status,
+        setup=nudge,
         weekly_schedule=ensure_current_weekly_schedule(connection, config, project_root),
     )

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from run_analysis.recommendation import recommend_next_run
 from run_analysis.web.schemas import (
     ConfidenceLevel,
@@ -85,8 +88,10 @@ def _state(**changes) -> FitnessState:
     return FitnessState(**values)
 
 
-def _recommend(state: FitnessState, status=CurrentHealthStatus.NORMAL, notes=""):
-    return recommend_next_run(state, RecommendationRequest(health_status=status, notes=notes), CONFIG)
+def _recommend(state: FitnessState, status=CurrentHealthStatus.NORMAL, config=None):
+    return recommend_next_run(
+        state, RecommendationRequest(health_status=status), config or CONFIG
+    )
 
 
 def test_low_load_three_days_rest_and_no_recent_quality_can_be_quality_eligible() -> None:
@@ -149,13 +154,17 @@ def test_illness_blocks_until_current_self_report_returns_to_normal() -> None:
     assert check.facts["hidden_normal_run_requirement"] == 0
 
 
-def test_active_illness_language_still_blocks_running() -> None:
-    result = _recommend(
-        _state(),
-        status=CurrentHealthStatus.SICK_OR_RECOVERING,
-        notes="Fever and actively sick",
-    )
-    assert result.workout_type == WorkoutType.REST
+def test_a_check_in_carries_no_free_text_field() -> None:
+    """The note went to one overwritten slot that nothing read. Rejecting it
+    outright beats accepting input the app silently discards."""
+    with pytest.raises(ValidationError):
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL, notes="my knee hurts")
+
+
+def test_reporting_illness_with_the_buttons_does_change_the_prescription() -> None:
+    result = _recommend(_state(), status=CurrentHealthStatus.SICK_OR_RECOVERING)
+    assert result.workout_type == WorkoutType.RECOVERY
+    assert any("not medical clearance" in warning for warning in result.warnings)
 
 
 def test_high_rpe_on_easy_run_adds_recovery_caution() -> None:
@@ -183,7 +192,7 @@ def test_recent_hilly_run_counts_as_mechanical_load_without_inventing_hr_points(
     assert result.workout_type == WorkoutType.EASY
 
 
-def test_high_acute_load_avoids_added_volume_or_quality() -> None:
+def test_high_acute_load_avoids_added_volume_orquality() -> None:
     state = _state(recent_load=_state().recent_load.model_copy(update={"acute_to_prior_ratio": 1.5}))
     result = _recommend(state)
     assert result.workout_type == WorkoutType.EASY
@@ -215,6 +224,28 @@ def test_long_run_uses_rough_110_percent_reference_with_practical_rounding() -> 
     assert result.workout_type == WorkoutType.LONG
     assert result.distance_range_miles[1] == 9.0
     assert "rounded" in result.warnings[0]
+
+
+def test_long_run_progression_cap_outranks_the_conventional_five_mile_floor() -> None:
+    """A three-mile base must never be prescribed a five-mile long run."""
+    load = _state().recent_load.model_copy(
+        update={
+            "trailing_28d": _window(28, 40, 500),
+            "capacity_reference_miles": 10,
+        }
+    )
+    result = _recommend(_state(days_since_long_run=12, longest_run_30d_miles=3, recent_load=load))
+    assert result.workout_type == WorkoutType.LONG
+    # 3 miles * 1.10 = 3.3, rounded to a practical half mile.
+    assert result.distance_range_miles == (3.0, 3.5)
+    assert any("progression limit" in warning for warning in result.warnings)
+
+
+def test_easy_run_zone_instruction_follows_configured_zones() -> None:
+    config = {**CONFIG, "zones": {"z2": [132, 147]}}
+    result = _recommend(_state(days_since_quality_run=1, days_since_long_run=1), config=config)
+    assert result.workout_type == WorkoutType.EASY
+    assert any("132–147 bpm" in step.instruction for step in result.structure)
 
 
 def test_quality_session_types_rotate_and_respect_disabled_settings() -> None:
@@ -261,16 +292,14 @@ def test_missing_gps_keeps_load_but_lowers_default_confidence() -> None:
     assert result.confidence == ConfidenceLevel.LOW
 
 
-def test_recent_hard_workout_is_not_followed_by_quality() -> None:
+def test_recent_hard_workout_is_not_followed_byquality() -> None:
     result = _recommend(_state(days_since_quality_run=1, days_since_long_run=3))
     assert result.workout_type != WorkoutType.INTERVALS
 
 
-def test_manual_pain_and_shortness_of_breath_override_training_state() -> None:
+def test_reported_pain_overrides_training_state() -> None:
     pain = _recommend(_state(), CurrentHealthStatus.PAIN_OR_INJURY_CONCERN)
-    breathing = _recommend(_state(), notes="Unexplained shortness of breath today")
     assert pain.workout_type == WorkoutType.REST
-    assert breathing.workout_type == WorkoutType.REST
 
 
 def test_recommendation_api_persists_request_state_and_rule_trace(tmp_path: Path) -> None:
@@ -283,7 +312,6 @@ def test_recommendation_api_persists_request_state_and_rule_trace(tmp_path: Path
         json={
             "health_status": "normal",
             "planned_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
-            "notes": "",
         },
     )
     assert response.status_code == 200
@@ -300,7 +328,55 @@ def test_recommendation_api_requires_a_planned_time(tmp_path: Path) -> None:
     with connect(database) as connection:
         initialize(connection)
     response = TestClient(create_app(tmp_path)).post(
-        "/api/recommendation", json={"health_status": "normal", "notes": ""}
+        "/api/recommendation", json={"health_status": "normal"}
     )
     assert response.status_code == 422
     assert "planned date and time" in response.json()["detail"]
+
+
+def test_goal_progress_never_raises_where_the_validator_would() -> None:
+    """A read-out that throws when the goal is unset is useless in exactly the
+    situation an athlete most wants an answer."""
+    from run_analysis.race_goals import GoalStatus, goal_progress
+
+    assert goal_progress(None, {}).status == GoalStatus.NO_GOAL
+    selected_but_undated = {"coaching": {"training_goal": "marathon"}}
+    result = goal_progress(None, selected_but_undated)
+    assert result.status == GoalStatus.NO_GOAL
+    assert "no date set" in result.headline.lower()
+
+
+def test_goal_progress_reports_thin_history_rather_than_guessing() -> None:
+    from datetime import date as _date
+
+    from run_analysis.race_goals import GoalStatus, goal_progress
+
+    config = {
+        "coaching": {
+            "training_goal": "10k",
+            "goal_date": "2027-01-01",
+            "goal_pace_min_mile": 9.0,
+        }
+    }
+    result = goal_progress(None, config, as_of=_date(2026, 8, 8))
+    assert result.status == GoalStatus.INSUFFICIENT_EVIDENCE
+    assert result.weeks_remaining is not None
+
+
+def test_the_progress_read_out_and_the_validator_agree_on_supported_pace() -> None:
+    """Two implementations of "what your running supports" would eventually
+    disagree in front of the athlete."""
+    from statistics import median
+
+    from run_analysis.race_goals import RACE_GOALS, supported_goal_pace
+
+    profile = RACE_GOALS["10k"]
+    performances = [(9.0 + index * 0.1, 4.0) for index in range(10)]
+    expected = median(
+        sorted(
+            (pace * distance * (profile.distance_miles / distance) ** 1.06
+             + profile.prediction_penalty_minutes) / profile.distance_miles
+            for pace, distance in performances
+        )[:3]
+    )
+    assert supported_goal_pace(performances, profile) == pytest.approx(expected)

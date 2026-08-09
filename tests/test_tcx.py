@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from run_analysis.tcx import _quality, parse_tcx
+from run_analysis.activity_assembly import quality
+from run_analysis.tcx import parse_tcx
 
 
 TCX_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
@@ -86,9 +87,9 @@ def test_missing_gps_and_hr_are_flagged_not_invented(tmp_path: Path) -> None:
 
 
 def test_sensor_quality_tolerates_sparse_missing_trackpoints() -> None:
-    assert _quality("gps", 98, 100) == "gps_complete"
-    assert _quality("gps", 94, 100) == "gps_partial"
-    assert _quality("gps", 0, 100) == "gps_missing"
+    assert quality("gps", 98, 100) == "gps_complete"
+    assert quality("gps", 94, 100) == "gps_partial"
+    assert quality("gps", 0, 100) == "gps_missing"
 
 
 def test_zero_zero_position_is_invalid_but_preserved(tmp_path: Path) -> None:

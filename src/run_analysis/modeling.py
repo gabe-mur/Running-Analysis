@@ -495,9 +495,9 @@ def _fit_data_selected_models(
         "config": config["model"],
     }
     version = hashlib.sha256(json.dumps(version_payload, sort_keys=True).encode()).hexdigest()[:16]
-    connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_145'")
+    connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_at_target_hr'")
     connection.execute(
-        """UPDATE activity_metrics SET standardized_pace_145_min_mile=NULL,
+        """UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=NULL,
            standardized_pace_uncertainty_min_mile=NULL,raw_aerobic_efficiency_min_mile=NULL,
            environmental_adjustment_min_mile=NULL,selected_model_name=NULL,
            selected_model_version=NULL"""
@@ -521,7 +521,7 @@ def _fit_data_selected_models(
         result = {
             "activity_id": run_rows[0]["external_activity_id"],
             "observed_segment_pace_min_mile": observed,
-            "standardized_pace_145_min_mile": standardized_pace,
+            "standardized_pace_at_target_hr_min_mile": standardized_pace,
             "uncertainty_95_min_mile": pace_uncertainty,
             "raw_run_effect_mps": raw_effect,
             "shrunk_run_effect_mps": effect,
@@ -533,11 +533,11 @@ def _fit_data_selected_models(
         }
         connection.execute(
             "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
-            (activity_id, "standardized_pace_145", version, json.dumps(result)),
+            (activity_id, "standardized_pace_at_target_hr", version, json.dumps(result)),
         )
         connection.execute(
             """
-            UPDATE activity_metrics SET standardized_pace_145_min_mile=?,
+            UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=?,
                 standardized_pace_uncertainty_min_mile=?,raw_aerobic_efficiency_min_mile=?,
                 environmental_adjustment_min_mile=?,selected_model_name=?,selected_model_version=?
             WHERE activity_id=?
@@ -625,7 +625,7 @@ def _fit_data_selected_models(
     }
     connection.execute(
         "INSERT OR REPLACE INTO model_metadata(model_name,model_version,fitted_at_utc,metadata_json) VALUES (?,?,?,?)",
-        ("standardized_pace_145", version, datetime.now(timezone.utc).isoformat(), json.dumps(metadata)),
+        ("standardized_pace_at_target_hr", version, datetime.now(timezone.utc).isoformat(), json.dumps(metadata)),
     )
     connection.commit()
     output = Path(output_path)

@@ -13,7 +13,7 @@ def write_activity_type_review(connection: sqlite3.Connection, config: dict, pat
         """
         SELECT a.activity_id,a.start_time_local,a.total_distance_m/1609.344 AS distance_miles,
                m.moving_pace_min_mile,m.moving_average_hr_bpm,m.stop_fraction,
-               AVG(s.average_cadence) AS average_cadence,m.model_eligible,m.exclusion_reason,
+               AVG(s.average_cadence_spm) AS average_cadence_spm,m.model_eligible,m.exclusion_reason,
                a.notes,o.activity_id AS override_activity_id
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN segments s ON s.activity_id=a.id AND s.is_pathological=0
@@ -28,8 +28,8 @@ def write_activity_type_review(connection: sqlite3.Connection, config: dict, pat
         if row["override_activity_id"] is not None:
             continue
         pace = row["moving_pace_min_mile"]
-        cadence = row["average_cadence"]
-        if pace is None or cadence is None:
+        cadence_spm = row["average_cadence_spm"]
+        if pace is None or cadence_spm is None:
             continue
         score = 0
         reasons = []
@@ -44,24 +44,26 @@ def write_activity_type_review(connection: sqlite3.Connection, config: dict, pat
         elif pace >= float(settings["review_slow_pace_min_mile"]):
             score += 1
             reasons.append("slow-tail pace")
-        if cadence is not None:
-            if cadence <= float(settings["high_confidence_walk_cadence_max"]):
+        # Thresholds are total steps per minute, matching the canonical
+        # conversion applied when segments were written.
+        if cadence_spm is not None:
+            if cadence_spm <= float(settings["high_confidence_walk_cadence_max_spm"]):
                 score += 5
-                reasons.append("walking-range recorded run cadence")
-            elif cadence < 65:
+                reasons.append("walking-range cadence")
+            elif cadence_spm < float(settings["very_low_cadence_max_spm"]):
                 score += 3
-                reasons.append("very low recorded run cadence")
-            elif cadence <= float(settings["review_low_cadence_max"]):
+                reasons.append("very low cadence")
+            elif cadence_spm <= float(settings["review_low_cadence_max_spm"]):
                 score += 1
-                reasons.append("low recorded run cadence")
+                reasons.append("low cadence")
         if pace <= float(settings["high_confidence_bike_pace_min_mile"]) and row["distance_miles"] >= 5:
             score += 8
             reasons.append("bike-range sustained pace")
             suggestion = "bike"
         elif (
             pace >= float(settings["high_confidence_walk_pace_min_mile"])
-            and cadence is not None
-            and cadence <= float(settings["high_confidence_walk_cadence_max"])
+            and cadence_spm is not None
+            and cadence_spm <= float(settings["high_confidence_walk_cadence_max_spm"])
         ):
             suggestion = "hike_or_walk"
             confidence = "high"
@@ -80,7 +82,7 @@ def write_activity_type_review(connection: sqlite3.Connection, config: dict, pat
         "distance_miles",
         "moving_pace_min_mile",
         "moving_average_hr_bpm",
-        "average_cadence",
+        "average_cadence_spm",
         "stop_fraction",
         "suggested_type",
         "confidence",
@@ -103,8 +105,8 @@ def write_activity_type_review(connection: sqlite3.Connection, config: dict, pat
                     "moving_average_hr_bpm": round(row["moving_average_hr_bpm"], 1)
                     if row["moving_average_hr_bpm"] is not None
                     else "",
-                    "average_cadence": round(row["average_cadence"], 1)
-                    if row["average_cadence"] is not None
+                    "average_cadence_spm": round(row["average_cadence_spm"], 1)
+                    if row["average_cadence_spm"] is not None
                     else "",
                     "stop_fraction": round(row["stop_fraction"], 3),
                     "suggested_type": suggestion,

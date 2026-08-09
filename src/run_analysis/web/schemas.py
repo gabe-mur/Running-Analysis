@@ -13,6 +13,10 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..intensity_balance import IntensityBalance
+from ..onboarding import SetupStep, ZoneMethod
+from ..race_goals import GoalStatus
+
 
 class ApiModel(BaseModel):
     """Base model with strict, frontend-friendly validation."""
@@ -32,6 +36,18 @@ class FitnessTrend(StrEnum):
     STABLE = "stable"
     DECLINING = "declining"
     UNCERTAIN = "uncertain"
+    INSUFFICIENT_DATA = "insufficient_data"
+
+
+class TrainingStatus(StrEnum):
+    """What training is currently doing. Not a fitness score."""
+
+    BUILDING = "building"
+    MAINTAINING = "maintaining"
+    REBUILDING = "rebuilding"
+    RECOVERING = "recovering"
+    STRAINED = "strained"
+    UNDERLOADED = "underloaded"
     INSUFFICIENT_DATA = "insufficient_data"
 
 
@@ -109,6 +125,11 @@ class HealthResponse(ApiModel):
     database_exists: bool
     counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    #: True when application source on disk is newer than this process. Static
+    #: assets are read from disk on every request while Python code is held in
+    #: memory, so an un-restarted server serves new markup against old data.
+    source_newer_than_process: bool = False
+    restart_hint: str | None = None
 
 
 class PaceValue(ApiModel):
@@ -195,6 +216,15 @@ class LoadContext(ApiModel):
     prior_28d_weekly_miles: float | None = Field(default=None, ge=0)
     sustained_capacity_miles: float | None = Field(default=None, ge=0)
     capacity_reference_miles: float | None = Field(default=None, ge=0)
+    previous_capacity_reference_miles: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Retained demonstrated weekly capacity as of one comparison window ago. "
+            "Paired with capacity_reference_miles this shows whether capacity itself "
+            "moved, which period mileage alone cannot."
+        ),
+    )
     confidence: ConfidenceLevel
     flags: list[str] = Field(default_factory=list)
 
@@ -250,8 +280,39 @@ class Split(ApiModel):
     moving_minutes: float = Field(ge=0)
     pace_min_mile: float | None = Field(default=None, gt=0)
     average_hr_bpm: float | None = Field(default=None, gt=0)
+    average_cadence_spm: float | None = Field(default=None, gt=0)
+    #: Speed divided by cadence. A proxy, not a measured ground-contact distance.
+    stride_length_m: float | None = Field(default=None, gt=0)
     elevation_change_feet: float | None = None
     is_partial: bool = False
+
+
+class CadenceComparison(ApiModel):
+    """This athlete's own cadence at a similar pace. Never a population norm."""
+
+    available: bool = False
+    personal_median_spm: float | None = Field(default=None, gt=0)
+    personal_spread_spm: float | None = Field(default=None, ge=0)
+    comparable_segment_count: int = Field(default=0, ge=0)
+    pace_band_low_min_mile: float | None = Field(default=None, gt=0)
+    pace_band_high_min_mile: float | None = Field(default=None, gt=0)
+    detail: str = ""
+
+
+class CadenceAnalysis(ApiModel):
+    available: bool = False
+    average_spm: float | None = Field(default=None, gt=0)
+    median_spm: float | None = Field(default=None, gt=0)
+    first_half_spm: float | None = Field(default=None, gt=0)
+    second_half_spm: float | None = Field(default=None, gt=0)
+    change_spm: float | None = None
+    average_stride_length_m: float | None = Field(default=None, gt=0)
+    first_half_stride_length_m: float | None = Field(default=None, gt=0)
+    second_half_stride_length_m: float | None = Field(default=None, gt=0)
+    coverage_fraction: float = Field(default=0, ge=0, le=1)
+    comparison: CadenceComparison = Field(default_factory=CadenceComparison)
+    observations: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
 
 
 class WeatherSnapshot(ApiModel):
@@ -354,6 +415,7 @@ class RunFeedback(ApiModel):
     run: RunSummary
     metadata: RunMetadata
     splits: list[Split] = Field(default_factory=list)
+    cadence: CadenceAnalysis = Field(default_factory=CadenceAnalysis)
     weather: WeatherSnapshot | None = None
     cardiac_drift: DriftAssessment
     workout_analysis: WorkoutAnalysis | None = None
@@ -435,39 +497,10 @@ class FitnessCoverageItem(ApiModel):
     reason: str
 
 
-class ExternalFitnessSnapshotInput(ApiModel):
-    measured_at: date
-    vo2_max: float | None = Field(default=None, gt=10, le=100)
-    predicted_5k_seconds: int | None = Field(default=None, gt=600, le=10800)
-    predicted_10k_seconds: int | None = Field(default=None, gt=1200, le=21600)
-    predicted_half_marathon_seconds: int | None = Field(default=None, gt=2400, le=43200)
-    predicted_marathon_seconds: int | None = Field(default=None, gt=4800, le=86400)
-    source: str = Field(default="Garmin", max_length=100)
-
-    @model_validator(mode="after")
-    def require_metric(self) -> "ExternalFitnessSnapshotInput":
-        values = (
-            self.vo2_max,
-            self.predicted_5k_seconds,
-            self.predicted_10k_seconds,
-            self.predicted_half_marathon_seconds,
-            self.predicted_marathon_seconds,
-        )
-        if all(value is None for value in values):
-            raise ValueError("Enter VO2 max or at least one race prediction")
-        return self
-
-
-class ExternalFitnessSnapshot(ExternalFitnessSnapshotInput):
-    id: int
-
-
-class ExternalFitnessSummary(ApiModel):
-    snapshots: list[ExternalFitnessSnapshot] = Field(default_factory=list)
-    vo2_max_trend: FitnessTrend = FitnessTrend.INSUFFICIENT_DATA
-    race_prediction_trend: FitnessTrend = FitnessTrend.INSUFFICIENT_DATA
-    confidence: ConfidenceLevel = ConfidenceLevel.UNAVAILABLE
-    interpretation: str
+class Vo2TrendPoint(ApiModel):
+    as_of: datetime
+    value_ml_kg_min: float = Field(gt=0)
+    uncertainty_95_ml_kg_min: float = Field(ge=0)
 
 
 class LocalVo2Estimate(ApiModel):
@@ -479,6 +512,10 @@ class LocalVo2Estimate(ApiModel):
     demographic_baseline_ml_kg_min: float | None = Field(default=None, gt=0)
     demographic_uncertainty_95_ml_kg_min: float | None = Field(default=None, ge=0)
     interpretation: str
+    #: The same estimate applied to the trailing pace curve. It is a monotone
+    #: transform of that curve, not separate evidence, so it is drawn beside
+    #: the number rather than presented as a second opinion.
+    series: list[Vo2TrendPoint] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
 
@@ -496,12 +533,19 @@ class IntensitySummary(ApiModel):
     hard_percent: float | None = Field(default=None, ge=0, le=100)
     known_hr_minutes: float = Field(ge=0)
     missing_hr_minutes: float = Field(ge=0)
+    #: What the split means, not what it measures. Three percentages are not
+    #: advice; which way the distribution is wrong decides the fix.
+    balance: IntensityBalance = IntensityBalance.INSUFFICIENT_DATA
+    balance_headline: str = ""
+    balance_detail: str = ""
     confidence: ConfidenceLevel
 
 
 class ProgressResponse(ApiModel):
     as_of: datetime
     window_days: int
+    #: The comparison heart rate every "pace at X bpm" figure refers to.
+    target_hr_bpm: float = Field(default=145, gt=0)
     reference_within_run_minutes: float = Field(default=20, gt=0)
     available_windows: list[int]
     fitness_trend: FitnessTrend
@@ -520,7 +564,6 @@ class ProgressResponse(ApiModel):
     current_load: LoadContext
     consistency: ConsistencySummary
     intensity: IntensitySummary
-    external_fitness: ExternalFitnessSummary
     local_vo2_estimate: LocalVo2Estimate
     blind_spots: list[str] = Field(default_factory=list)
 
@@ -554,13 +597,34 @@ class FitnessInterpretation(ApiModel):
     caveats: list[str] = Field(default_factory=list)
 
 
+class TrainingStatusSummary(ApiModel):
+    """The dashboard headline, with the rules that produced it."""
+
+    status: TrainingStatus
+    label: str
+    detail: str
+    confidence: ConfidenceLevel
+    as_of: datetime
+    rule_trace: list["RuleTrace"] = Field(default_factory=list)
+
+
+class SetupNudge(ApiModel):
+    """Just enough for the dashboard to admit it is still using defaults."""
+
+    complete: bool
+    remaining: int = Field(ge=0)
+    detail: str
+
+
 class DashboardResponse(ApiModel):
     progress: ProgressResponse
+    training_status: TrainingStatusSummary
     fitness_interpretation: FitnessInterpretation
     last_run: RunFeedback | None = None
     recommendation: RecommendationResponse
     current_status: RecommendationRequest
     weekly_schedule: "WeeklyScheduleResponse | None" = None
+    setup: SetupNudge | None = None
 
 
 class FitnessState(ApiModel):
@@ -618,7 +682,6 @@ class PlannedWeather(ApiModel):
 class RecommendationRequest(ApiModel):
     health_status: CurrentHealthStatus
     planned_at: datetime | None = None
-    notes: str = Field(default="", max_length=2000)
     desired_distance_miles: float | None = Field(default=None, gt=0, le=50)
 
 
@@ -672,7 +735,6 @@ class RecommendationResponse(ApiModel):
 
 class WeeklyScheduleRequest(ApiModel):
     health_status: CurrentHealthStatus
-    notes: str = Field(default="", max_length=2000)
 
 
 class WeeklyScheduleDay(ApiModel):
@@ -810,6 +872,86 @@ class ProfileSettings(ApiModel):
     sex: str = Field(pattern="^(male|female)$")
     weight_lb: float = Field(gt=50, le=1000)
     height_in: float = Field(gt=36, le=100)
+    #: Whether max_hr came from a real maximal effort or an age formula. It is
+    #: the largest single source of error in the VO2 estimate, so the estimate
+    #: says which one it assumed.
+    max_hr_source: str = Field(default="estimated", pattern="^(measured|estimated)$")
+
+
+class GoalProgressResponse(ApiModel):
+    """Where you stand against the goal, or why it cannot say."""
+
+    status: GoalStatus
+    headline: str
+    detail: str
+    goal_label: str | None = None
+    race_date: date | None = None
+    weeks_remaining: float | None = None
+    goal_pace_min_mile: float | None = None
+    supported_pace_min_mile: float | None = None
+    gap_seconds_per_mile: float | None = None
+
+
+class SetupSettings(ApiModel):
+    """Which setup questions the athlete has actually answered.
+
+    Tracked explicitly because every setting here ships with a plausible
+    default, so a filled-in field proves nothing about whether anyone chose it.
+    """
+
+    confirmed_steps: list[SetupStep] = Field(default_factory=list)
+    zone_method: ZoneMethod | None = None
+
+
+class SetupStepStatus(ApiModel):
+    step: SetupStep
+    title: str
+    complete: bool
+    detail: str
+    blocking: bool = False
+
+
+class SetupStateResponse(ApiModel):
+    complete: bool
+    steps: list[SetupStepStatus]
+    next_step: SetupStep | None = None
+
+
+class ComparisonHrSupportPoint(ApiModel):
+    heart_rate_bpm: int
+    run_count: int
+    segment_count: int
+
+
+class ComparisonHrRecommendation(ApiModel):
+    recommended_bpm: int | None = None
+    run_count: int = 0
+    segment_count: int = 0
+    zone_lower_bpm: int
+    zone_upper_bpm: int
+    rationale: str
+    candidates: list[ComparisonHrSupportPoint] = Field(default_factory=list)
+
+
+class ZonePreviewRequest(ApiModel):
+    method: ZoneMethod
+    max_hr: int = Field(gt=0, le=250)
+    resting_hr: int | None = Field(default=None, gt=0, lt=150)
+    boundaries: dict[str, ZoneRange] | None = None
+
+
+class ZonePreviewResponse(ApiModel):
+    method: ZoneMethod
+    zones: dict[str, ZoneRange]
+    #: Recomputed against the previewed zones, because moving Z2 moves where
+    #: the evidence for a comparison heart rate is.
+    comparison_hr: ComparisonHrRecommendation
+
+
+class MaxHrEstimateResponse(ApiModel):
+    estimated_max_hr: int
+    method: str
+    caveat: str
 
 
 class SettingsResponse(ApiModel):
@@ -830,6 +972,7 @@ class SettingsResponse(ApiModel):
     moving_time: MovingTimeSettings
     coaching: CoachingSettings
     profile: ProfileSettings | None = None
+    setup: SetupSettings = Field(default_factory=SetupSettings)
     recalculation: list[UploadStage] = Field(default_factory=list)
 
 
@@ -850,6 +993,7 @@ class SettingsPatch(ApiModel):
     moving_time: MovingTimeSettings | None = None
     coaching: CoachingSettings | None = None
     profile: ProfileSettings | None = None
+    setup: SetupSettings | None = None
 
     @model_validator(mode="after")
     def require_one_change(self) -> "SettingsPatch":

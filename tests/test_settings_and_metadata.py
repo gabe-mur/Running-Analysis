@@ -15,6 +15,9 @@ from run_analysis.web.schemas import (
     ZoneRange,
     CoachingSettings,
 )
+from fastapi.testclient import TestClient
+
+from run_analysis.web.app import create_app
 from test_web_phase1 import _write_config
 
 
@@ -110,3 +113,159 @@ def test_at_least_one_quality_session_type_must_remain_enabled() -> None:
                 "hill_repeats": False,
             },
         )
+
+
+def test_setup_endpoint_reports_what_is_still_defaulted(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    payload = client.get("/api/setup").json()
+    assert payload["complete"] is False
+    assert payload["next_step"] == "runs"
+    assert any(step["blocking"] for step in payload["steps"])
+
+
+def test_zone_preview_shows_the_effect_before_anything_is_saved(tmp_path: Path) -> None:
+    """The point of a preview is that moving Z2 moves where the evidence for a
+    comparison heart rate is, and the athlete should see that first."""
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    before = client.get("/api/settings").json()["zones"]
+    response = client.post(
+        "/api/setup/zone-preview",
+        json={"method": "heart_rate_reserve", "max_hr": 194, "resting_hr": 49},
+    )
+    assert response.status_code == 200
+    preview = response.json()
+    assert preview["zones"]["z5"]["maximum_bpm"] == 194
+    assert "comparison_hr" in preview
+    assert client.get("/api/settings").json()["zones"] == before
+
+
+def test_zone_preview_rejects_reserve_without_a_resting_heart_rate(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    response = client.post(
+        "/api/setup/zone-preview", json={"method": "heart_rate_reserve", "max_hr": 194}
+    )
+    assert response.status_code == 422
+
+
+def test_confirmations_persist_and_accumulate(tmp_path: Path) -> None:
+    """Confirming one step must not silently un-confirm the others."""
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    client.patch("/api/settings", json={"setup": {"confirmed_steps": ["heart_rate"]}})
+    client.patch(
+        "/api/settings",
+        json={"setup": {"confirmed_steps": ["heart_rate", "zones"], "zone_method": "device"}},
+    )
+    setup = client.get("/api/settings").json()["setup"]
+    assert set(setup["confirmed_steps"]) == {"heart_rate", "zones"}
+    assert setup["zone_method"] == "device"
+
+
+def test_the_estimated_max_endpoint_states_its_own_uncertainty(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    client = TestClient(create_app(tmp_path))
+    payload = client.get("/api/setup/max-hr", params={"age_years": 30}).json()
+    assert payload["estimated_max_hr"] == 187
+    assert "not a measurement" in payload["caveat"]
+
+
+def test_reset_restores_tuning_but_never_personal_settings(tmp_path: Path) -> None:
+    """A button labelled "reset" must not be able to erase someone's max heart
+    rate. It clears modelling parameters and nothing else."""
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    shipped = client.get("/api/settings").json()
+
+    client.patch(
+        "/api/settings",
+        json={
+            "max_hr": 201,
+            "target_hr": 151,
+            "reference_temperature_f": 80.0,
+            "moving_time": {**shipped["moving_time"], "minimum_stop_seconds": 42},
+            "coaching": {
+                **shipped["coaching"],
+                "high_load_ratio": 1.9,
+                "quality_sessions": {**shipped["coaching"]["quality_sessions"], "hill_repeats": True},
+            },
+        },
+    )
+    changed = client.get("/api/settings").json()
+    assert changed["max_hr"] == 201 and changed["reference_temperature_f"] == 80.0
+
+    after = client.post("/api/settings/reset-advanced").json()
+    # Tuning is back to shipped values.
+    assert after["reference_temperature_f"] == shipped["reference_temperature_f"]
+    assert after["moving_time"]["minimum_stop_seconds"] == shipped["moving_time"]["minimum_stop_seconds"]
+    assert after["coaching"]["high_load_ratio"] == shipped["coaching"]["high_load_ratio"]
+    # Everything that describes the athlete survives.
+    assert after["max_hr"] == 201
+    assert after["target_hr"] == 151
+    assert after["coaching"]["quality_sessions"]["hill_repeats"] is True
+
+
+def test_reset_is_safe_to_run_when_nothing_was_ever_changed(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    before = client.get("/api/settings").json()
+    assert client.post("/api/settings/reset-advanced").status_code == 200
+    after = client.get("/api/settings").json()
+    assert after["moving_time"] == before["moving_time"]
+    assert after["zones"] == before["zones"]
+
+
+def test_setup_saves_everything_in_one_request(tmp_path: Path) -> None:
+    """Setup writes once. Saving step by step let the page show a comparison
+    heart rate that no longer matched the zones already stored."""
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    shipped = client.get("/api/settings").json()
+    response = client.patch(
+        "/api/settings",
+        json={
+            "max_hr": shipped["max_hr"],
+            "resting_hr": 49,
+            "target_hr": 148,
+            "zones": shipped["zones"],
+            "coaching": shipped["coaching"],
+            "historical_weather_enabled": True,
+            "forecast_weather_enabled": False,
+            "weather_privacy_radius_km": 2.0,
+            "setup": {
+                "confirmed_steps": ["heart_rate", "zones", "comparison_hr", "goal", "weather"],
+                "zone_method": "device",
+            },
+        },
+    )
+    assert response.status_code == 200
+    saved = response.json()
+    assert saved["target_hr"] == 148
+    assert saved["resting_hr"] == 49
+    assert saved["setup"]["zone_method"] == "device"
+    assert len(saved["setup"]["confirmed_steps"]) == 5
+    # And it survives a reload rather than only living in the response.
+    assert client.get("/api/settings").json()["target_hr"] == 148

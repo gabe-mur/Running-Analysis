@@ -691,9 +691,9 @@ def fit_published_reference_model(
     }
     version = hashlib.sha256(json.dumps(version_payload, sort_keys=True).encode()).hexdigest()[:16]
     selected_name = "literature-prior + locally matched personal evidence"
-    connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_145'")
+    connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_at_target_hr'")
     connection.execute(
-        """UPDATE activity_metrics SET standardized_pace_145_min_mile=NULL,
+        """UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=NULL,
            standardized_pace_uncertainty_min_mile=NULL,raw_aerobic_efficiency_min_mile=NULL,
            environmental_adjustment_min_mile=NULL,selected_model_name=NULL,
            selected_model_version=NULL"""
@@ -792,7 +792,7 @@ def fit_published_reference_model(
         uncertainty = math.sqrt(uncertainty**2 + (fallback_penalty_seconds / 60.0) ** 2)
 
         observed_pace = speed_to_pace_min_mile(observed_speed)
-        raw_pace_145 = speed_to_pace_min_mile(time_speed)
+        raw_pace_at_target_hr = speed_to_pace_min_mile(time_speed)
         contributions = {
             "hr_normalization": _pace_delta(observed_speed, raw_hr_speed),
             "time_normalization": _pace_delta(raw_hr_speed, time_speed),
@@ -871,10 +871,14 @@ def fit_published_reference_model(
         }
         result = {
             "activity_id": run_rows[0]["external_activity_id"],
+            # The heart rate every "at target HR" figure in this result refers
+            # to. Stored per run so a later configuration change is visible
+            # instead of silently relabeling old estimates.
+            "target_hr_bpm": float(config["target_hr"]),
             "observed_segment_pace_min_mile": observed_pace,
-            "raw_pace_145_min_mile": raw_pace_145,
+            "raw_pace_at_target_hr_min_mile": raw_pace_at_target_hr,
             "environmental_adjustment_min_mile": environmental_adjustment,
-            "standardized_pace_145_min_mile": standardized_pace,
+            "standardized_pace_at_target_hr_min_mile": standardized_pace,
             "uncertainty_95_min_mile": uncertainty,
             "measurement_uncertainty_95_min_mile": measurement_uncertainty,
             "heat_coefficient_uncertainty_95_min_mile": heat_coefficient_uncertainty,
@@ -937,8 +941,8 @@ def fit_published_reference_model(
                 + (benchmark_fallback_penalty / 60.0) ** 2
             )
             result["steady_aerobic_benchmark"] = {
-                "standardized_pace_145_min_mile": benchmark_pace,
-                "raw_pace_145_min_mile": speed_to_pace_min_mile(benchmark_hr_speeds[benchmark_index]),
+                "standardized_pace_at_target_hr_min_mile": benchmark_pace,
+                "raw_pace_at_target_hr_min_mile": speed_to_pace_min_mile(benchmark_hr_speeds[benchmark_index]),
                 "uncertainty_95_min_mile": benchmark_uncertainty,
                 "measurement_uncertainty_95_min_mile": benchmark_measurement_uncertainty,
                 "fallback_uncertainty_95_min_mile": benchmark_fallback_penalty / 60.0,
@@ -969,17 +973,17 @@ def fit_published_reference_model(
             result["steady_aerobic_benchmark"] = None
         connection.execute(
             "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
-            (activity_id, "standardized_pace_145", version, json.dumps(result)),
+            (activity_id, "standardized_pace_at_target_hr", version, json.dumps(result)),
         )
         connection.execute(
-            """UPDATE activity_metrics SET standardized_pace_145_min_mile=?,
+            """UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=?,
                 standardized_pace_uncertainty_min_mile=?,raw_aerobic_efficiency_min_mile=?,
                 environmental_adjustment_min_mile=?,selected_model_name=?,selected_model_version=?
             WHERE activity_id=?""",
             (
                 standardized_pace,
                 uncertainty,
-                raw_pace_145,
+                raw_pace_at_target_hr,
                 environmental_adjustment,
                 selected_name,
                 version,
@@ -1089,7 +1093,7 @@ def fit_published_reference_model(
     connection.execute(
         "INSERT OR REPLACE INTO model_metadata(model_name,model_version,fitted_at_utc,metadata_json) VALUES (?,?,?,?)",
         (
-            "standardized_pace_145",
+            "standardized_pace_at_target_hr",
             version,
             datetime.now(timezone.utc).isoformat(),
             json.dumps(metadata),

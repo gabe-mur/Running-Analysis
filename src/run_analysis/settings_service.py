@@ -19,6 +19,7 @@ from .web.schemas import (
     MovingTimeSettings,
     ProfileSettings,
     SettingsPatch,
+    SetupSettings,
     SettingsResponse,
     UploadStage,
     ZoneRange,
@@ -95,6 +96,7 @@ def settings_response(config: dict[str, Any], stages: list[UploadStage] | None =
         moving_time=MovingTimeSettings.model_validate(config["moving_time"]),
         coaching=CoachingSettings.model_validate(coaching),
         profile=(ProfileSettings.model_validate(config["profile"]) if config.get("profile") else None),
+        setup=SetupSettings.model_validate(config.get("setup") or {}),
         recalculation=stages or [],
     )
 
@@ -141,6 +143,12 @@ def _patch_to_overlay(patch: SettingsPatch) -> dict[str, Any]:
         if hasattr(profile.get("birth_date"), "isoformat"):
             profile["birth_date"] = profile["birth_date"].isoformat()
         overlay["profile"] = profile
+    if "setup" in values:
+        # Merged, not replaced: confirming one step must not silently
+        # un-confirm the others. Dumped as plain strings because the overlay is
+        # YAML, and PyYAML matches representers by exact type -- a StrEnum is a
+        # str but is not `str`, so it would fail to serialise.
+        overlay["setup"] = patch.setup.model_dump(mode="json", exclude_none=True)
     if "default_fitness_window" in values:
         overlay["app"] = {"default_fitness_window": values["default_fitness_window"]}
     return overlay
@@ -211,3 +219,44 @@ def recalculate_for_settings(connection, config: dict[str, Any], project_root: P
                 )
             )
     return stages
+
+#: Overlay sections that are model machinery rather than facts about the
+#: athlete. Only these are cleared by a reset.
+_ADVANCED_SECTIONS = ("moving_time", "reference_conditions")
+
+#: Coaching keys that describe the athlete's intent, not the planner's tuning.
+#: A reset must not silently discard a race date someone entered.
+_PERSONAL_COACHING_KEYS = frozenset(
+    {"training_goal", "goal_date", "goal_pace_min_mile", "quality_sessions"}
+)
+
+
+def reset_advanced_overlay(config_path: Path) -> dict[str, Any]:
+    """Return the tuning knobs to their shipped values.
+
+    Deliberately partial. Everything under Advanced is a modelling parameter
+    with a defensible default, so putting it back is safe. Heart rates, zones,
+    profile, goal, and weather consent are answers about a person, and a button
+    labelled "reset" must never be able to erase those -- a destructive action
+    hiding behind a harmless-sounding label is worse than no button.
+    """
+
+    overlay_path = Path(config_path).with_name("config.local.yaml")
+    existing: dict[str, Any] = {}
+    if overlay_path.exists():
+        existing = yaml.safe_load(overlay_path.read_text(encoding="utf-8")) or {}
+    for section in _ADVANCED_SECTIONS:
+        existing.pop(section, None)
+    coaching = existing.get("coaching")
+    if isinstance(coaching, dict):
+        kept = {key: value for key, value in coaching.items() if key in _PERSONAL_COACHING_KEYS}
+        if kept:
+            existing["coaching"] = kept
+        else:
+            existing.pop("coaching", None)
+    temporary = overlay_path.with_suffix(".yaml.tmp")
+    temporary.write_text(yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+    private_file(temporary)
+    temporary.replace(overlay_path)
+    private_file(overlay_path)
+    return load_config(config_path)

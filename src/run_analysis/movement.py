@@ -129,7 +129,18 @@ def classify_movement(
         )
         if stationary_device_gap and not recorded_low:
             flags.append("stale_endpoint_speed_ignored_for_stationary_gap")
-        low_candidates.append(stationary_device_gap or (distance_low and recorded_low and gps_low))
+        # A device-recorded pause is evidence, not inference. Every heuristic
+        # above exists only because TCX cannot say when the timer stopped; when
+        # a FIT file does say so, that settles it. Requiring the pause to cover
+        # most of the interval stops a brief pause inside a long recording gap
+        # from condemning the whole gap.
+        recorded_pause_s = first.pause_after_s or 0.0
+        recorded_pause = recorded_pause_s >= max(minimum_stop, 0.5 * elapsed)
+        if recorded_pause:
+            flags.append("recorded_timer_pause")
+        low_candidates.append(
+            recorded_pause or stationary_device_gap or (distance_low and recorded_low and gps_low)
+        )
         bearing = None
         if gps_distance is not None and gps_distance > 0.5:
             assert first.latitude is not None and first.longitude is not None
@@ -263,3 +274,40 @@ def attach_elevation_deltas(
         second = smoothed[second_index]
         if first is not None and second is not None:
             interval.elevation_delta_m = second - first
+
+
+def pause_restart_offsets(
+    intervals: list[MovementInterval], minimum_stop_seconds: float
+) -> list[float]:
+    """Cumulative moving-time offsets at which running resumed after a pause.
+
+    Heart rate falls quickly when an athlete stops and needs minutes to climb
+    back once they resume. A window taken immediately after a long stop
+    therefore pairs ordinary running speed with a heart rate that has not
+    caught up yet, which reads as unusually good aerobic efficiency. Callers
+    use these offsets to exclude that stretch.
+
+    Offsets are measured in cumulative moving seconds so they line up with the
+    moving-time coordinates the modeling windows are built in. Stop time is
+    accumulated across consecutive intervals, so several short stops back to
+    back count as one long one.
+
+    Stop time on a partially stopped ``mixed_gap`` interval counts too. That
+    classification is exactly what Garmin's auto-pause produces, so ignoring it
+    would miss the common case. Because the interval does not record where
+    inside itself the movement happened, the restart is anchored at the
+    interval's start, which suppresses slightly more rather than less.
+    """
+
+    offsets: list[float] = []
+    moving_s = 0.0
+    pending_stop_s = 0.0
+    for interval in intervals:
+        pending_stop_s += interval.stopped_time_s
+        if interval.moving_time_s <= 0:
+            continue
+        if pending_stop_s >= minimum_stop_seconds:
+            offsets.append(moving_s)
+        pending_stop_s = 0.0
+        moving_s += interval.moving_time_s
+    return offsets

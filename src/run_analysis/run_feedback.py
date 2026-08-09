@@ -10,6 +10,7 @@ import sqlite3
 
 from .config import load_config, resolve_project_path
 from .db import connect, initialize
+from .cadence_feedback import build_cadence_analysis
 from .movement import MovementInterval, attach_elevation_deltas, classify_movement
 from .processing import _load_points
 from .segmentation import METERS_PER_MILE
@@ -124,11 +125,24 @@ def _data_quality(row: sqlite3.Row, load_coverage: float) -> DataQuality:
     return DataQuality.GOOD
 
 
+def _split_stride_length(
+    distance_m: float, moving_s: float, cadence_weighted: float, cadence_seconds: float
+) -> float | None:
+    """Metres per step across a split: speed divided by cadence."""
+    if moving_s <= 0 or cadence_seconds <= 0:
+        return None
+    cadence_spm = cadence_weighted / cadence_seconds
+    if cadence_spm <= 0:
+        return None
+    return (distance_m / moving_s) / (cadence_spm / 60.0)
+
+
 def build_mile_splits(intervals: list[MovementInterval]) -> list[Split]:
     """Create exact mile boundaries by proportionally splitting raw intervals."""
 
     output: list[Split] = []
     distance = moving_s = elevation = hr_weighted = hr_seconds = 0.0
+    cadence_weighted = cadence_seconds = 0.0
     index = 1
     for interval in intervals:
         if interval.distance_m <= 0 or interval.moving_time_s <= 0:
@@ -151,6 +165,15 @@ def build_mile_splits(intervals: list[MovementInterval]) -> list[Split]:
             if hrs:
                 hr_weighted += (sum(hrs) / len(hrs)) * apportioned_time
                 hr_seconds += apportioned_time
+            # Total steps per minute via the one canonical conversion.
+            cadences = [
+                value
+                for value in (interval.start.cadence_spm, interval.end.cadence_spm)
+                if value is not None
+            ]
+            if cadences:
+                cadence_weighted += (sum(cadences) / len(cadences)) * apportioned_time
+                cadence_seconds += apportioned_time
             remaining -= consumed
             if distance >= METERS_PER_MILE - 1e-6:
                 miles = distance / METERS_PER_MILE
@@ -161,11 +184,18 @@ def build_mile_splits(intervals: list[MovementInterval]) -> list[Split]:
                         moving_minutes=moving_s / 60,
                         pace_min_mile=(moving_s / 60) / miles,
                         average_hr_bpm=hr_weighted / hr_seconds if hr_seconds else None,
+                        average_cadence_spm=(
+                            cadence_weighted / cadence_seconds if cadence_seconds else None
+                        ),
+                        stride_length_m=_split_stride_length(
+                            distance, moving_s, cadence_weighted, cadence_seconds
+                        ),
                         elevation_change_feet=elevation * 3.28084,
                     )
                 )
                 index += 1
                 distance = moving_s = elevation = hr_weighted = hr_seconds = 0.0
+                cadence_weighted = cadence_seconds = 0.0
     if distance >= METERS_PER_MILE * 0.05:
         miles = distance / METERS_PER_MILE
         output.append(
@@ -175,6 +205,12 @@ def build_mile_splits(intervals: list[MovementInterval]) -> list[Split]:
                 moving_minutes=moving_s / 60,
                 pace_min_mile=(moving_s / 60) / miles,
                 average_hr_bpm=hr_weighted / hr_seconds if hr_seconds else None,
+                average_cadence_spm=(
+                    cadence_weighted / cadence_seconds if cadence_seconds else None
+                ),
+                stride_length_m=_split_stride_length(
+                    distance, moving_s, cadence_weighted, cadence_seconds
+                ),
                 elevation_change_feet=elevation * 3.28084,
                 is_partial=True,
             )
@@ -228,8 +264,8 @@ def _fitness_observation(row: sqlite3.Row) -> FitnessObservation | None:
     if not row["result_json"]:
         return None
     result = json.loads(row["result_json"])
-    raw = result.get("raw_pace_145_min_mile")
-    standardized = result.get("standardized_pace_145_min_mile")
+    raw = result.get("raw_pace_at_target_hr_min_mile")
+    standardized = result.get("standardized_pace_at_target_hr_min_mile")
     if raw is None or standardized is None or row["start_time_utc"] is None:
         return None
     contributions: list[AdjustmentContribution] = []
@@ -593,6 +629,7 @@ def get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], act
         run=summary,
         metadata=metadata,
         splits=splits,
+        cadence=build_cadence_analysis(connection, activity_id, movement.intervals),
         weather=weather,
         cardiac_drift=drift,
         workout_analysis=workout_analysis,

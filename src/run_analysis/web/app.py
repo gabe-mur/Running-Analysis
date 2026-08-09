@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import date, datetime, timezone
+import os
 import sqlite3
+import time
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -14,12 +16,15 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from ..config import load_config, resolve_project_path
 from ..db import connect, initialize
 from ..dashboard import DASHBOARD_WINDOW_DAYS, build_dashboard
-from ..external_fitness import save_snapshot, summarize_external_fitness
 from ..metadata_service import update_run_metadata
 from ..modeling import fit_models
 from ..processing import process_activities
 from ..run_feedback import get_run_feedback, list_runs
+from ..onboarding import derive_zones, estimate_max_hr, recommend_comparison_hr, setup_state
+from dataclasses import asdict
+
 from ..progress import build_progress
+from ..race_goals import goal_progress
 from ..recommendation_service import (
     current_fitness_state,
     generate_recommendation,
@@ -28,13 +33,25 @@ from ..recommendation_service import (
     load_current_status,
     load_latest_recommendation,
 )
-from ..settings_service import recalculate_for_settings, save_settings_overlay, settings_response
+from ..settings_service import (
+    recalculate_for_settings,
+    reset_advanced_overlay,
+    save_settings_overlay,
+    settings_response,
+)
 from ..weather import save_activity_postal_code, update_weather
 from .schemas import (
+    ComparisonHrRecommendation,
+    ComparisonHrSupportPoint,
+    MaxHrEstimateResponse,
+    SetupStateResponse,
+    SetupStepStatus,
+    ZonePreviewRequest,
+    ZonePreviewResponse,
+    GoalProgressResponse,
+    MovingTimeSettings,
+    ZoneRange,
     FitnessState,
-    ExternalFitnessSnapshot,
-    ExternalFitnessSnapshotInput,
-    ExternalFitnessSummary,
     DashboardResponse,
     HealthResponse,
     ProgressResponse,
@@ -63,8 +80,43 @@ COUNT_TABLES = (
 )
 
 
+#: When this process began. Compared against source modification times so a
+#: server left running across an edit can report that fact itself.
+PROCESS_STARTED_AT = time.time()
+
+
+def _source_is_newer_than_process() -> bool:
+    """Whether any application module has been edited since startup.
+
+    Static assets are re-read from disk on every request, but Python modules
+    are loaded once. After an edit that touches both, an un-restarted server
+    serves current markup against stale data, and the mismatch surfaces as a
+    confusing client-side error about a missing field rather than as the
+    restart it actually is.
+    """
+
+    package_root = Path(__file__).resolve().parent.parent
+    try:
+        newest = max(
+            path.stat().st_mtime for path in package_root.rglob("*.py") if path.is_file()
+        )
+    except (OSError, ValueError):
+        return False
+    # A second of slack keeps normal filesystem timestamp jitter from flagging
+    # a server that started immediately after a write.
+    return newest > PROCESS_STARTED_AT + 1.0
+
+
 def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
     warnings: list[str] = []
+    stale = _source_is_newer_than_process()
+    restart_hint = (
+        "This server is running code from before your most recent edit. Static files "
+        "are read from disk on every request but Python is loaded once, so the page "
+        "and the data can disagree. Stop the server and run `python3 start.py` again."
+        if stale
+        else None
+    )
     try:
         config = load_config(config_path)
     except (FileNotFoundError, ValueError) as exc:
@@ -73,6 +125,8 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
             database_path="",
             database_exists=False,
             warnings=[str(exc)],
+            source_newer_than_process=stale,
+            restart_hint=restart_hint,
         )
 
     database = resolve_project_path(project_root, config["paths"]["database"])
@@ -82,6 +136,8 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
             database_path=str(database),
             database_exists=False,
             warnings=["Run the import pipeline to create the analysis database."],
+            source_newer_than_process=stale,
+            restart_hint=restart_hint,
         )
 
     counts: dict[str, int] = {}
@@ -127,6 +183,20 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
         schema_version=schema_version,
         counts=counts,
         warnings=warnings,
+    )
+
+
+#: Environment variables the reload worker reads, because uvicorn's reloader
+#: re-imports the application in a fresh process and cannot be handed arguments.
+PROJECT_ROOT_ENV = "RUN_ANALYSIS_PROJECT_ROOT"
+CONFIG_PATH_ENV = "RUN_ANALYSIS_CONFIG"
+
+
+def create_app_from_env() -> FastAPI:
+    """Factory used by ``uvicorn --reload``; see the environment names above."""
+    return create_app(
+        os.environ.get(PROJECT_ROOT_ENV, "."),
+        os.environ.get(CONFIG_PATH_ENV, "config.yaml"),
     )
 
 
@@ -288,10 +358,7 @@ def create_app(
             generate_weekly_schedule(
                 connection,
                 config,
-                WeeklyScheduleRequest(
-                    health_status=current.health_status,
-                    notes=current.notes,
-                ),
+                WeeklyScheduleRequest(health_status=current.health_status),
                 root,
             )
             feedback = get_run_feedback(connection, config, activity_id)
@@ -308,22 +375,6 @@ def create_app(
         with connect(database) as connection:
             initialize(connection)
             return build_progress(connection, selected_window, config=config)
-
-    @api.get("/external-fitness", response_model=ExternalFitnessSummary, tags=["analysis"])
-    def external_fitness() -> ExternalFitnessSummary:
-        config = load_config(selected_config)
-        database = resolve_project_path(root, config["paths"]["database"])
-        with connect(database) as connection:
-            initialize(connection)
-            return summarize_external_fitness(connection, datetime.now(timezone.utc))
-
-    @api.post("/external-fitness", response_model=ExternalFitnessSnapshot, tags=["analysis"])
-    def add_external_fitness(snapshot: ExternalFitnessSnapshotInput) -> ExternalFitnessSnapshot:
-        config = load_config(selected_config)
-        database = resolve_project_path(root, config["paths"]["database"])
-        with connect(database) as connection:
-            initialize(connection)
-            return save_snapshot(connection, snapshot)
 
     @api.get("/fitness-state", response_model=FitnessState, tags=["coaching"])
     def fitness_state() -> FitnessState:
@@ -394,6 +445,127 @@ def create_app(
         with connect(database) as connection:
             initialize(connection)
             return ensure_current_weekly_schedule(connection, config, root)
+
+    def _recommendation_model(result) -> ComparisonHrRecommendation:
+        return ComparisonHrRecommendation(
+            recommended_bpm=result.recommended_bpm,
+            run_count=result.run_count,
+            segment_count=result.segment_count,
+            zone_lower_bpm=result.zone_lower_bpm,
+            zone_upper_bpm=result.zone_upper_bpm,
+            rationale=result.rationale,
+            candidates=[
+                ComparisonHrSupportPoint(
+                    heart_rate_bpm=item.heart_rate_bpm,
+                    run_count=item.run_count,
+                    segment_count=item.segment_count,
+                )
+                for item in result.candidates
+            ],
+        )
+
+    @api.post("/settings/reset-advanced", response_model=SettingsResponse, tags=["settings"])
+    def reset_advanced() -> SettingsResponse:
+        """Restore the modelling parameters, and nothing that describes you."""
+
+        config = reset_advanced_overlay(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        stages: list = []
+        if database.exists():
+            with connect(database) as connection:
+                initialize(connection)
+                # Movement and reference conditions feed the pipeline, so the
+                # stored results are stale the moment they change back.
+                stages = recalculate_for_settings(
+                    connection, config, root, SettingsPatch(moving_time=MovingTimeSettings.model_validate(config["moving_time"]))
+                )
+        return settings_response(config, stages)
+
+    @api.get("/goal-progress", response_model=GoalProgressResponse, tags=["coaching"])
+    def goal_progress_route() -> GoalProgressResponse:
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            return GoalProgressResponse.model_validate(asdict(goal_progress(None, config)))
+        with connect(database) as connection:
+            initialize(connection)
+            return GoalProgressResponse.model_validate(asdict(goal_progress(connection, config)))
+
+    @api.get("/setup", response_model=SetupStateResponse, tags=["settings"])
+    def get_setup() -> SetupStateResponse:
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        with connect(database) as connection:
+            initialize(connection)
+            state = setup_state(connection, config)
+        return SetupStateResponse(
+            complete=state.complete,
+            steps=[
+                SetupStepStatus(
+                    step=item.step,
+                    title=item.title,
+                    complete=item.complete,
+                    detail=item.detail,
+                    blocking=item.blocking,
+                )
+                for item in state.steps
+            ],
+            next_step=state.next_step.step if state.next_step else None,
+        )
+
+    @api.get("/setup/max-hr", response_model=MaxHrEstimateResponse, tags=["settings"])
+    def estimated_max_hr(age_years: float = Query(gt=5, le=110)) -> MaxHrEstimateResponse:
+        return MaxHrEstimateResponse(
+            estimated_max_hr=estimate_max_hr(age_years),
+            method="Tanaka, Monahan & Seals (2001): 208 - 0.7 x age",
+            caveat=(
+                "An age formula, not a measurement. Individuals vary by roughly 7 bpm "
+                "either side, and this single number sets every zone boundary below it."
+            ),
+        )
+
+    @api.post("/setup/zone-preview", response_model=ZonePreviewResponse, tags=["settings"])
+    def preview_zones(request: ZonePreviewRequest) -> ZonePreviewResponse:
+        """Show the zones a method produces, and what it does to the comparison
+        heart rate, before anything is saved."""
+
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        try:
+            zones = derive_zones(
+                request.method,
+                maximum_hr=request.max_hr,
+                resting_hr=request.resting_hr,
+                boundaries=(
+                    {name: (zone.minimum_bpm, zone.maximum_bpm) for name, zone in request.boundaries.items()}
+                    if request.boundaries
+                    else None
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        with connect(database) as connection:
+            initialize(connection)
+            recommendation = recommend_comparison_hr(connection, zones)
+        return ZonePreviewResponse(
+            method=request.method,
+            zones={name: ZoneRange(minimum_bpm=low, maximum_bpm=high) for name, (low, high) in zones.items()},
+            comparison_hr=_recommendation_model(recommendation),
+        )
+
+    @api.get("/setup/comparison-hr", response_model=ComparisonHrRecommendation, tags=["settings"])
+    def comparison_hr() -> ComparisonHrRecommendation:
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        with connect(database) as connection:
+            initialize(connection)
+            return _recommendation_model(recommend_comparison_hr(connection, config["zones"]))
 
     @api.get("/settings", response_model=SettingsResponse, tags=["settings"])
     def get_settings() -> SettingsResponse:

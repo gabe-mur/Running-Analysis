@@ -36,7 +36,7 @@ RULE_CATALOG: tuple[RuleDefinition, ...] = (
     RuleDefinition("planned_timing", "Recovery spacing and rolling load are projected to the planned run time."),
     RuleDefinition("planned_weather", "Forecast heat, humidity, wind, and precipitation can make a future workout more costly."),
     RuleDefinition("health_pain", "Pain or injury concern blocks a running prescription."),
-    RuleDefinition("health_sick", "Sick/recovering limits training to reduced recovery work; explicit active or concerning symptoms still block running."),
+    RuleDefinition("health_sick", "Sick/recovering limits training to a short, low-load return-to-running check. Judging symptom severity is the athlete's call, not the app's."),
     RuleDefinition("long_or_hard_yesterday", "A long/hard run within 36 hours favors rest or short recovery."),
     RuleDefinition("high_recent_load", "A high 7-day mileage load relative to retained demonstrated capacity blocks added volume or quality."),
     RuleDefinition("moderate_leakage", "Excess recent Z3 time redirects the next run to deliberate Z1/Z2."),
@@ -79,6 +79,44 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
         },
         **config.get("coaching", {}),
     }
+
+
+def _zone_copy(config: dict[str, Any], zone: str) -> str:
+    """Render a configured zone as athlete-facing copy.
+
+    Instruction text must never hard-code a bpm range; the athlete's zones are
+    configurable and the prescription has to agree with them.
+    """
+
+    bounds = (config.get("zones") or {}).get(zone)
+    if not bounds or len(bounds) < 2:
+        return f"{zone.upper()}"
+    return f"{int(bounds[0])}–{int(bounds[1])} bpm"
+
+
+# A long run is conventionally at least five miles, but that is a convention,
+# not a guardrail.  The progression ceiling always outranks it.
+LONG_RUN_CONVENTIONAL_FLOOR_MILES = 5.0
+
+
+def _long_run_distance(
+    cap_miles: float, weekly_norm_miles: float
+) -> tuple[float, float, bool]:
+    """Resolve a long-run range that respects the progression ceiling.
+
+    Returns ``(lower, upper, capped_by_progression)``.  The conventional
+    five-mile floor is applied only when the 110%-of-longest-recent-run
+    ceiling already supports it; a runner whose longest recent run was three
+    miles must never be handed five.  Half-mile rounding stays as the only
+    thing that may exceed the ceiling, and only by rounding, which the
+    prescription's warning already discloses.
+    """
+
+    practical = min(cap_miles, weekly_norm_miles * 0.35 if weekly_norm_miles else cap_miles)
+    practical = min(cap_miles, max(LONG_RUN_CONVENTIONAL_FLOOR_MILES, practical))
+    upper = max(1.0, round(practical * 2) / 2)
+    lower = max(1.0, upper - 0.5)
+    return (lower, max(upper, lower), cap_miles < LONG_RUN_CONVENTIONAL_FLOOR_MILES)
 
 
 def typical_easy_distance(state: FitnessState) -> tuple[float, float]:
@@ -285,9 +323,6 @@ def recommend_next_run(
         and state.moderate_evidence_runs_14d >= 2
         and state.moderate_fraction_14d >= float(settings["moderate_intensity_leakage_fraction"])
     )
-    notes = request.notes.casefold()
-    pain_note = any(phrase in notes for phrase in ("sharp pain", "chest pain", "injury concern"))
-    sickness_note = any(phrase in notes for phrase in ("shortness of breath", "fever", "actively sick"))
 
     trace.append(
         _trace(
@@ -331,8 +366,8 @@ def recommend_next_run(
     )
 
     rule = RULES["health_pain"]
-    fired = health == CurrentHealthStatus.PAIN_OR_INJURY_CONCERN or pain_note
-    trace.append(_trace(rule, fired, health_status=health.value, concerning_note=pain_note))
+    fired = health == CurrentHealthStatus.PAIN_OR_INJURY_CONCERN
+    trace.append(_trace(rule, fired, health_status=health.value))
     if fired:
         return _result(
             state,
@@ -348,19 +383,7 @@ def recommend_next_run(
 
     rule = RULES["health_sick"]
     recovering_mode = health == CurrentHealthStatus.SICK_OR_RECOVERING
-    trace.append(_trace(rule, recovering_mode or sickness_note, health_status=health.value, concerning_note=sickness_note, recent_illness=state.recent_illness_or_recovery))
-    if sickness_note:
-        return _result(
-            state,
-            workout_type=WorkoutType.REST,
-            title="Recovery day",
-            reasons=["Your notes indicate active or concerning illness symptoms, which override training-load signals."],
-            warnings=["Resume with reduced easy volume only when symptoms and ordinary daily activity are clearly tolerated."],
-            modifications=["If you feel normal later, request a new recommendation rather than using this stale one."],
-            confidence=ConfidenceLevel.HIGH,
-            readiness=ReadinessFlag.NOT_READY,
-            trace=trace,
-        )
+    trace.append(_trace(rule, recovering_mode, health_status=health.value, recent_illness=state.recent_illness_or_recovery))
     if recovering_mode:
         recovery_distance = (
             round(max(1.5, easy_distance[0] * 0.5) * 2) / 2,
@@ -379,7 +402,7 @@ def recommend_next_run(
                 )
             ],
             reasons=["Sick/recovering status permits only a short, low-load return-to-running check."],
-            warnings=["This is not medical clearance. Fever, chest pain, unusual shortness of breath, or worsening symptoms mean do not run."],
+            warnings=["This is not medical clearance, and the app cannot assess your symptoms. Fever, chest pain, unusual shortness of breath, or worsening symptoms mean do not run today — ignore this prescription entirely."],
             modifications=["Change the current status to Normal when you are ready for ordinary load and workout scoring."],
             confidence=ConfidenceLevel.MODERATE,
             readiness=ReadinessFlag.CAUTION,
@@ -695,9 +718,15 @@ def recommend_next_run(
             state.recent_load.trailing_28d.distance_miles / 4,
             state.recent_load.capacity_reference_miles or 0,
         )
-        practical = max(5.0, min(cap, weekly_norm * 0.35 if weekly_norm else cap))
-        upper = max(5.0, round(practical * 2) / 2)
-        lower = max(4.5, upper - 0.5)
+        lower, upper, capped_by_progression = _long_run_distance(cap, weekly_norm)
+        warnings = ["The distance is rounded to a practical half mile; the progression limit is a warning, not a hard safety line."]
+        if capped_by_progression:
+            warnings.append(
+                f"Your longest run in the past 30 days was {state.longest_run_30d_miles:.1f} miles, "
+                f"so the progression limit is about {cap:.1f} miles and this long run follows that "
+                "rather than a conventional distance. Half-mile rounding may put the upper end "
+                "level with the limit."
+            )
         return _result(
             state,
             workout_type=WorkoutType.LONG,
@@ -709,7 +738,7 @@ def recommend_next_run(
                 WorkoutStep(instruction="Remain primarily Z2; no planned fast finish.", target_zones=["Z2"]),
             ],
             reasons=["A long run fits your recent mileage, recovery, and time since the last one.", "The distance stays close to your longest run in the past 30 days."],
-            warnings=["The distance is rounded to a practical half mile; the progression limit is a warning, not a hard safety line."],
+            warnings=warnings,
             modifications=["Cut the run to ordinary easy distance if fatigue, pain, or illness symptoms appear."],
             confidence=ConfidenceLevel.MODERATE,
             readiness=ReadinessFlag.READY,
@@ -812,7 +841,7 @@ def recommend_next_run(
         zones=["Z1", "Z2"],
         structure=[
             WorkoutStep(instruction="First 10 minutes in Z1 or low Z2.", duration_minutes=10, target_zones=["Z1", "low Z2"]),
-            WorkoutStep(instruction="Then stay primarily 141–153 bpm; no fast finish.", target_zones=["Z2"]),
+            WorkoutStep(instruction=f"Then stay primarily {_zone_copy(config, 'z2')}; no fast finish.", target_zones=["Z2"]),
         ],
         reasons=reasons,
         warnings=["Sleep, soreness, stress, hydration, and unrecorded activity are unavailable."],

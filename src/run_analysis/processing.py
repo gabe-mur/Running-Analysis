@@ -15,7 +15,7 @@ from .segmentation import METERS_PER_MILE, Segment, build_segments
 from .workload import update_workloads
 from .training_load import calculate_session_load
 
-PROCESSOR_VERSION = "phase3-v6-device-distance-fallback"
+PROCESSOR_VERSION = "phase3-v7-canonical-cadence-spm"
 
 
 @dataclass(slots=True)
@@ -54,7 +54,8 @@ def _load_points(connection: sqlite3.Connection, activity_id: int) -> list[Track
         """
         SELECT lap_index, track_index, point_index, timestamp_utc, latitude,
                longitude, gps_valid, altitude_m, distance_m, heart_rate_bpm,
-               cadence, run_cadence, cadence_source, speed_mps, parse_flags_json
+               cadence, run_cadence, cadence_source, speed_mps, pause_after_s,
+               parse_flags_json
         FROM trackpoints WHERE activity_id = ?
         ORDER BY lap_index, track_index, point_index
         """,
@@ -76,6 +77,7 @@ def _load_points(connection: sqlite3.Connection, activity_id: int) -> list[Track
             run_cadence=row["run_cadence"],
             cadence_source=row["cadence_source"],
             speed_mps=row["speed_mps"],
+            pause_after_s=row["pause_after_s"],
             parse_flags=json.loads(row["parse_flags_json"]),
         )
         for row in rows
@@ -183,14 +185,16 @@ def _eligibility(
     if distance_m and not 0.85 <= distance_coverage <= 1.15:
         reasons.append("unreliable_trackpoint_distance")
     moving_pace = _pace(float(moving_diagnostics.get("moving_time_s", 0)), distance_m)
-    cadence_values = [segment.average_cadence for segment in segments if segment.average_cadence is not None]
-    mean_cadence = sum(cadence_values) / len(cadence_values) if cadence_values else None
+    cadence_values = [
+        segment.average_cadence_spm for segment in segments if segment.average_cadence_spm is not None
+    ]
+    mean_cadence_spm = sum(cadence_values) / len(cadence_values) if cadence_values else None
     classification = config["activity_classification"]
     probable_walk = (
         moving_pace is not None
-        and mean_cadence is not None
+        and mean_cadence_spm is not None
         and moving_pace >= float(classification["high_confidence_walk_pace_min_mile"])
-        and mean_cadence <= float(classification["high_confidence_walk_cadence_max"])
+        and mean_cadence_spm <= float(classification["high_confidence_walk_cadence_max_spm"])
     )
     probable_bike = (
         moving_pace is not None
@@ -242,7 +246,7 @@ def _insert_segments(connection: sqlite3.Connection, activity_id: int, segments:
         INSERT INTO segments(
             activity_id, segment_index, metrics_json, start_time_utc, end_time_utc,
             distance_m, moving_time_s, elapsed_time_s, stopped_time_s,
-            moving_pace_min_mile, average_hr_bpm, maximum_hr_bpm, average_cadence,
+            moving_pace_min_mile, average_hr_bpm, maximum_hr_bpm, average_cadence_spm,
             elevation_gain_m, elevation_loss_m, net_elevation_change_m,
             average_grade_percent, distance_into_run_m, elapsed_minutes_into_run,
             moving_minutes_into_run, gps_complete_fraction, route_bearing_degrees,
@@ -263,7 +267,7 @@ def _insert_segments(connection: sqlite3.Connection, activity_id: int, segments:
                 segment.moving_pace_min_mile,
                 segment.average_hr_bpm,
                 segment.maximum_hr_bpm,
-                segment.average_cadence,
+                segment.average_cadence_spm,
                 segment.elevation_gain_m,
                 segment.elevation_loss_m,
                 segment.net_elevation_change_m,

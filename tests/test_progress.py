@@ -59,12 +59,12 @@ def test_progress_keeps_pace_volume_and_intensity_as_separate_dimensions(tmp_pat
                 "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
                 (
                     activity_id,
-                    "standardized_pace_145",
+                    "standardized_pace_at_target_hr",
                     "test",
                     json.dumps(
                         {
-                            "raw_pace_145_min_mile": pace + 0.2,
-                            "standardized_pace_145_min_mile": pace,
+                            "raw_pace_at_target_hr_min_mile": pace + 0.2,
+                            "standardized_pace_at_target_hr_min_mile": pace,
                             "uncertainty_95_min_mile": 0.15,
                         }
                     ),
@@ -116,19 +116,19 @@ def test_device_distance_fitness_estimate_is_not_labeled_unscored(tmp_path: Path
             "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
             (
                 activity_id,
-                "standardized_pace_145",
+                "standardized_pace_at_target_hr",
                 "test",
                 json.dumps(
                     {
-                        "raw_pace_145_min_mile": 11.2,
-                        "standardized_pace_145_min_mile": 11.0,
+                        "raw_pace_at_target_hr_min_mile": 11.2,
+                        "standardized_pace_at_target_hr_min_mile": 11.0,
                         "uncertainty_95_min_mile": 0.8,
                         "estimate_quality": "device_distance_fallback",
                         "gps_coverage_fraction": 0,
                         "fallback_uncertainty_95_min_mile": 0.5,
                         "steady_aerobic_benchmark": {
-                            "raw_pace_145_min_mile": 11.1,
-                            "standardized_pace_145_min_mile": 10.9,
+                            "raw_pace_at_target_hr_min_mile": 11.1,
+                            "standardized_pace_at_target_hr_min_mile": 10.9,
                             "uncertainty_95_min_mile": 1.0,
                             "selection_quality": "estimated_fixed_time",
                             "estimate_quality": "device_distance_fallback",
@@ -147,3 +147,120 @@ def test_device_distance_fitness_estimate_is_not_labeled_unscored(tmp_path: Path
     assert "Estimated from Garmin distance" in coverage.reason
     assert progress.steady_aerobic.series[0].benchmark_quality == "estimated_fixed_time"
     assert progress.steady_aerobic.series[0].measurement_quality == "device_distance_fallback"
+
+
+def test_progress_copy_follows_the_configured_comparison_heart_rate(tmp_path: Path) -> None:
+    """A changed comparison HR must show up in what the app tells the athlete."""
+    anchor = datetime.now(timezone.utc)
+    with connect(tmp_path / "target_hr.sqlite") as connection:
+        initialize(connection)
+        ids = [
+            _insert_run(connection, index, anchor - timedelta(days=day), 5, 55, 100)
+            for index, day in enumerate([3, 8, 14, 21], start=1)
+        ]
+        for activity_id, pace in zip(ids, (10.5, 10.2, 10.4, 10.3)):
+            connection.execute(
+                "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
+                (
+                    activity_id,
+                    "standardized_pace_at_target_hr",
+                    "test",
+                    json.dumps(
+                        {
+                            "raw_pace_at_target_hr_min_mile": pace + 0.2,
+                            "standardized_pace_at_target_hr_min_mile": pace,
+                            "uncertainty_95_min_mile": 0.15,
+                        }
+                    ),
+                ),
+            )
+        connection.commit()
+        progress = build_progress(
+            connection,
+            28,
+            config={"target_hr": 147, "reference_conditions": {"within_run_minutes": 18}},
+        )
+    assert progress.target_hr_bpm == 147
+    assert "147 bpm" in progress.definition
+    assert "145" not in progress.definition
+    assert "147 bpm" in progress.steady_aerobic.definition
+    assert "minute 18" in progress.steady_aerobic.definition
+
+
+def test_a_pre_rename_database_upgrades_without_losing_any_scored_run(tmp_path: Path) -> None:
+    """The 145-to-target-HR rename touches a column, two model_name values, and
+    the stored JSON keys. Miss any one and every run silently reads as
+    'no reliable aerobic windows' rather than failing loudly."""
+    from run_analysis.db import SCHEMA_VERSION
+
+    path = tmp_path / "legacy.sqlite"
+    anchor = datetime.now(timezone.utc)
+    with connect(path) as connection:
+        initialize(connection)
+        activity_ids = [
+            _insert_run(connection, index, anchor - timedelta(days=day), 5, 55, 100)
+            for index, day in enumerate([3, 8, 14, 21], start=1)
+        ]
+        # Rewind the schema to what it looked like before the rename.
+        connection.execute(
+            "ALTER TABLE activity_metrics "
+            "RENAME COLUMN standardized_pace_at_target_hr_min_mile TO standardized_pace_145_min_mile"
+        )
+        for activity_id, pace in zip(activity_ids, (10.5, 10.2, 10.4, 10.3)):
+            connection.execute(
+                "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
+                (
+                    activity_id,
+                    "standardized_pace_145",
+                    "legacy",
+                    json.dumps(
+                        {
+                            "raw_pace_145_min_mile": pace + 0.2,
+                            "standardized_pace_145_min_mile": pace,
+                            "uncertainty_95_min_mile": 0.15,
+                            "steady_aerobic_benchmark": {
+                                "standardized_pace_145_min_mile": pace,
+                                "raw_pace_145_min_mile": pace + 0.2,
+                                "uncertainty_95_min_mile": 0.2,
+                                "selection_quality": "strict_observed",
+                            },
+                        }
+                    ),
+                ),
+            )
+        connection.execute(
+            "INSERT INTO model_metadata(model_name,model_version,fitted_at_utc,metadata_json) VALUES (?,?,?,?)",
+            ("standardized_pace_145", "legacy", anchor.isoformat(), "{}"),
+        )
+        connection.commit()
+
+    # Reopening runs the migrations, exactly as every endpoint does per request.
+    with connect(path) as connection:
+        initialize(connection)
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(activity_metrics)")}
+        assert "standardized_pace_at_target_hr_min_mile" in columns
+        assert "standardized_pace_145_min_mile" not in columns
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_runs WHERE model_name='standardized_pace_145'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM model_runs WHERE result_json LIKE '%pace_145_min_mile%'"
+        ).fetchone()[0] == 0
+        assert int(
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+        ) == SCHEMA_VERSION
+
+        progress = build_progress(connection, 28, config={"target_hr": 145})
+
+    # All four runs still score, and the coverage table does not claim they are
+    # unusable.
+    assert len(progress.series) == 4
+    assert progress.current_pace is not None
+    assert progress.steady_aerobic.series
+    statuses = {item.score_status for item in progress.activity_coverage}
+    assert "unscored" not in statuses, statuses
+    assert all(
+        item.standardized_pace_min_mile is not None for item in progress.activity_coverage
+    )

@@ -127,7 +127,6 @@ def generate_weekly_schedule(
         daily_request = RecommendationRequest(
             health_status=request.health_status,
             planned_at=planned_at,
-            notes=request.notes,
         )
         daily_states.append(current_fitness_state(connection, config, daily_request))
     selected_offsets = automatic_run_day_offsets(
@@ -159,14 +158,12 @@ def generate_weekly_schedule(
         chosen_request = RecommendationRequest(
             health_status=request.health_status,
             planned_at=chosen_at,
-            notes=request.notes,
         )
         daily_states[offset] = current_fitness_state(
             connection, config, chosen_request
         ).model_copy(update={"planned_weather": forecast})
     shared_request = RecommendationRequest(
         health_status=request.health_status,
-        notes=request.notes,
     )
     result = build_weekly_schedule(
         daily_states,
@@ -227,7 +224,6 @@ def generate_weekly_schedule(
     current = RecommendationRequest(
         health_status=request.health_status,
         planned_at=None,
-        notes=request.notes,
     )
     connection.execute(
         """
@@ -281,6 +277,6 @@ def ensure_current_weekly_schedule(
     return generate_weekly_schedule(
         connection,
         config,
-        WeeklyScheduleRequest(health_status=saved.health_status, notes=saved.notes),
+        WeeklyScheduleRequest(health_status=saved.health_status),
         project_root,
     )

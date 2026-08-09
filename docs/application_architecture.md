@@ -41,20 +41,24 @@ model commands.
 | `trackpoints` | raw time, GPS, altitude, distance, HR, cadence, speed | Moving time, mile splits, model windows |
 | `activity_metrics` | moving/device/elapsed time and pace, stops, moving HR, zones, eligibility, prior 7/28-day load, standardized result | All three jobs |
 | `activity_weather` / `weather_cache` | run-time weather, route-relative wind, cached raw response | Progress, feedback |
-| `model_runs` | raw pace @145, atomic adjustments, standardized pace, uncertainty, per-adjustment evidence | Progress, feedback |
+| `model_runs` | raw pace at the comparison HR (with the `target_hr_bpm` it was scored at), atomic adjustments, standardized pace, uncertainty, per-adjustment evidence | Progress, feedback |
 | `model_metadata` | HR calibration, heat prior/personal likelihood/posterior, window diagnostics | Progress/method transparency |
 | `run_overrides` | inclusion, workout type, illness, notes | Feedback, recommendation |
 | `run_analysis.analytics` | adjustable 14/28/42/56/90-day fitness summaries | Progress/dashboard |
 | `run_analysis.importer` | incremental import and duplicate detection | Upload |
 | `run_analysis.processing` | moving-time classification, zones, metrics | Upload/feedback |
 | `run_analysis.weather` | privacy-jittered Open-Meteo retrieval and cache | Upload |
-| `run_analysis.objective_modeling` | standardized pace @145 and evidence chain | Progress/feedback |
+| `run_analysis.objective_modeling` | standardized pace at the comparison HR and evidence chain | Progress/feedback |
+| `run_analysis.cadence` | the one conversion from recorded cadence to total steps per minute | Segments, classification, workout scoring |
+| `run_analysis.cadence_feedback` | per-run turnover/stride, speed decomposition, personal pace-matched band | Run feedback |
+| `run_analysis.training_status` | the dashboard's headline classification and its rule trace | Dashboard |
+| `run_analysis.vo2_estimation` | ACSM + heart-rate-reserve VO2 estimate with propagated error | Progress |
 | `run_analysis.race_goals` | 10-run goal validation, distance/time guardrails, goal-specific biases | Settings/recommendation |
 
 ### What already answers each product job
 
 **Progress Analysis** already has independent per-run raw/standardized pace at
-145, uncertainty, atomic environmental contributions, adjustable robust trends,
+the comparison heart rate, uncertainty, atomic environmental contributions, adjustable robust trends,
 weather evidence, HR zones, and leakage-safe prior 7/28-day mileage/time.
 
 **Run Feedback** already has moving vs elapsed/device time, traffic-stop
@@ -140,7 +144,7 @@ All routes are under `/api`; `/` and unknown non-API routes serve the local app.
 ├─────────────────────────────────────────────────────────────────────┤
 │ DASHBOARD                                                           │
 │ ┌ How am I doing? ┐ ┌ Last run ─────────┐ ┌ What next? ─────────┐  │
-│ │ pace @145/trend │ │ distance/HR/zones │ │ workout/zones/why   │  │
+│ │ pace @HR / trend│ │ distance/HR/zones │ │ workout/zones/why   │  │
 │ └─────────────────┘ └───────────────────┘ └─────────────────────┘  │
 │ load / consistency strip                                            │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -148,7 +152,7 @@ All routes are under `/api`; `/` and unknown non-API routes serve the local app.
 │           fitness | load | consistency | intensity | durability     │
 ├─────────────────────────────────────────────────────────────────────┤
 │ RUNS: filters/table → RUN FEEDBACK detail                            │
-│       raw @145 → named adjustments → standardized @145              │
+│    raw @target_hr → named adjustments → standardized @target_hr     │
 │       mile splits | zones | moving/stopped | context | assessment   │
 ├─────────────────────────────────────────────────────────────────────┤
 │ NEXT RUN: health input → workout prescription → reasons/warnings    │
@@ -206,3 +210,42 @@ correction.
 The recommendation trace will record which rules fired, the facts they saw,
 and which unavailable factors limited confidence. “Smart” therefore means both
 using more relevant evidence and being honest about what the file cannot say.
+
+
+## Frontend structure
+
+`web/static/app/` is plain ES modules; no build step and no framework.
+
+| Module | Holds |
+| --- | --- |
+| `main.js` | entry point: registers uploads, starts the router |
+| `router.js` | hash routing, one line per screen |
+| `api.js` | the single fetch wrapper and the cached settings every view reads the comparison heart rate from |
+| `format.js` | value formatting and label lookups; no DOM, no fetch, no state |
+| `components.js` | shared render pieces, including the one trend-arrow vocabulary |
+| `charts.js` | inline SVG chart geometry |
+| `dom.js` | the view element and the shared loading state |
+| `uploads.js` | drop target and upload progress |
+| `views/*.js` | one module per screen |
+
+Splitting the former single file means an identifier can now be in scope in one
+module and undefined in another, which `node --check` cannot see. Run
+`scripts/render_smoke.mjs` against a live instance: it loads the real module
+graph against a stub DOM and renders every view with real API data, so a
+missing import or a field the backend no longer returns fails there rather than
+silently in the browser.
+
+Colour vocabulary is deliberately narrow: green for good news, white for no
+clear change, amber for attention. It lands on the left rail, the arrow, and
+the verdict word — never on a card surface, so a measurement never reads as a
+status badge.
+
+**Direction and meaning are separate.** `components.js` encodes them as two
+values, not one. The arrow says which way the number moved; the colour says
+whether that is good news. They disagree often enough to matter: a training
+week at 145% of demonstrated capacity has an up arrow and an amber colour, one
+at 55% has a down arrow and the same amber, and 105% is up and neutral. Tying
+colour to the arrow would make the app cheer for a bigger number regardless of
+what a bigger number means. Use `trendValue` for backend `FitnessTrend` values,
+where the metric is already expressed so improving means the good direction,
+and `comparisonValue`/`directionValue` anywhere the two can come apart.

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import json
 import sqlite3
 
 from .privacy import private_directory, private_file
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -138,6 +139,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             cadence INTEGER,
             run_cadence INTEGER,
             cadence_source TEXT,
+            pause_after_s REAL,
             speed_mps REAL,
             parse_flags_json TEXT NOT NULL DEFAULT '[]',
             UNIQUE(activity_id, lap_index, track_index, point_index)
@@ -204,11 +206,15 @@ def initialize(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    _reject_newer_database(connection)
     connection.execute(
         "INSERT INTO schema_metadata(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(SCHEMA_VERSION),),
     )
+    # Renames run before the additive migrations so that an ``ADD COLUMN``
+    # further down does not create an empty twin of a column being renamed.
+    _rename_legacy_columns(connection)
     _migrate_v2(connection)
     _migrate_v3(connection)
     _migrate_v4(connection)
@@ -217,7 +223,47 @@ def initialize(connection: sqlite3.Connection) -> None:
     _migrate_v7(connection)
     _migrate_v8(connection)
     _migrate_v9(connection)
+    _migrate_v10(connection)
+    _migrate_v11(connection)
+    _migrate_v12(connection)
+    _migrate_v13(connection)
     connection.commit()
+
+
+class DatabaseTooNewError(RuntimeError):
+    """The database was migrated by a newer version of this application."""
+
+
+def _reject_newer_database(connection: sqlite3.Connection) -> None:
+    """Refuse to run against a database a newer build already migrated.
+
+    Migrations only move forward, so older code cannot understand a newer
+    database — but it also cannot tell. A renamed column or model name simply
+    matches nothing, and every query returns an empty, confident-looking
+    answer. Worse, the version marker below would then be rewritten *downward*,
+    erasing the only evidence of the mismatch.
+
+    This is the exact failure a long-running server hits when the code on disk
+    is upgraded underneath it: the process keeps serving stale code until it is
+    restarted. Fail loudly and say so.
+    """
+
+    row = connection.execute(
+        "SELECT value FROM schema_metadata WHERE key='schema_version'"
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        stored = int(row[0])
+    except (TypeError, ValueError):
+        return
+    if stored > SCHEMA_VERSION:
+        raise DatabaseTooNewError(
+            f"This database is at schema version {stored}, but this build of the "
+            f"application understands version {SCHEMA_VERSION}. A newer version "
+            "has already migrated it. If a server is running, restart it so it "
+            "picks up the current code."
+        )
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -230,6 +276,33 @@ def _add_columns(connection: sqlite3.Connection, table: str, definitions: list[s
         name = definition.split()[0]
         if name not in existing:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
+#: ``(table, old_name, new_name)`` renames applied before additive migrations.
+_COLUMN_RENAMES = (
+    (
+        "activity_metrics",
+        "standardized_pace_145_min_mile",
+        "standardized_pace_at_target_hr_min_mile",
+    ),
+)
+
+
+def _rename_legacy_columns(connection: sqlite3.Connection) -> None:
+    for table, old_name, new_name in _COLUMN_RENAMES:
+        columns = _columns(connection, table)
+        if old_name in columns and new_name not in columns:
+            connection.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
+        elif old_name in columns:
+            # Both names present: an additive migration created the new column
+            # before the rename existed, so the rename was skipped and the old
+            # one was orphaned. Drop it only when it holds nothing, so a real
+            # column is never destroyed by a cleanup step.
+            populated = connection.execute(
+                f"SELECT COUNT({old_name}) FROM {table}"
+            ).fetchone()[0]
+            if not populated:
+                connection.execute(f"ALTER TABLE {table} DROP COLUMN {old_name}")
 
 
 def _migrate_v2(connection: sqlite3.Connection) -> None:
@@ -338,7 +411,7 @@ def _migrate_v5(connection: sqlite3.Connection) -> None:
         connection,
         "activity_metrics",
         [
-            "standardized_pace_145_min_mile REAL",
+            "standardized_pace_at_target_hr_min_mile REAL",
             "standardized_pace_uncertainty_min_mile REAL",
             "raw_aerobic_efficiency_min_mile REAL",
             "environmental_adjustment_min_mile REAL",
@@ -421,3 +494,87 @@ def _migrate_v8(connection: sqlite3.Connection) -> None:
 
 def _migrate_v9(connection: sqlite3.Connection) -> None:
     _add_columns(connection, "run_overrides", ["perceived_exertion INTEGER"])
+
+
+def _migrate_v10(connection: sqlite3.Connection) -> None:
+    """Store segment cadence in total steps per minute.
+
+    ``segments.average_cadence`` held whatever the device recorded, which for
+    Garmin's RunCadence extension is one leg only. The replacement column has
+    a unit in its name so a half-cadence value can never be silently compared
+    against a steps-per-minute threshold. Existing rows are left for the
+    processor to rewrite; the processor version bump forces that reprocessing.
+    """
+
+    _add_columns(connection, "segments", ["average_cadence_spm REAL"])
+
+
+def _migrate_v11(connection: sqlite3.Connection) -> None:
+    """Drop the hard-coded comparison heart rate from stored model names.
+
+    The comparison heart rate is configurable, so a column, model name, or
+    result key that says "145" becomes wrong the moment the athlete changes
+    it. Stored values are not recomputed here: they were produced at whatever
+    ``target_hr`` was configured at the time, and each model run now records
+    that heart rate alongside its result so the two can never drift apart
+    unnoticed. The matching column rename happens in
+    :func:`_rename_legacy_columns`.
+    """
+
+    for table in ("model_runs", "model_metadata"):
+        connection.execute(
+            f"UPDATE {table} SET model_name='standardized_pace_at_target_hr' "
+            "WHERE model_name='standardized_pace_145'"
+        )
+    # Stored result payloads carry the same keys and must be rewritten too,
+    # including inside the nested steady-aerobic benchmark. Left alone, every
+    # reader would silently see a missing estimate.
+    for old_key, new_key in (
+        ("standardized_pace_145_min_mile", "standardized_pace_at_target_hr_min_mile"),
+        ("raw_pace_145_min_mile", "raw_pace_at_target_hr_min_mile"),
+    ):
+        connection.execute(
+            "UPDATE model_runs SET result_json=REPLACE(result_json, ?, ?) "
+            "WHERE result_json LIKE ?",
+            (f'"{old_key}"', f'"{new_key}"', f'%"{old_key}"%'),
+        )
+
+
+def _migrate_v12(connection: sqlite3.Connection) -> None:
+    """Drop the free-text note from the stored current-status payload.
+
+    The note was written to a single ``app_state`` slot that every later
+    check-in overwrote, so it was never a record of anything, and nothing read
+    it. Removing the field from the request model makes strict validation
+    reject any payload that still carries it, so the stored JSON is rewritten
+    rather than left to fail on the next read. Per-run notes are a different
+    field on ``run_overrides`` and are untouched.
+    """
+
+    row = connection.execute(
+        "SELECT value_json FROM app_state WHERE key='current_health'"
+    ).fetchone()
+    if not row:
+        return
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, dict) or "notes" not in payload:
+        return
+    payload.pop("notes")
+    connection.execute(
+        "UPDATE app_state SET value_json=? WHERE key='current_health'",
+        (json.dumps(payload),),
+    )
+
+
+def _migrate_v13(connection: sqlite3.Connection) -> None:
+    """Record device-stated pause duration alongside each trackpoint.
+
+    FIT files carry explicit timer start/stop events, which is better evidence
+    than inferring a stop from speed and distance. TCX has nothing equivalent,
+    so this stays NULL for those runs and the inference path is unchanged.
+    """
+
+    _add_columns(connection, "trackpoints", ["pause_after_s REAL"])

@@ -134,6 +134,21 @@ def test_quarter_mile_segments_exclude_stop_time_from_pace() -> None:
     assert segments[0].elapsed_time_s == pytest.approx(260)
     assert segments[0].stopped_time_s == pytest.approx(60)
     assert segments[0].moving_pace_min_mile == pytest.approx(200 / 60 / 0.25)
+    # The trackpoints record 80 via Garmin's one-sided RunCadence extension,
+    # so the segment must store 160 total steps per minute.
+    assert segments[0].average_cadence_spm == pytest.approx(160)
+
+
+def test_segment_cadence_is_not_doubled_for_plain_tcx_cadence() -> None:
+    quarter = 0.25 * METERS_PER_MILE
+    p0 = point(0, 0, 2, index=0)
+    p1 = point(100, quarter, 2, index=1)
+    for candidate in (p0, p1):
+        candidate.cadence_source = "cadence"
+    segments = build_segments(
+        [interval(0, p0, p1, quarter, moving=100)], 0.25, SEGMENT_SETTINGS, ELEVATION_SETTINGS
+    )
+    assert segments[0].average_cadence_spm == pytest.approx(80)
 
 
 def test_segment_grade_uses_smoothed_interval_change() -> None:

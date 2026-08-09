@@ -112,3 +112,62 @@ def test_model_and_full_pipeline_defer_cleanly_for_empty_history(
     assert command_all(args) == 0
     assert command_model(args) == 0
     assert "Model deferred" in capsys.readouterr().out
+
+
+def test_legacy_one_sided_cadence_thresholds_are_upgraded_to_spm(tmp_path) -> None:
+    """An existing config written before the steps-per-minute change must not
+    compare a one-sided threshold against a doubled cadence."""
+    from run_analysis.config import load_config
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "max_hr: 190\nresting_hr: 55\ntarget_hr: 145\n"
+        "zones:\n  z2: [139, 152]\n"
+        "timezone_default: UTC\npaths:\n  database: data/x.sqlite\n"
+        "activity_classification:\n"
+        "  high_confidence_walk_cadence_max: 55\n"
+        "  review_low_cadence_max: 70\n",
+        encoding="utf-8",
+    )
+    classification = load_config(config_path)["activity_classification"]
+    assert classification["high_confidence_walk_cadence_max_spm"] == 110
+    assert classification["review_low_cadence_max_spm"] == 140
+    assert classification["very_low_cadence_max_spm"] == 130
+    assert "high_confidence_walk_cadence_max" not in classification
+
+
+def test_cadence_spm_doubles_only_one_sided_sources() -> None:
+    from run_analysis.cadence import cadence_spm
+
+    assert cadence_spm(84, "run_cadence_extension") == 168
+    assert cadence_spm(168, "cadence") == 168
+    assert cadence_spm(0, "run_cadence_extension") is None
+    assert cadence_spm(None, "cadence") is None
+
+
+def test_initialize_refuses_a_database_migrated_by_a_newer_build(tmp_path) -> None:
+    """Older code against a newer database returns empty results, not errors.
+    That silent wrongness is what a stale server process produces."""
+    import pytest
+
+    from run_analysis.db import SCHEMA_VERSION, DatabaseTooNewError, connect, initialize
+
+    path = tmp_path / "future.sqlite"
+    with connect(path) as connection:
+        initialize(connection)
+        connection.execute(
+            "UPDATE schema_metadata SET value=? WHERE key='schema_version'",
+            (str(SCHEMA_VERSION + 1),),
+        )
+        connection.commit()
+
+    with connect(path) as connection:
+        with pytest.raises(DatabaseTooNewError, match="restart it"):
+            initialize(connection)
+        # The marker must survive; rewriting it downward would erase the
+        # evidence that anything was wrong.
+        assert int(
+            connection.execute(
+                "SELECT value FROM schema_metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+        ) == SCHEMA_VERSION + 1

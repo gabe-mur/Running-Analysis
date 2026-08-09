@@ -8,7 +8,6 @@ import json
 import sqlite3
 
 from .analytics import build_fitness_analytics
-from .external_fitness import summarize_external_fitness
 from .segmentation import METERS_PER_MILE
 from .training_load import (
     TrainingSession,
@@ -17,7 +16,8 @@ from .training_load import (
     distance_capacity,
     rolling_load,
 )
-from .vo2_estimation import estimate_local_vo2
+from .intensity_balance import assess_intensity_balance
+from .vo2_estimation import estimate_local_vo2, vo2_series
 from .web.schemas import (
     ConfidenceLevel,
     ConsistencySummary,
@@ -38,6 +38,20 @@ from .web.schemas import (
 
 
 AVAILABLE_WINDOWS = (14, 28, 42, 56, 90, 180, 365)
+
+#: Only used when a caller supplies no configuration at all (tests, tooling).
+#: Production callers always pass the athlete's configured comparison HR.
+DEFAULT_TARGET_HR_BPM = 145.0
+
+
+def _optional_float(value) -> float | None:
+    """A missing score is missing, not a crash.
+
+    Stored result payloads are written by whichever model version was current
+    at the time, so a reader must tolerate a key that is absent rather than
+    assume every scored run carries every field.
+    """
+    return None if value is None else float(value)
 
 
 def _pace_display(pace: float) -> str:
@@ -140,7 +154,7 @@ def _scored_runs(
         FROM model_runs mr JOIN activities a ON a.id=mr.activity_id
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
-        WHERE mr.model_name='standardized_pace_145'
+        WHERE mr.model_name='standardized_pace_at_target_hr'
         ORDER BY a.start_time_utc_epoch,a.id
         """
     ).fetchall()
@@ -150,7 +164,7 @@ def _scored_runs(
     steady_points: list[FitnessPoint] = []
     for row in rows:
         result = json.loads(row["result_json"])
-        standardized = result.get("standardized_pace_145_min_mile")
+        standardized = result.get("standardized_pace_at_target_hr_min_mile")
         if standardized is None or not row["start_time_utc"]:
             continue
         uncertainty = float(result.get("uncertainty_95_min_mile") or 0)
@@ -172,7 +186,7 @@ def _scored_runs(
             FitnessPoint(
                 activity_id=activity_id,
                 start_time=datetime.fromisoformat(row["start_time_utc"]),
-                raw_pace_min_mile=result.get("raw_pace_145_min_mile"),
+                raw_pace_min_mile=result.get("raw_pace_at_target_hr_min_mile"),
                 standardized_pace_min_mile=float(standardized),
                 uncertainty_95_min_mile=uncertainty,
                 distance_miles=float(row["total_distance_m"] or 0) / METERS_PER_MILE,
@@ -185,8 +199,8 @@ def _scored_runs(
             )
         )
         benchmark = result.get("steady_aerobic_benchmark")
-        if benchmark and benchmark.get("standardized_pace_145_min_mile") is not None:
-            steady_pace = float(benchmark["standardized_pace_145_min_mile"])
+        if benchmark and benchmark.get("standardized_pace_at_target_hr_min_mile") is not None:
+            steady_pace = float(benchmark["standardized_pace_at_target_hr_min_mile"])
             steady_uncertainty = float(benchmark.get("uncertainty_95_min_mile") or 0)
             if included_in_trend:
                 steady_rows.append(
@@ -201,7 +215,7 @@ def _scored_runs(
                 FitnessPoint(
                     activity_id=activity_id,
                     start_time=datetime.fromisoformat(row["start_time_utc"]),
-                    raw_pace_min_mile=benchmark.get("raw_pace_145_min_mile"),
+                    raw_pace_min_mile=benchmark.get("raw_pace_at_target_hr_min_mile"),
                     standardized_pace_min_mile=steady_pace,
                     uncertainty_95_min_mile=steady_uncertainty,
                     distance_miles=float(row["total_distance_m"] or 0) / METERS_PER_MILE,
@@ -286,7 +300,7 @@ def _activity_coverage(
         FROM activities a
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
-        LEFT JOIN model_runs mr ON mr.activity_id=a.id AND mr.model_name='standardized_pace_145'
+        LEFT JOIN model_runs mr ON mr.activity_id=a.id AND mr.model_name='standardized_pace_at_target_hr'
         WHERE a.start_time_utc_epoch>? AND a.start_time_utc_epoch<=?
         ORDER BY a.start_time_utc_epoch DESC,a.id DESC
         """,
@@ -335,8 +349,8 @@ def _activity_coverage(
                 workout_type=workout,
                 health_tag=health_tag,
                 score_status=status,
-                standardized_pace_min_mile=(
-                    float(result["standardized_pace_145_min_mile"]) if result else None
+                standardized_pace_min_mile=_optional_float(
+                    (result or {}).get("standardized_pace_at_target_hr_min_mile")
                 ),
                 included_in_trend=included,
                 trend_weight=trend_weight,
@@ -353,6 +367,12 @@ def build_progress(
     as_of: datetime | None = None,
     config: dict | None = None,
 ) -> ProgressResponse:
+    # Every "pace at X bpm" figure below is relative to the configured
+    # comparison heart rate. Nothing may hard-code a number here.
+    target_hr = float((config or {}).get("target_hr", DEFAULT_TARGET_HR_BPM))
+    reference_minutes = float(
+        (config or {}).get("reference_conditions", {}).get("within_run_minutes", 20)
+    )
     sessions, details = _sessions(connection)
     analytics_rows, points, steady_rows, steady_points = _scored_runs(connection, details)
     now = datetime.now(timezone.utc)
@@ -374,7 +394,11 @@ def build_progress(
     chart_start = as_of - timedelta(days=window_days)
     points = [point for point in points if chart_start < point.start_time <= as_of]
     steady_points = [point for point in steady_points if chart_start < point.start_time <= as_of]
-    analysis = build_fitness_analytics(analytics_rows, window_days) if analytics_rows else {"available": False}
+    analysis = (
+        build_fitness_analytics(analytics_rows, window_days, target_hr)
+        if analytics_rows
+        else {"available": False}
+    )
 
     current_pace = None
     uncertainty = None
@@ -382,7 +406,10 @@ def build_progress(
     pace_change_uncertainty = None
     trend = FitnessTrend.INSUFFICIENT_DATA
     confidence = ConfidenceLevel.UNAVAILABLE
-    definition = f"Estimated pace at the same heart rate and conditions over the last {window_days} days"
+    definition = (
+        f"Estimated pace at {target_hr:g} bpm and reference conditions "
+        f"over the last {window_days} days"
+    )
     current_standardized = previous_standardized = None
     if analysis.get("available"):
         current = analysis["current"]
@@ -405,7 +432,11 @@ def build_progress(
         }:
             trend = FitnessTrend.UNCERTAIN
 
-    steady_analysis = build_fitness_analytics(steady_rows, window_days) if steady_rows else {"available": False}
+    steady_analysis = (
+        build_fitness_analytics(steady_rows, window_days, target_hr)
+        if steady_rows
+        else {"available": False}
+    )
     steady_current_pace = None
     steady_uncertainty = None
     steady_change = None
@@ -434,7 +465,8 @@ def build_progress(
             steady_trend = FitnessTrend.UNCERTAIN
     steady_summary = FitnessBenchmarkSummary(
         definition=(
-            "A simple check of pace near 145 bpm around minute 20. It supports the main trend but does not replace it."
+            f"A simple check of pace near {target_hr:g} bpm around minute "
+            f"{reference_minutes:g}. It supports the main trend but does not replace it."
         ),
         trend=steady_trend,
         confidence=steady_confidence,
@@ -479,15 +511,19 @@ def build_progress(
         for item in sessions
         if as_of - timedelta(days=28) < item.start_time <= as_of
     )
-    capacity = distance_capacity(
-        sessions,
-        as_of,
-        retention_half_life_days=float(
+    capacity_settings = {
+        "retention_half_life_days": float(
             (config or {}).get("coaching", {}).get("capacity_retention_half_life_days", 42)
         ),
-        retention_grace_days=int(
+        "retention_grace_days": int(
             (config or {}).get("coaching", {}).get("capacity_retention_grace_days", 28)
         ),
+    }
+    capacity = distance_capacity(sessions, as_of, **capacity_settings)
+    # Capacity one window back, so the dashboard can say whether demonstrated
+    # capacity moved rather than only whether this period's mileage did.
+    previous_capacity = distance_capacity(
+        sessions, as_of - timedelta(days=window_days), **capacity_settings
     )
     current_load = LoadContext(
         trailing_7d=_load_window(loads[0]),
@@ -498,10 +534,14 @@ def build_progress(
         prior_28d_weekly_miles=capacity.prior_28d_weekly_miles,
         sustained_capacity_miles=capacity.sustained_weekly_miles,
         capacity_reference_miles=capacity.reference_miles,
+        previous_capacity_reference_miles=previous_capacity.reference_miles,
         confidence=ConfidenceLevel.LOW if any_missing_load else ConfidenceLevel.HIGH,
         flags=["some_recent_sessions_missing_hr_load"] if any_missing_load else [],
     )
 
+    trend_28d_points = [
+        item for item in _trend_series(analytics_rows, 28) if item.as_of > chart_start
+    ]
     recent = [item for item in sessions if current_start < item.start_time <= as_of]
     ordered_dates = sorted(item.start_time for item in recent)
     gaps = [(right - left).total_seconds() / 86400 for left, right in zip(ordered_dates, ordered_dates[1:])]
@@ -526,12 +566,25 @@ def build_progress(
         hard += load.hard_minutes
         missing += load.unknown_hr_minutes
     known = easy + moderate + hard
+    easy_percent = easy / known * 100 if known else None
+    moderate_percent = moderate / known * 100 if known else None
+    hard_percent = hard / known * 100 if known else None
+    verdict = assess_intensity_balance(
+        easy_percent=easy_percent,
+        moderate_percent=moderate_percent,
+        hard_percent=hard_percent,
+        known_minutes=known,
+        missing_minutes=missing,
+    )
     intensity = IntensitySummary(
-        easy_percent=easy / known * 100 if known else None,
-        moderate_percent=moderate / known * 100 if known else None,
-        hard_percent=hard / known * 100 if known else None,
+        easy_percent=easy_percent,
+        moderate_percent=moderate_percent,
+        hard_percent=hard_percent,
         known_hr_minutes=known,
         missing_hr_minutes=missing,
+        balance=verdict.balance,
+        balance_headline=verdict.headline,
+        balance_detail=verdict.detail,
         confidence=ConfidenceLevel.HIGH if known and missing / (known + missing) <= 0.1 else ConfidenceLevel.LOW,
     )
     blind_spots = []
@@ -545,9 +598,8 @@ def build_progress(
     return ProgressResponse(
         as_of=as_of,
         window_days=window_days,
-        reference_within_run_minutes=float(
-            (config or {}).get("reference_conditions", {}).get("within_run_minutes", 20)
-        ),
+        target_hr_bpm=target_hr,
+        reference_within_run_minutes=reference_minutes,
         available_windows=list(AVAILABLE_WINDOWS),
         fitness_trend=trend,
         fitness_confidence=confidence,
@@ -558,20 +610,21 @@ def build_progress(
         definition=definition,
         series=points,
         trend_7d=[item for item in _trend_series(analytics_rows, 7) if item.as_of > chart_start],
-        trend_28d=[item for item in _trend_series(analytics_rows, 28) if item.as_of > chart_start],
+        trend_28d=trend_28d_points,
         steady_aerobic=steady_summary,
         activity_coverage=_activity_coverage(connection, current_start, as_of),
         period_comparison=comparison,
         current_load=current_load,
         consistency=consistency,
         intensity=intensity,
-        external_fitness=summarize_external_fitness(connection, as_of),
         local_vo2_estimate=estimate_local_vo2(
             current_pace=current_pace,
+            current_pace_uncertainty_95=uncertainty,
             as_of=as_of,
             recent_load=current_load,
             fitness_trend=trend,
             config=config or {},
+            series=vo2_series(trend_28d_points, config=config or {}, as_of=as_of),
         ),
         blind_spots=blind_spots,
     )

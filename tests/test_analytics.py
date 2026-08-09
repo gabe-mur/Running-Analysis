@@ -58,3 +58,52 @@ def test_change_inside_combined_uncertainty_is_not_forced_directional() -> None:
     assert abs(change["pace_change_seconds_per_mile"]) < change["uncertainty_95_seconds_per_mile"]
     assert change["direction"] == "stable_or_uncertain"
 
+
+
+def test_analytics_definition_names_the_configured_comparison_heart_rate() -> None:
+    """Changing the comparison HR must change what the app says, not only what
+    it calculates."""
+    runs = [
+        {"start_time_utc": f"2026-05-{day:02d}T12:00:00+00:00", "standardized_pace": 9.0, "uncertainty_95": 0.2}
+        for day in range(1, 10)
+    ]
+    at_147 = build_fitness_analytics(runs, 28, target_hr_bpm=147)
+    assert at_147["target_hr_bpm"] == 147
+    assert "147 bpm" in at_147["definition"]
+    assert "145" not in at_147["definition"]
+    # With no configured value the copy stays honest rather than inventing one.
+    assert "comparison heart rate" in build_fitness_analytics(runs, 28)["definition"]
+
+
+def _series(paces: list[float]) -> list[dict]:
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return [
+        {
+            "start_time_utc": (start + timedelta(days=index * 2)).isoformat(),
+            "standardized_pace": pace,
+            "uncertainty_95": 0.25,
+            "trend_weight": 1.0,
+        }
+        for index, pace in enumerate(paces)
+    ]
+
+
+def test_huber_layer_absorbs_a_corrupted_run_far_more_than_it_delays_a_real_step() -> None:
+    """The robust layer's cost is a small lag; its benefit is large. See
+    scripts/huber_sensitivity.py for the full comparison this pins down."""
+    stable = [9.5] * 13
+    corrupted = _series(stable + [12.5])
+    clean = _series(stable + [9.5])
+
+    def level(rows, robust):
+        return build_fitness_analytics(rows, 28, robust=robust)["current"]["pace_min_mile"]
+
+    robust_shift = level(corrupted, True) - level(clean, True)
+    plain_shift = level(corrupted, False) - level(clean, False)
+    assert robust_shift < plain_shift / 3
+
+    # A genuine sustained step is still tracked, not suppressed.
+    stepped = _series([9.5] * 13 + [9.0] * 8)
+    assert level(stepped, True) < 9.35

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import fmean
-from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 
+from .activity_assembly import finish_activity, quality
+from .timeparse import parse_datetime
 from .models import Activity, Lap, ParsedTCX, Trackpoint
 
 
@@ -48,22 +48,6 @@ def _float(element: ET.Element | None, flags: list[str], field_name: str) -> flo
 def _int(element: ET.Element | None, flags: list[str], field_name: str) -> int | None:
     value = _float(element, flags, field_name)
     return round(value) if value is not None else None
-
-
-def parse_datetime(value: str | None, warnings: list[str], field_name: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        warnings.append(f"malformed_{field_name}")
-        return None
-    if parsed.tzinfo is None:
-        # TCX track and lap timestamps are UTC. Some Smashrun Activity/Id values
-        # omit the suffix while retaining the UTC clock time.
-        warnings.append(f"naive_{field_name}_treated_as_utc")
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _load_xml(path: Path) -> tuple[ET.Element, list[str], str, list[str]]:
@@ -172,85 +156,11 @@ def _parse_trackpoint(
     )
 
 
-COMPLETE_SENSOR_COVERAGE = 0.95
-
-
-def _quality(prefix: str, present: int, total: int) -> str:
-    """Describe material sensor coverage, not literal point-for-point perfection."""
-    if total == 0 or present == 0:
-        return f"{prefix}_missing"
-    if present / total >= COMPLETE_SENSOR_COVERAGE:
-        return f"{prefix}_complete"
-    return f"{prefix}_partial"
-
-
 def _creator_name(root: ET.Element, activity_element: ET.Element) -> str | None:
     if root.attrib.get("creator"):
         return root.attrib["creator"].strip() or None
     creator = _child(activity_element, "Creator")
     return _text(_descendant(creator, "Name")) if creator is not None else None
-
-
-def _finish_activity(activity: Activity, default_timezone: str) -> None:
-    points = activity.trackpoints
-    timestamps = [point.timestamp_utc for point in points if point.timestamp_utc is not None]
-    if timestamps:
-        activity.start_time_utc = min(timestamps)
-        if len(timestamps) > 1:
-            activity.total_elapsed_time_s = (max(timestamps) - min(timestamps)).total_seconds()
-    elif any(lap.start_time_utc for lap in activity.laps):
-        activity.start_time_utc = min(lap.start_time_utc for lap in activity.laps if lap.start_time_utc)
-        activity.parse_warnings.append("start_time_from_lap_no_trackpoint_time")
-    else:
-        activity.start_time_utc = parse_datetime(activity.activity_id, activity.parse_warnings, "activity_id")
-        if activity.start_time_utc:
-            activity.parse_warnings.append("start_time_from_activity_id")
-
-    lap_times = [lap.total_time_s for lap in activity.laps if lap.total_time_s is not None]
-    lap_distances = [lap.distance_m for lap in activity.laps if lap.distance_m is not None]
-    activity.lap_recorded_time_s = sum(lap_times) if lap_times else None
-    activity.total_distance_m = sum(lap_distances) if lap_distances else None
-    lap_calories = [lap.calories for lap in activity.laps if lap.calories is not None]
-    activity.calories = sum(lap_calories) if lap_calories else None
-    weighted_hr = [
-        (lap.average_hr_bpm, lap.total_time_s)
-        for lap in activity.laps
-        if lap.average_hr_bpm is not None and lap.total_time_s is not None and lap.total_time_s > 0
-    ]
-    if weighted_hr:
-        activity.average_hr_bpm = sum(hr * seconds for hr, seconds in weighted_hr) / sum(
-            seconds for _, seconds in weighted_hr
-        )
-    else:
-        summary_values = [lap.average_hr_bpm for lap in activity.laps if lap.average_hr_bpm is not None]
-        activity.average_hr_bpm = fmean(summary_values) if summary_values else None
-    maxima = [lap.maximum_hr_bpm for lap in activity.laps if lap.maximum_hr_bpm is not None]
-    activity.maximum_hr_bpm = max(maxima) if maxima else None
-
-    count = len(points)
-    activity.gps_quality = _quality("gps", sum(point.gps_valid for point in points), count)
-    activity.hr_quality = _quality("hr", sum(point.heart_rate_bpm is not None for point in points), count)
-    activity.elevation_quality = _quality("elevation", sum(point.altitude_m is not None for point in points), count)
-    activity.cadence_quality = _quality("cadence", sum(point.cadence is not None for point in points), count)
-    device_distance_present = bool(lap_distances) or any(point.distance_m is not None for point in points)
-    activity.distance_source = "device" if device_distance_present else "unknown"
-
-    valid_positions = [(point.latitude, point.longitude) for point in points if point.gps_valid]
-    timezone_source = "configured_default"
-    if valid_positions:
-        mean_lat = fmean(position[0] for position in valid_positions if position[0] is not None)
-        mean_lon = fmean(position[1] for position in valid_positions if position[1] is not None)
-        if 40.45 <= mean_lat <= 41.0 and -74.30 <= mean_lon <= -73.65:
-            timezone_source = "gps_nyc"
-        else:
-            activity.parse_warnings.append("timezone_default_used_outside_nyc")
-    else:
-        activity.parse_warnings.append("timezone_default_used_without_gps")
-    activity.timezone_name = default_timezone
-    activity.timezone_source = timezone_source
-    if activity.start_time_utc:
-        activity.start_time_local = activity.start_time_utc.astimezone(ZoneInfo(default_timezone))
-    activity.parse_warnings = sorted(set(activity.parse_warnings))
 
 
 def parse_tcx(path: str | Path, default_timezone: str = "America/New_York") -> ParsedTCX:
@@ -279,6 +189,6 @@ def parse_tcx(path: str | Path, default_timezone: str = "America/New_York") -> P
             trackpoints=trackpoints,
             parse_warnings=warnings,
         )
-        _finish_activity(activity, default_timezone)
+        finish_activity(activity, default_timezone)
         activities.append(activity)
     return ParsedTCX(activities, namespaces, sorted(set(file_warnings)), encoding)

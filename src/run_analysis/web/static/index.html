@@ -13,14 +13,21 @@
       <nav aria-label="Primary navigation">
         <a data-route="dashboard" href="#dashboard">Dashboard</a>
         <a data-route="progress" href="#progress">Progress</a>
-        <a data-route="runs" href="#runs">Runs</a>
-        <a data-route="next-run" href="#next-run">Week Plan</a>
+        <a data-route="runs" href="#runs">Run Analysis</a>
+        <a data-route="next-run" href="#next-run">Weekly Plan</a>
         <a data-route="settings" href="#settings">Settings</a>
       </nav>
+      <p class="upload-hint">or drop TCX or FIT files anywhere on the page</p>
       <button id="upload-button" class="primary-button" type="button">Upload Runs</button>
-      <input id="upload-input" type="file" accept=".tcx,application/xml,text/xml" multiple hidden>
+      <input id="upload-input" type="file" accept=".tcx,.fit,.fit.gz,application/xml,text/xml,application/octet-stream" multiple hidden>
     </header>
     <main id="app-view" tabindex="-1"></main>
+    <footer class="site-footer">
+      <p>Training estimates from your own files, not medical advice. This app cannot
+      recognise pain, illness, or injury, and prescribing a workout is not clearance
+      to run it. Stop and seek medical attention for chest pain, unusual shortness of
+      breath, faintness, or pain that worsens as you run.</p>
+    </footer>
     <aside id="upload-panel" class="upload-panel" hidden aria-live="polite">
       <div class="panel-heading">
         <div>
@@ -32,6 +39,6 @@
       <p id="upload-summary">Reading files…</p>
       <ol id="upload-stages"></ol>
     </aside>
-    <script type="module" src="/assets/app.js"></script>
+    <script type="module" src="/assets/app/main.js"></script>
   </body>
 </html>

@@ -121,7 +121,7 @@ def test_five_minute_window_is_derived_from_raw_intervals() -> None:
         "run_moving_pace": 10,
         "moving_average_hr_bpm": 145,
     }
-    row, reason = accumulator.finish(activity, hourly, moving_midpoint_s=450, config=settings)
+    row, reason = accumulator.finish(activity, hourly, moving_start_s=300, config=settings)
     assert reason is None
     assert row is not None
     assert row["moving_pace_min_mile"] == pytest.approx(10.72896)
@@ -160,7 +160,7 @@ def test_missing_elevation_does_not_discard_hr_gps_window() -> None:
         "run_moving_pace": 10,
         "moving_average_hr_bpm": 145,
     }
-    row, reason = accumulator.finish(activity, hourly, moving_midpoint_s=450, config=settings)
+    row, reason = accumulator.finish(activity, hourly, moving_start_s=300, config=settings)
     assert reason is None
     assert row is not None
     assert row["grade_energy_ratio"] is None
@@ -204,7 +204,7 @@ def test_device_distance_scores_zero_gps_window_as_fallback() -> None:
         "moving_average_hr_bpm": 145,
         "weather_quality": "hourly_interpolated_estimated_location",
     }
-    row, reason = accumulator.finish(activity, hourly, moving_midpoint_s=450, config=settings)
+    row, reason = accumulator.finish(activity, hourly, moving_start_s=300, config=settings)
     assert reason is None
     assert row is not None
     assert row["gps_complete_fraction"] == 0
@@ -247,8 +247,82 @@ def test_ninety_percent_gps_is_not_a_reduced_weight_fallback() -> None:
         "moving_average_hr_bpm": 145,
         "weather_quality": "hourly_interpolated",
     }
-    row, reason = accumulator.finish(activity, hourly, moving_midpoint_s=600, config=settings)
+    row, reason = accumulator.finish(activity, hourly, moving_start_s=300, config=settings)
     assert reason is None
     assert row is not None
     assert row["gps_complete_fraction"] == pytest.approx(0.9)
     assert row["uses_device_distance_fallback"] is False
+
+
+def _hourly(start: datetime) -> dict:
+    return {
+        "time": [start.timestamp(), (start + timedelta(hours=1)).timestamp()],
+        "temperature_2m": [70, 70],
+        "relative_humidity_2m": [50, 50],
+        "dew_point_2m": [50, 50],
+        "apparent_temperature": [70, 70],
+        "precipitation": [0, 0],
+        "surface_pressure": [1010, 1010],
+        "wind_speed_10m": [3, 3],
+        "wind_direction_10m": [0, 0],
+        "wind_gusts_10m": [5, 5],
+    }
+
+
+def _activity(start: datetime, name: str) -> dict:
+    return {
+        "id": 1,
+        "activity_id": name,
+        "start_time_utc": start.isoformat(),
+        "previous_7d_miles": 10,
+        "previous_28d_miles": 40,
+        "days_since_previous_run": 2,
+        "days_since_previous_hard_run": 5,
+        "run_moving_pace": 10,
+        "moving_average_hr_bpm": 145,
+    }
+
+
+def _post_pause_window(moving_start_s: float, restarts: list[float]) -> str | None:
+    settings = config()
+    start = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    accumulator = _WindowAccumulator(60, 12)
+    for index in range(5):
+        accumulator.add(_interval(index, start + timedelta(seconds=index * 60)))
+    _row, reason = accumulator.finish(
+        _activity(start, "post-pause"),
+        _hourly(start),
+        moving_start_s,
+        settings,
+        restarts,
+    )
+    return reason
+
+
+def test_window_starting_just_after_a_long_pause_is_suppressed() -> None:
+    """HR needs minutes to recover; that stretch is not evidence of efficiency."""
+    assert _post_pause_window(600, [600.0]) == "post_pause_hr_recovery"
+
+
+def test_window_overlapping_the_tail_of_recovery_is_suppressed() -> None:
+    # Restart at 500s, suppression 180s -> recovery runs to 680s, and this
+    # 300-second window covers 400-700s.
+    assert _post_pause_window(400, [500.0]) == "post_pause_hr_recovery"
+
+
+def test_window_clear_of_the_recovery_period_is_retained() -> None:
+    assert _post_pause_window(600, [300.0]) is None
+    assert _post_pause_window(600, []) is None
+
+
+def test_pause_restart_offsets_use_cumulative_moving_time() -> None:
+    from run_analysis.movement import pause_restart_offsets
+
+    start = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    intervals = [_interval(index, start + timedelta(seconds=index * 60)) for index in range(4)]
+    # A two-minute stop between the second and third minute of running.
+    intervals[2].moving_time_s = 0
+    intervals[2].stopped_time_s = 120
+    assert pause_restart_offsets(intervals, 60) == [120.0]
+    # Too short to matter at a stricter threshold.
+    assert pause_restart_offsets(intervals, 300) == []

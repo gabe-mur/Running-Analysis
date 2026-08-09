@@ -37,7 +37,43 @@ def load_config(path: str | Path = "config.yaml") -> dict[str, Any]:
     missing = [key for key in required if key not in config]
     if missing:
         raise ValueError(f"Missing required configuration keys: {', '.join(missing)}")
+    _upgrade_cadence_thresholds(config)
     return config
+
+
+#: Cadence thresholds used to be expressed in Garmin's one-sided strides per
+#: minute. They are now total steps per minute, matching the one canonical
+#: conversion in ``run_analysis.cadence``.
+_LEGACY_CADENCE_KEYS = {
+    "high_confidence_walk_cadence_max": "high_confidence_walk_cadence_max_spm",
+    "review_low_cadence_max": "review_low_cadence_max_spm",
+}
+
+_CADENCE_THRESHOLD_DEFAULTS = {
+    "high_confidence_walk_cadence_max_spm": 110,
+    "very_low_cadence_max_spm": 130,
+    "review_low_cadence_max_spm": 140,
+}
+
+
+def _upgrade_cadence_thresholds(config: dict[str, Any]) -> None:
+    """Convert legacy one-sided cadence thresholds in place.
+
+    An existing config.yaml written before the steps-per-minute change would
+    otherwise silently compare a one-sided threshold against a doubled value
+    and label ordinary running as walking.
+    """
+
+    section = config.get("activity_classification")
+    if not isinstance(section, dict):
+        section = {}
+        config["activity_classification"] = section
+    for legacy, current in _LEGACY_CADENCE_KEYS.items():
+        if legacy in section:
+            value = section.pop(legacy)
+            section.setdefault(current, float(value) * 2)
+    for key, default in _CADENCE_THRESHOLD_DEFAULTS.items():
+        section.setdefault(key, default)
 
 
 def resolve_project_path(project_root: Path, configured_path: str) -> Path:

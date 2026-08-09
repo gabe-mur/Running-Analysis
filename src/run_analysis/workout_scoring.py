@@ -61,16 +61,12 @@ def _dimension(
 
 
 def _cadence_value(interval: MovementInterval) -> float | None:
-    values: list[float] = []
-    for point in (interval.start, interval.end):
-        if point.cadence is None or point.cadence <= 0:
-            continue
-        value = float(point.cadence)
-        # Garmin's running-cadence extension is strides per minute for one
-        # side.  Display total steps per minute, which is what runners expect.
-        if point.cadence_source == "run_cadence_extension":
-            value *= 2
-        values.append(value)
+    """Interval cadence in total steps per minute."""
+    values = [
+        value
+        for value in (interval.start.cadence_spm, interval.end.cadence_spm)
+        if value is not None
+    ]
     return mean(values) if values else None
 
 
