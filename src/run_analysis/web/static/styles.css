@@ -503,6 +503,12 @@ body.dragging::after { content: "Drop TCX files to analyze"; position: fixed; in
 .heading-actions { flex: none; margin: 0; }
 #settings-status-top:not(:empty), #settings-status:not(:empty) { margin-left: .2rem; }
 
+/* The one conclusion a quality session produces. Blue, because it belongs to
+   run analysis, and only ever present when there is something to say. */
+.progression-note { margin-top: 1rem; --card-rule: #6f8fc4; --card-tint: rgba(111,143,196,.22); position: relative; overflow: hidden; background: radial-gradient(120% 90% at 100% 0, var(--card-tint) 0, transparent 62%), linear-gradient(155deg, #16202b, #0d131b); }
+.progression-note::before { content: ""; position: absolute; inset: 0 0 auto; height: 2px; background: linear-gradient(90deg, var(--card-rule), transparent 70%); }
+.progression-text { margin: .2rem 0 0 !important; color: #cfd9e2 !important; font-size: 1.05rem; line-height: 1.5; max-width: 74ch; }
+
 .advanced-settings { margin-top: 1.5rem; }
 .advanced-settings summary { display: flex; align-items: baseline; gap: .8rem; cursor: pointer; }
 .advanced-settings summary b { color: #eef2f6; }

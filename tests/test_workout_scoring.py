@@ -90,3 +90,40 @@ def test_workout_analysis_contract_has_four_dimensions_and_no_composite_score() 
     assert "recovery" in WorkoutAnalysis.model_fields
     assert "score" not in WorkoutAnalysis.model_fields
 
+
+
+def test_an_ordinary_run_gets_no_progression_advice() -> None:
+    """"Use the weekly plan and see how you feel" is true of every run ever
+    done. Printing it on all of them buries the sessions that say something."""
+    from run_analysis.web.schemas import (
+        ConfidenceLevel,
+        DriftAssessment,
+        SessionDifficulty,
+        WorkoutType,
+        ZoneBreakdown,
+    )
+    from run_analysis.workout_scoring import _generic_analysis
+
+    difficulty = SessionDifficulty(
+        distance_miles=5.0,
+        moving_minutes=50.0,
+        elapsed_minutes=51.0,
+        stopped_minutes=1.0,
+        zone_load=100.0,
+        zone_breakdown=ZoneBreakdown(),
+        is_long_run=False,
+        is_quality_session=False,
+        difficulty_flags=[],
+    )
+    analysis = _generic_analysis(
+        WorkoutType.EASY,
+        difficulty,
+        DriftAssessment(
+            valid=False,
+            decoupling_percent=None,
+            reason="not enough steady running",
+            confidence=ConfidenceLevel.UNAVAILABLE,
+        ),
+        [],
+    )
+    assert analysis.progression_recommendation is None

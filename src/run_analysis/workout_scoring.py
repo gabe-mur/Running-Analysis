@@ -526,7 +526,12 @@ def _generic_analysis(
         workout_type=workout,
         definition="Four independent workout judgments; no composite score is calculated.",
         execution=execution, control=control, stimulus=stimulus, recovery=recovery,
-        progression_recommendation="Use the weekly plan and how you feel before making the next workout harder.",
+        # No progression note for an ordinary run. "Use the weekly plan and see
+        # how you feel" is true of every run ever done, so printing it on all
+        # of them buries the three sessions where there is something specific
+        # to say. Quality sessions set this below; everything else leaves it
+        # empty and the interface shows nothing.
+        progression_recommendation=None,
     )
 
 

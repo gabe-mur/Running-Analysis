@@ -41,7 +41,13 @@ function renderWorkoutAnalysis(analysis) {
     intervalTable = `<article class="wide-card interval-card"><div class="card-heading"><div><p class="eyebrow">Reconstructed workout</p><h2>Warmup → work → recovery → cooldown</h2></div><span class="quality ${intervals.confidence}">${intervals.source === "recorded_laps" ? "Recorded Garmin laps" : "Inferred boundaries"}</span></div><p>${escapeHtml(intervals.explanation)}</p>${intervals.available ? `<div class="table-scroll"><table><thead><tr><th>Phase</th><th>Time</th><th>Distance</th><th>Pace</th><th>Avg HR</th><th>End / max HR</th><th>Cadence</th><th>Recovery</th><th>HR recovery</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p>${escapeHtml(intervals.explanation)}</p>`}</article>`;
   }
   const comparison = analysis.historical_comparison ? `<article class="wide-card"><p class="eyebrow">Like-for-like history</p><h2>${analysis.historical_comparison.available ? `Compared with ${dateLabel(analysis.historical_comparison.date)}` : "No close match yet"}</h2><p>${escapeHtml(analysis.historical_comparison.summary)}</p>${analysis.historical_comparison.metrics.length ? `<ul class="analysis-metrics">${analysis.historical_comparison.metrics.map((item) => `<li><span>${escapeHtml(item.name)}</span><strong>${escapeHtml(item.value)}</strong><small>${escapeHtml(item.detail)}</small></li>`).join("")}</ul>` : ""}</article>` : "";
-  return `<section class="workout-analysis"><div class="card-heading"><div><p class="eyebrow">Workout analysis</p><h2>How the workout went</h2></div></div><div class="analysis-grid">${cards}</div>${intervalTable}${comparison}</section>`;
+  // Only rendered when the session actually produced advice, which in practice
+  // means quality workouts. It sits at the end because it is the conclusion
+  // drawn from everything above it, not a separate topic.
+  const progression = analysis.progression_recommendation
+    ? `<article class="wide-card progression-note"><p class="eyebrow">Before you repeat this</p><p class="progression-text">${escapeHtml(analysis.progression_recommendation)}</p></article>`
+    : "";
+  return `<section class="workout-analysis"><div class="card-heading"><div><p class="eyebrow">Workout analysis</p><h2>How the workout went</h2></div></div><div class="analysis-grid">${cards}</div>${intervalTable}${comparison}${progression}</section>`;
 }
 
 function cadenceCard(cadence) {
