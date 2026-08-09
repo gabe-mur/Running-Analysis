@@ -26,8 +26,11 @@ On this page, click the green **Code** button near the top, then
 
 Put that folder somewhere you intend to keep — your Documents folder is fine,
 your Downloads folder is not. The app stores your runs, settings, and analysis
-*inside* this folder, so deleting it deletes your history. You can rename or
-move it later without breaking anything.
+*inside* this folder, so deleting it deletes your history.
+
+Renaming or moving the folder later is safe; the next launch takes an extra
+moment while the app repairs its own paths, then carries on with everything
+intact.
 
 ## Open the app
 
@@ -71,6 +74,21 @@ click **Open** in the dialog. You only have to do this the first time.
 `python3 start.py` does the same thing. `--port 8001` moves it off a busy
 port (it also finds a free one by itself), `--no-browser` suppresses the
 browser, and `--dev` adds the test dependencies.
+
+### Updating to a newer version
+
+Downloading a new ZIP gives you an **empty** app — your history stays behind in
+the old folder. To bring it across, copy these from the old folder into the new
+one before opening it:
+
+| | |
+|---|---|
+| `data/` | your database, weather cache, and privacy salt |
+| `uploads/` | the original run files you imported |
+| `config.local.yaml` | your heart rates, zones, goal, and preferences |
+| `run_overrides.csv` | workout-type and health corrections, if present |
+
+Then delete the old folder once you have confirmed the new one works.
 
 ## The five screens
 
