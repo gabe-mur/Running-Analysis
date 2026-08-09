@@ -445,6 +445,13 @@ body.dragging::after { content: "Drop TCX files to analyze"; position: fixed; in
 @keyframes load { from { transform: translateX(-40%); opacity: .4; } 50% { opacity: 1; } to { transform: translateX(40%); opacity: .4; } }
 /* Guided setup. Each block is one question with its consequence stated, so
    the page reads as a conversation rather than a form. */
+/* Shown only before any runs exist. Amber because it genuinely blocks the
+   rest of the page, unlike the settings below it, which merely have defaults
+   standing in for an answer. */
+.setup-blocked { margin-bottom: 1rem; border-left: 3px solid var(--warning); }
+.setup-blocked h2 { margin: .3rem 0 .6rem; color: var(--warning); font-size: 1.5rem; }
+.setup-blocked p { color: #cfd9e2; }
+
 .setup-page .setup-block { margin-top: 1rem; }
 .setup-page h2 { margin: .3rem 0 .6rem; font-size: 1.5rem; }
 .setup-steps { list-style: none; display: grid; gap: .55rem; margin: 1rem 0 0; padding: 0; }

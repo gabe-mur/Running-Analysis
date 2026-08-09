@@ -52,7 +52,8 @@ const cases = [
   ["dashboard", () => dashboard.renderDashboard()],
   ["progress",  () => progress.renderProgress()],
   ["runs",      () => runs.renderRuns()],
-  ["run-detail",() => detail.renderRunDetail(runList[0].activity_id)],
+  // Skipped on an empty install: there is no run to open, which is not a bug.
+  ...(runList.length ? [["run-detail", () => detail.renderRunDetail(runList[0].activity_id)]] : []),
   ["next-run",  () => next.renderNextRun()],
   ["settings",  () => settings.renderSettings()],
   ["setup",     () => setup.renderSetup()],

@@ -61,15 +61,28 @@ export async function renderSetup() {
     comparison_hr: settings.target_hr,
   };
 
+  // Nothing below can be answered well without data: the comparison heart rate
+  // is picked from where the athlete's own history has evidence, so with no
+  // runs the page would be asking questions it cannot help them answer.
+  const blocked = state.steps.find((step) => step.blocking && !step.complete);
   view.innerHTML = `
     <section class="page narrow setup-page">
       <div class="page-heading"><div>
         <p class="eyebrow">Setup</p>
-        <h1>${state.complete ? "You are set up" : "Two numbers decide everything else"}</h1>
-        <p>${state.complete
+        <h1>${blocked ? "Add your runs first" : state.complete ? "You are set up" : "Two numbers decide everything else"}</h1>
+        <p>${blocked
+          ? "These settings are chosen from your own running, so the answers get better once there is something to read. Fill them in now if you like, and come back after your first upload."
+          : state.complete
           ? "Every setting below has been confirmed rather than defaulted. Change any of them any time."
           : "Your heart-rate zones decide what counts as easy, and your comparison heart rate is where every pace figure is measured. Until you confirm them, the app is using defaults that may not describe you."}</p>
       </div></div>
+
+      ${blocked ? `<article class="wide-card setup-blocked">
+        <p class="eyebrow">First</p>
+        <h2>No runs yet</h2>
+        <p>Drop <b>.tcx</b> or <b>.fit</b> files anywhere on this page, or use <b>Upload Runs</b> at the top right. Garmin Connect and Strava both export them.</p>
+        <p class="chart-note">Your comparison heart rate in Step 3 is chosen from where your own easy running actually has evidence, so it has nothing to recommend from until some runs are in.</p>
+      </article>` : ""}
 
       <article class="wide-card" id="setup-checklist">${checklistMarkup(state)}</article>
 
@@ -110,7 +123,7 @@ export async function renderSetup() {
           <p class="eyebrow">Step 3</p>
           <h2>Comparison heart rate</h2>
           <p class="chart-note">Every "pace at X bpm" figure is measured here. Runs far from it have to be extrapolated, so the best choice is wherever your own history has the most evidence inside Z2.</p>
-          <div id="comparison-recommendation" class="chart-note">Reading your history…</div>
+          <div id="comparison-recommendation" class="chart-note">${blocked ? "Waiting on your first runs. Upload some and this will recommend a value from your own easy running." : "Reading your history"}</div>
           <div class="setup-fields">
             <label>Comparison heart rate<input type="number" name="target_hr" min="80" max="200" value="${draft.comparison_hr}" required></label>
           </div>
