@@ -9,10 +9,10 @@ manual inputs. It does not decide whether a run was easy, whether load is high,
 or what workout comes next.
 
 This avoids a Node build pipeline for a single-user local application and does
-not require rewriting the TCX/weather/model backend.
+not require rewriting the parsing/weather/model backend.
 
 ```text
-TCX upload
+Run file upload (.tcx / .fit)
    │
    ▼
 FastAPI route ──► pipeline service ──► existing importer/process/weather/model
@@ -23,7 +23,7 @@ FastAPI route ──► pipeline service ──► existing importer/process/wea
 typed response models ◄── query/state/feedback/recommendation services
    │
    ▼
-static local frontend (Dashboard / Progress / Runs / Next Run / Settings)
+static local frontend (Dashboard / Progress / Run Analysis / Weekly Plan / Settings)
 ```
 
 ## Existing backend inventory
@@ -53,7 +53,11 @@ model commands.
 | `run_analysis.cadence_feedback` | per-run turnover/stride, speed decomposition, personal pace-matched band | Run feedback |
 | `run_analysis.training_status` | the dashboard's headline classification and its rule trace | Dashboard |
 | `run_analysis.vo2_estimation` | ACSM + heart-rate-reserve VO2 estimate with propagated error | Progress |
-| `run_analysis.race_goals` | 10-run goal validation, distance/time guardrails, goal-specific biases | Settings/recommendation |
+| `run_analysis.race_goals` | 10-run goal validation and goal-specific biases, plus `goal_progress`, a read-out that never raises where the validator would | Settings, weekly plan, progress |
+| `run_analysis.onboarding` | zone derivation by four methods, evidence-chosen comparison HR, setup state | Setup |
+| `run_analysis.intensity_balance` | the easy/moderate/hard split turned into a verdict and its fix | Progress |
+| `run_analysis.tcx` / `run_analysis.fit` | the two readers; both emit the same records | Upload |
+| `run_analysis.activity_assembly` | derived fields shared by both readers so formats cannot disagree | Upload |
 
 ### What already answers each product job
 
@@ -130,17 +134,24 @@ All routes are under `/api`; `/` and unknown non-API routes serve the local app.
 | `GET /api/runs` | sortable/filterable run summaries |
 | `GET /api/runs/{id}` | detailed run feedback, splits, zones, context, audit chain |
 | `PATCH /api/runs/{id}/metadata` | workout type, health tag, notes, model inclusion |
-| `POST /api/uploads` | one/many TCX files; returns per-stage and per-file results |
+| `POST /api/uploads` | one/many `.tcx`, `.fit`, or `.fit.gz` files; returns per-stage and per-file results |
 | `GET /api/fitness-state` | compact structured state used by recommendation rules |
-| `POST /api/recommendation` | health status/notes in, transparent recommendation out |
+| `POST /api/recommendation` | health status in, transparent recommendation out |
+| `POST /api/weekly-schedule` | rebuild the seven-day plan from a health check-in |
+| `GET /api/goal-progress` | progress toward the configured race goal; never raises |
+| `GET /api/setup` | which settings are confirmed and which are still defaults |
+| `GET /api/setup/max-hr?age_years=` | Tanaka estimate, with its own uncertainty stated |
+| `POST /api/setup/zone-preview` | zones a method would produce, and their effect on the comparison HR, without saving |
+| `GET /api/setup/comparison-hr` | best-supported heart rate inside Z2, with the evidence behind it |
 | `GET /api/settings` | editable configuration contract |
 | `PATCH /api/settings` | validate/persist settings, then recalculate affected outputs |
+| `POST /api/settings/reset-advanced` | restore modelling parameters only; never personal settings |
 
 ## Frontend structure and layout
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Running Coach     Dashboard Progress Runs Next Run Settings  Upload │
+│ Running Coach  Dashboard Progress Run Analysis Weekly Plan Settings │
 ├─────────────────────────────────────────────────────────────────────┤
 │ DASHBOARD                                                           │
 │ ┌ How am I doing? ┐ ┌ Last run ─────────┐ ┌ What next? ─────────┐  │
@@ -242,10 +253,11 @@ status badge.
 
 **Direction and meaning are separate.** `components.js` encodes them as two
 values, not one. The arrow says which way the number moved; the colour says
-whether that is good news. They disagree often enough to matter: a training
-week at 145% of demonstrated capacity has an up arrow and an amber colour, one
-at 55% has a down arrow and the same amber, and 105% is up and neutral. Tying
-colour to the arrow would make the app cheer for a bigger number regardless of
-what a bigger number means. Use `trendValue` for backend `FitnessTrend` values,
+whether that is good news. They disagree often enough to matter. Taking the
+weekly plan against demonstrated capacity, where the arrow turns at ±5% and the
+colour only at 130%: a week at 140% is an up arrow in amber, 110% is the same
+up arrow in neutral, and 60% is a down arrow that is also neutral, because a
+deliberate down week is not a fault. Tying colour to the arrow would make the
+app cheer for a bigger number regardless of what a bigger number means. Use `trendValue` for backend `FitnessTrend` values,
 where the metric is already expressed so improving means the good direction,
 and `comparisonValue`/`directionValue` anywhere the two can come apart.
