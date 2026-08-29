@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 import json
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -10,6 +11,13 @@ import yaml
 from fastapi.testclient import TestClient
 
 from run_analysis.db import connect
+from run_analysis.recommendation_service import (
+    _today_plan_time_is_stale,
+    _weekly_emergency_alerts_are_stale,
+    _weekly_plan_shape_is_stale,
+)
+from run_analysis.weekly_schedule import WEEKLY_PLANNER_VERSION
+from run_analysis.web.schemas import WorkoutType
 from run_analysis.web.app import create_app
 from run_analysis.web.upload_service import UploadPayload, run_upload_pipeline
 from test_tcx import TCX_TEMPLATE
@@ -81,7 +89,7 @@ def test_upload_endpoint_accepts_multiple_tcx_files(tmp_path: Path) -> None:
     assert payload["primary_activity_id"] is None
 
 
-def test_uploading_todays_run_refreshes_tomorrow_forward_schedule(tmp_path: Path) -> None:
+def test_uploading_todays_run_refreshes_today_forward_schedule(tmp_path: Path) -> None:
     config = yaml.safe_load((Path(__file__).parents[1] / "config.example.yaml").read_text())
     config["paths"].update(
         {
@@ -119,7 +127,175 @@ def test_uploading_todays_run_refreshes_tomorrow_forward_schedule(tmp_path: Path
     local_today = datetime.now(timezone.utc).astimezone(
         ZoneInfo(config["timezone_default"])
     ).date()
-    assert date.fromisoformat(schedule["start_date"]) == local_today + timedelta(days=1)
+    assert date.fromisoformat(schedule["start_date"]) == local_today
     assert schedule["days"][0]["date"] == schedule["start_date"]
-    assert schedule["trailing_days"][-1]["date"] == local_today.isoformat()
-    assert schedule["trailing_days"][-1]["activities"]
+    assert schedule["days"][0]["recommendation"] is None
+    assert schedule["days"][0]["completed_activities"]
+    assert schedule["completed_run_count"] == 1
+    assert schedule["trailing_days"][0]["date"] == (
+        local_today - timedelta(days=7)
+    ).isoformat()
+    assert schedule["trailing_days"][-1]["date"] == (
+        local_today - timedelta(days=1)
+    ).isoformat()
+    assert all(day["date"] != local_today.isoformat() for day in schedule["trailing_days"])
+
+
+def test_passed_early_slot_refreshes_but_evening_slot_lasts_until_midnight() -> None:
+    now = datetime(2026, 8, 25, 22, tzinfo=timezone.utc)
+    config = {"weather": {"automatic_run_time_hours_local": [7, 12, 19]}}
+
+    def schedule_at(hour: int):
+        return SimpleNamespace(
+            days=[
+                SimpleNamespace(
+                    date=now.date(),
+                    recommendation=object(),
+                    planned_at=now.replace(hour=hour),
+                )
+            ]
+        )
+
+    assert _today_plan_time_is_stale(schedule_at(7), now, config) is True
+    assert _today_plan_time_is_stale(schedule_at(19), now, config) is False
+
+
+def test_ordinary_today_rest_refreshes_when_an_early_option_closes() -> None:
+    zone = ZoneInfo("America/New_York")
+    now = datetime(2026, 8, 28, 12, 5, tzinfo=zone)
+    config = {"weather": {"automatic_run_time_hours_local": [7, 12, 19]}}
+
+    def rest_schedule(*, generated_at: datetime, forced: bool = False, completed=False):
+        return SimpleNamespace(
+            generated_at=generated_at,
+            days=[
+                SimpleNamespace(
+                    date=now.date(),
+                    recommendation=None,
+                    forced_rest=forced,
+                    completed_activities=[object()] if completed else [],
+                )
+            ],
+        )
+
+    # Noon stopped being a future option at 11:50, so the remaining week must
+    # be optimized again instead of preserving the ordinary rest day all day.
+    assert _today_plan_time_is_stale(
+        rest_schedule(generated_at=now.replace(hour=11, minute=29)), now, config
+    ) is True
+    assert _today_plan_time_is_stale(
+        rest_schedule(generated_at=now.replace(hour=11, minute=55)), now, config
+    ) is False
+    assert _today_plan_time_is_stale(
+        rest_schedule(generated_at=now.replace(hour=11, minute=29), forced=True),
+        now,
+        config,
+    ) is False
+    assert _today_plan_time_is_stale(
+        rest_schedule(generated_at=now.replace(hour=11, minute=29), completed=True),
+        now,
+        config,
+    ) is False
+
+
+def test_actionable_today_plan_refreshes_official_alerts_without_staling_rest() -> None:
+    now = datetime(2026, 8, 28, 18, tzinfo=timezone.utc)
+    config = {"weather": {"emergency_alerts_enabled": True}}
+
+    def schedule(*, age_seconds: int, workout=WorkoutType.EASY):
+        return SimpleNamespace(
+            generated_at=now - timedelta(seconds=age_seconds),
+            days=[
+                SimpleNamespace(
+                    date=now.date(),
+                    recommendation=(
+                        None
+                        if workout is None
+                        else SimpleNamespace(workout_type=workout)
+                    ),
+                )
+            ],
+        )
+
+    assert _weekly_emergency_alerts_are_stale(
+        schedule(age_seconds=61), now, config
+    ) is True
+    assert _weekly_emergency_alerts_are_stale(
+        schedule(age_seconds=30), now, config
+    ) is False
+    assert _weekly_emergency_alerts_are_stale(
+        schedule(age_seconds=61, workout=None), now, config
+    ) is False
+
+
+def test_saved_plan_above_its_visible_week_target_is_stale() -> None:
+    schedule = SimpleNamespace(
+        projected_distance_range_miles=(11.5, 13.0),
+        target_distance_range_miles=(9.5, 11.0),
+    )
+
+    assert _weekly_plan_shape_is_stale(schedule) is True
+
+
+def test_saved_plan_from_previous_planner_version_is_stale() -> None:
+    schedule = SimpleNamespace(
+        planner_version=1,
+        projected_distance_range_miles=(9.5, 11.0),
+        target_distance_range_miles=(9.5, 11.0),
+    )
+
+    assert _weekly_plan_shape_is_stale(schedule) is True
+
+
+def test_saved_plan_that_includes_today_in_recent_history_is_stale() -> None:
+    today = date(2026, 8, 28)
+    schedule = SimpleNamespace(
+        planner_version=WEEKLY_PLANNER_VERSION,
+        projected_distance_range_miles=(9.5, 11.0),
+        target_distance_range_miles=(9.5, 11.0),
+        start_date=today,
+        trailing_days=[
+            SimpleNamespace(date=today - timedelta(days=offset))
+            for offset in range(6, -1, -1)
+        ],
+    )
+
+    assert _weekly_plan_shape_is_stale(schedule) is True
+
+
+def test_rest_day_constraint_persists_replans_and_can_be_removed(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    client = TestClient(create_app(tmp_path))
+    original = client.get("/api/weekly-schedule/latest")
+    assert original.status_code == 200
+    original_plan = original.json()
+    selected = next(day for day in original_plan["days"] if day["recommendation"])
+
+    forced = client.post(
+        "/api/weekly-schedule/rest-day",
+        json={"date": selected["date"], "is_rest_day": True},
+    )
+
+    assert forced.status_code == 200
+    forced_plan = forced.json()
+    forced_day = next(
+        day for day in forced_plan["days"] if day["date"] == selected["date"]
+    )
+    assert forced_day["forced_rest"] is True
+    assert forced_day["day_role"] == "forced_rest_day"
+    assert forced_day["recommendation"] is None
+    assert forced_plan["run_count"] == original_plan["run_count"]
+    persisted = client.get("/api/weekly-schedule/latest").json()
+    assert next(
+        day for day in persisted["days"] if day["date"] == selected["date"]
+    )["forced_rest"] is True
+
+    removed = client.post(
+        "/api/weekly-schedule/rest-day",
+        json={"date": selected["date"], "is_rest_day": False},
+    )
+
+    assert removed.status_code == 200
+    assert next(
+        day for day in removed.json()["days"] if day["date"] == selected["date"]
+    )["forced_rest"] is False

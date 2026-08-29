@@ -8,6 +8,7 @@ import pytest
 from run_analysis.db import connect, initialize
 from run_analysis.race_goals import assess_race_goal
 from run_analysis.recommendation import recommend_next_run
+from run_analysis.weekly_schedule import PlanningActivity, derive_weekly_target
 from run_analysis.web.schemas import (
     ConfidenceLevel,
     CurrentHealthStatus,
@@ -107,6 +108,46 @@ def test_goal_rejects_too_few_runs_unreasonable_pace_and_short_timeline(tmp_path
             assess_race_goal(
                 connection, _config("10k", today + timedelta(weeks=2), 9.0), as_of=today
             )
+
+
+def test_marathon_goal_rejects_date_that_cannot_reach_long_run_target(tmp_path) -> None:
+    today = date(2026, 8, 7)
+    with connect(tmp_path / "runs.sqlite") as connection:
+        initialize(connection)
+        _insert_runs(connection, 10, distance_miles=6.0)
+        with pytest.raises(ValueError, match="preparation target"):
+            assess_race_goal(
+                connection,
+                _config("marathon", today + timedelta(weeks=8), 12.0),
+                as_of=today,
+            )
+
+
+def test_marathon_goal_raises_weekly_trajectory_without_overriding_general_mode() -> None:
+    as_of = datetime(2026, 8, 7, 12, tzinfo=timezone.utc)
+    activities = [
+        PlanningActivity(
+            start_time=as_of - timedelta(days=day),
+            distance_miles=5.0,
+        )
+        for day in range(1, 84, 2)
+    ]
+    base = {"timezone_default": "UTC", "coaching": {}}
+    _, general_target, _ = derive_weekly_target(activities, as_of, base)
+    marathon = {
+        "timezone_default": "UTC",
+        "coaching": {
+            "training_goal": "marathon",
+            "goal_date": (as_of.date() + timedelta(weeks=18)).isoformat(),
+            "goal_pace_min_mile": 12.0,
+        },
+    }
+    _, marathon_target, evidence = derive_weekly_target(
+        activities, as_of, marathon
+    )
+
+    assert sum(marathon_target) > sum(general_target)
+    assert "backward-planned trajectory" in evidence.rationale
 
 
 def _state(as_of: datetime) -> FitnessState:

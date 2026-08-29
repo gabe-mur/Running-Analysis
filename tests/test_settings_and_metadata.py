@@ -95,6 +95,7 @@ def test_at_least_one_quality_session_type_must_remain_enabled() -> None:
         CoachingSettings(
             training_goal="general_fitness",
             long_run_progression_factor=1.1,
+            long_run_target_progression_fraction=0.05,
             high_load_ratio=1.3,
             moderate_intensity_leakage_fraction=0.17,
             minimum_days_between_quality_sessions=4,
@@ -103,9 +104,10 @@ def test_at_least_one_quality_session_type_must_remain_enabled() -> None:
             capacity_retention_half_life_days=42,
             capacity_retention_grace_days=28,
             minimum_running_days_28d_for_quality=8,
-            long_run_recency_reference_days=10,
+            long_run_recency_reference_days=7,
             reduced_volume_factor=0.7,
             quality_sessions={
+                "fartlek": False,
                 "short_intervals": False,
                 "long_intervals": False,
                 "threshold": False,

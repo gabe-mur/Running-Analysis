@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import StrEnum
-from math import ceil
+from math import ceil, log
 from statistics import median
 import sqlite3
 
@@ -21,15 +21,39 @@ class RaceGoalProfile:
     long_run_bias: float
     quality_bias: float
     taper_days: int
+    peak_weekly_miles: float
+    peak_long_run_miles: float
     preferred_quality: tuple[str, ...]
 
 
 RACE_GOALS: dict[str, RaceGoalProfile] = {
-    "5k": RaceGoalProfile("5K", 3.10686, 2, 9, 4.0, 0.0, 0.0, 1.5, 7, ("short_intervals", "long_intervals", "threshold")),
-    "10k": RaceGoalProfile("10K", 6.21371, 3, 12, 4.15, 0.0, 0.25, 1.25, 7, ("long_intervals", "threshold", "short_intervals")),
-    "half_marathon": RaceGoalProfile("Half marathon", 13.1094, 4, 10, 4.3, 0.0, 1.25, 0.75, 10, ("threshold", "progression", "long_intervals")),
-    "marathon": RaceGoalProfile("Marathon", 26.2188, 8, 18, 4.45, 10.0, 2.0, 0.5, 14, ("progression", "threshold", "long_intervals")),
+    "5k": RaceGoalProfile("5K", 3.10686, 2, 9, 4.0, 0.0, 0.0, 1.5, 7, 15.0, 5.0, ("short_intervals", "long_intervals", "threshold")),
+    "10k": RaceGoalProfile("10K", 6.21371, 3, 12, 4.15, 0.0, 0.25, 1.25, 7, 18.0, 7.0, ("long_intervals", "threshold", "short_intervals")),
+    "half_marathon": RaceGoalProfile("Half marathon", 13.1094, 4, 10, 4.3, 0.0, 1.25, 0.75, 10, 22.0, 11.0, ("threshold", "progression", "long_intervals")),
+    "marathon": RaceGoalProfile("Marathon", 26.2188, 8, 18, 4.45, 10.0, 2.0, 0.5, 14, 30.0, 16.0, ("progression", "threshold", "long_intervals")),
 }
+
+
+def build_weeks_before_taper(
+    profile: RaceGoalProfile,
+    race_date: date,
+    on_date: date,
+) -> float:
+    return max(0.0, ((race_date - on_date).days - profile.taper_days) / 7.0)
+
+
+def required_compound_progression(
+    current: float,
+    target: float,
+    build_weeks: float,
+) -> float:
+    """Weekly compound rate required to reach a preparation target."""
+
+    if current <= 0 or target <= current:
+        return 0.0
+    if build_weeks <= 0:
+        return float("inf")
+    return (target / current) ** (1.0 / build_weeks) - 1.0
 
 
 def format_pace(pace_min_mile: float) -> str:
@@ -159,6 +183,27 @@ def assess_race_goal(
         raise ValueError(
             "A marathon inside 26 weeks requires at least one recent 6-mile run; build durability before setting this date"
         )
+    build_weeks = build_weeks_before_taper(profile, race_date, today)
+    required_long_rate = required_compound_progression(
+        longest,
+        profile.peak_long_run_miles,
+        build_weeks,
+    )
+    maximum_long_rate = 0.10
+    if required_long_rate > maximum_long_rate:
+        progression_weeks = ceil(
+            log(profile.peak_long_run_miles / longest)
+            / log(1.0 + maximum_long_rate)
+        )
+        earliest = today + timedelta(
+            days=progression_weeks * 7 + profile.taper_days
+        )
+        raise ValueError(
+            f"The {profile.label} date does not leave enough build time to progress "
+            f"from a {longest:.1f}-mile recent run toward the {profile.peak_long_run_miles:.1f}-mile "
+            f"preparation target without exceeding the 10% single-run progression ceiling; "
+            f"choose {earliest.isoformat()} or later"
+        )
     return RaceGoalAssessment(
         goal=str(config["coaching"]["training_goal"]),
         race_date=race_date,
@@ -171,7 +216,9 @@ def assess_race_goal(
         minimum_weeks=minimum_weeks,
         rationale=(
             f"Validated from Riegel-equivalent performances across the latest 10 usable runs; "
-            f"{profile.label} composition will influence quality, long-run, and taper scoring without overriding load or health guardrails."
+            f"{profile.label} planning works backward toward about {profile.peak_weekly_miles:.0f} "
+            f"peak weekly miles and a {profile.peak_long_run_miles:.0f}-mile long run before taper, "
+            "without overriding load or health guardrails."
         ),
     )
 

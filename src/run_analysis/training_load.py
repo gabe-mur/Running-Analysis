@@ -131,7 +131,7 @@ def distance_capacity(
     *,
     lookback_days: int = 365,
     retention_grace_days: int = 28,
-    retention_half_life_days: float = 42.0,
+    retention_half_life_days: float = 84.0,
 ) -> DistanceCapacity:
     """Compare current mileage with retained, demonstrated four-week capacity.
 

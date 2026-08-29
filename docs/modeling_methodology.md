@@ -357,20 +357,79 @@ are computed independently.
 
 The 7-day-to-prior ratio compares current load with the weekly mean of the
 preceding 28 days. It is a contextual coaching flag, not a validated injury-risk
-threshold. Likewise, the configurable 110% long-run progression factor is a soft
-user-requested guardrail, not a safety law.
+threshold. The configurable 110% single-run progression ceiling is informed by
+the Garmin-RUNSAFE cohort's observed increase in overuse-injury rates above a
+10% increase over the longest run in the prior 30 days. That observational
+association is used as a guardrail, not as a command to increase by 10% or as a
+guarantee of safety below it.
 
 That factor still outranks the conventional five-mile long-run distance. Where
 an athlete's longest run in the past 30 days was three miles, the prescription
 is roughly 3.0-3.5 miles with a warning naming the limit, never five miles
-because a convention outvoted the evidence. Half-mile rounding remains the only
-thing permitted to exceed the ceiling, and the prescription says so.
+because a convention outvoted the evidence. Practical quarter-mile range
+rounding remains the only thing permitted to exceed the ceiling, and the
+prescription says so.
+
+Long-run targeting is separate from that ceiling. The working target progresses
+by a configurable proportion of maintained recent single-run distance (5% by
+default); it does not automatically spend the 10% guardrail. Quarter-mile
+prescription rounding keeps that proportional target from becoming either a
+fixed half-mile build or zero midpoint progress. Current weekly capacity and
+demonstrated run frequency limit how much of the week can sit in one session. A
+recency-decayed six-month durability reference preserves
+evidence from older long runs without allowing an old peak to override the
+current 30-day single-session guardrail. Completed runs refresh the reference,
+so adherence can build the target upward rather than following decay downward.
+When the maintained recent distance is below that retained capacity, a general
+return-to-capacity rule can use more of the progression headroom, up to the 10%
+ceiling. The rate fades back toward the ordinary 5% target as the retained level
+is regained; historical progression speed is not learned as a personal safety
+claim.
+Once recovery and workout scoring select a safe, meaningful long run, the
+weekly allocator reserves that target before quality structure and easy-mile
+distribution; it does not erase the role merely to make all run distances more
+equal.
+
+Race goals add a required trajectory rather than merely changing workout
+labels. Each profile defines a preparation-level peak weekly volume and long
+run to reach before its taper. The planner works backward from the race date
+and uses the compound progression required to reach those targets when it is
+higher than the general-fitness build. It never raises either trajectory above
+the configured weekly planning ceiling or single-session progression ceiling;
+if the date would require that, goal validation rejects the date. The marathon
+defaults (30 peak weekly miles and a 16-mile long run) are preparation targets,
+not claims of medical safety or universal optimality. They are consistent with
+observational recreational-marathon evidence associating less than 40 km/week
+and a longest endurance run below 25 km with slower performance.
 
 Recent intensity is shown with the athlete's configured five zones and grouped
 for coaching as easy (Z1+Z2), moderate (Z3), and hard (Z4+Z5). The engine flags
 moderate-intensity leakage but does not enforce a universal 80/20 quota. The
 observational endurance literature uses several incompatible zone systems, so
 the interface keeps this athlete's definitions explicit.
+
+## Recovery model
+
+Recovery is modeled as transient athlete-relative session load, not as a fixed
+ban on running for 36, 48, or 72 hours. A completed run is compared with the
+athlete's trailing-28-day ordinary run using distance, moving time, and recorded
+HR-zone load. RPE, available zone fractions, hills/downhills, cardiac drift,
+and an unusually costly or strong response make smaller graded adjustments.
+Missing HR load does not become zero load; distance and duration retain their
+weight and zone fractions provide a limited intensity fallback.
+
+The resulting load decays exponentially by exact elapsed time with a 12-hour
+half-life. This half-life is a transparent planning assumption, not a direct
+measurement of muscle repair or a claim to reproduce a watch algorithm. The
+athlete's own data determine the starting magnitude, so a short easy run clears
+much sooner than a long, high-load, high-RPE, or mechanically costly one.
+
+Easy and taxing workouts use different residual-load references. This allows
+an easy run while the model would still steer away from another long or quality
+session. Candidate timing, workout scoring, weekly spacing, and mileage
+allocation all consume this same decaying signal. Calendar spacing remains a
+soft cadence preference only; crossing a named number of hours or days never
+causes recovery load to disappear.
 
 ## Race-goal guardrails
 

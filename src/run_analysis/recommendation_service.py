@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
 from zoneinfo import ZoneInfo
 
 from .fitness_state import build_fitness_state
-from .forecast import choose_planned_forecast, get_planned_forecast
+from .forecast import (
+    NWS_ALERT_CACHE_SECONDS,
+    _active_nws_alerts,
+    _alerts_for_time,
+    get_planned_forecast,
+    planned_forecast_options,
+)
 from .recommendation import recommend_next_run
 from .run_feedback import list_runs
 from .weekly_schedule import (
+    WEEKLY_PLANNER_VERSION,
+    PLANNING_HORIZON_DAYS,
     PlanningActivity,
-    automatic_run_day_offsets,
     build_weekly_schedule,
     derive_weekly_target,
 )
@@ -99,16 +106,56 @@ def load_latest_recommendation(connection: sqlite3.Connection) -> Recommendation
     return RecommendationResponse.model_validate_json(row[0]) if row else None
 
 
+def load_forced_rest_dates(connection: sqlite3.Connection) -> set[date]:
+    row = connection.execute(
+        "SELECT value_json FROM app_state WHERE key='weekly_forced_rest_dates'"
+    ).fetchone()
+    if not row:
+        return set()
+    try:
+        values = json.loads(row[0])
+        return {date.fromisoformat(str(value)) for value in values}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+
+
+def save_forced_rest_dates(
+    connection: sqlite3.Connection,
+    values: set[date],
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO app_state(key,value_json,updated_at_utc)
+        VALUES ('weekly_forced_rest_dates',?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value_json=excluded.value_json,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        (
+            json.dumps([value.isoformat() for value in sorted(values)]),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
 def generate_weekly_schedule(
     connection: sqlite3.Connection,
     config: dict,
     request: WeeklyScheduleRequest,
     project_root: str | Path,
 ) -> WeeklyScheduleResponse:
-    """Create and persist an automatic seven-day schedule starting tomorrow."""
+    """Create and persist an automatic seven-day schedule starting today."""
     local_zone = ZoneInfo(str(config.get("timezone_default", "UTC")))
     local_now = datetime.now(timezone.utc).astimezone(local_zone)
-    start_date = local_now.date() + timedelta(days=1)
+    start_date = local_now.date()
+    forced_rest_dates = {
+        value for value in load_forced_rest_dates(connection) if value >= start_date
+    }
+    forced_rest_offsets = {
+        (value - start_date).days
+        for value in forced_rest_dates
+        if 0 <= (value - start_date).days < PLANNING_HORIZON_DAYS
+    }
     run_history = list_runs(connection, limit=5000)
     history = [
         PlanningActivity(run.start_time, run.distance_miles)
@@ -119,27 +166,17 @@ def generate_weekly_schedule(
     target_runs, target_distance, target_evidence = derive_weekly_target(
         history, local_now, config
     )
-    daily_states: list[FitnessState] = []
-    for offset in range(7):
-        planned_at = datetime.combine(start_date + timedelta(days=offset), time(12, 0), tzinfo=local_zone)
-        if offset == 0 and planned_at <= local_now:
-            planned_at = local_now + timedelta(minutes=15)
-        daily_request = RecommendationRequest(
-            health_status=request.health_status,
-            planned_at=planned_at,
-        )
-        daily_states.append(current_fitness_state(connection, config, daily_request))
-    selected_offsets = automatic_run_day_offsets(
-        daily_states[0],
-        request.health_status,
-        config,
-        target_runs,
-    )
-    for offset in (item for item in selected_offsets if 0 <= item < len(daily_states)):
+    # Every day receives timing/weather context before the planner compares
+    # candidate date combinations. Date selection is therefore evidence-led,
+    # rather than weather being fetched only after fixed offsets are chosen.
+    # Keep all weather-backed time choices so projected recovery can prefer a
+    # later slot when its continuously decaying load is materially lower.
+    candidate_groups: list[list[datetime]] = []
+    for offset in range(PLANNING_HORIZON_DAYS):
         candidate_hours = config.get("weather", {}).get(
             "automatic_run_time_hours_local", [7, 12, 19]
         )
-        candidates = [
+        configured_candidates = [
             datetime.combine(
                 start_date + timedelta(days=offset),
                 time(int(hour), 0),
@@ -147,24 +184,112 @@ def generate_weekly_schedule(
             )
             for hour in candidate_hours
         ]
+        candidates = configured_candidates
         if offset == 0:
             candidates = [item for item in candidates if item > local_now + timedelta(minutes=10)]
-        chosen_at, forecast = choose_planned_forecast(
-            connection,
-            config,
-            project_root,
-            candidates,
-        )
-        chosen_request = RecommendationRequest(
+            # The current date remains part of the plan even after every
+            # configured time has passed. Keep the final evening slot for the
+            # rest of the local day rather than silently advancing to tomorrow.
+            # Once that clock time has elapsed, represent the slot as now so
+            # recovery and newly issued emergency alerts are evaluated at the
+            # time the athlete could actually leave.
+            if not candidates:
+                candidates = [local_now]
+        candidate_groups.append(candidates)
+    forecast_options = planned_forecast_options(
+        connection,
+        config,
+        project_root,
+        candidate_groups,
+    )
+    daily_state_options: list[list[FitnessState]] = []
+    for options in forecast_options:
+        states: list[FitnessState] = []
+        base_planned_at = options[0][0]
+        base_request = RecommendationRequest(
             health_status=request.health_status,
-            planned_at=chosen_at,
+            planned_at=base_planned_at,
         )
-        daily_states[offset] = current_fitness_state(
-            connection, config, chosen_request
-        ).model_copy(update={"planned_weather": forecast})
+        base_state = current_fitness_state(
+            connection, config, base_request
+        )
+        for planned_at, forecast in options:
+            delta_days = (
+                planned_at - base_planned_at
+            ).total_seconds() / 86400
+
+            def shifted(value: float | None) -> float | None:
+                return None if value is None else max(0.0, value + delta_days)
+
+            states.append(
+                base_state.model_copy(
+                    update={
+                        "as_of": planned_at,
+                        "days_since_last_run": shifted(
+                            base_state.days_since_last_run
+                        ),
+                        "days_since_quality_run": shifted(
+                            base_state.days_since_quality_run
+                        ),
+                        "days_since_long_run": shifted(
+                            base_state.days_since_long_run
+                        ),
+                        "planned_weather": forecast,
+                        # Weekly mileage and daily load checks must use the
+                        # same retained capacity evidence. Otherwise the plan
+                        # can target 16+ miles while a stale smaller denominator
+                        # labels that exact target excessive on later days.
+                        "recent_load": base_state.recent_load.model_copy(
+                            update={
+                                "capacity_reference_miles": max(
+                                    base_state.recent_load.capacity_reference_miles
+                                    or 0.0,
+                                    target_evidence.capacity_reference_miles,
+                                ),
+                                "sustained_capacity_miles": max(
+                                    base_state.recent_load.sustained_capacity_miles
+                                    or 0.0,
+                                    target_evidence.capacity_reference_miles,
+                                ),
+                                "acute_distance_to_capacity_ratio": (
+                                    base_state.recent_load.trailing_7d.distance_miles
+                                    / max(
+                                        base_state.recent_load.capacity_reference_miles
+                                        or 0.0,
+                                        target_evidence.capacity_reference_miles,
+                                    )
+                                    if max(
+                                        base_state.recent_load.capacity_reference_miles
+                                        or 0.0,
+                                        target_evidence.capacity_reference_miles,
+                                    ) > 0
+                                    else None
+                                ),
+                            }
+                        ),
+                    }
+                )
+            )
+        daily_state_options.append(states)
+    # Forecast options are weather-ranked. The leading state remains the
+    # neutral/default date state; the planner may select another exact time.
+    daily_states = [options[0] for options in daily_state_options]
     shared_request = RecommendationRequest(
         health_status=request.health_status,
     )
+    completed_today = [
+        TrailingDayActivity(
+            activity_id=run.activity_id,
+            start_time=run.start_time,
+            distance_miles=run.distance_miles,
+            workout_type=run.workout_type,
+            health_tag=run.health_tag,
+        )
+        for run in run_history
+        if run.start_time
+        and run.start_time.astimezone(local_zone).date() == start_date
+        and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
+    ]
     result = build_weekly_schedule(
         daily_states,
         shared_request,
@@ -172,9 +297,15 @@ def generate_weekly_schedule(
         target_run_count=target_runs,
         target_distance_range=target_distance,
         target_evidence=target_evidence,
+        completed_activities_by_offset=({0: completed_today} if completed_today else None),
+        daily_state_options=daily_state_options,
+        forced_rest_offsets=forced_rest_offsets,
     )
+    # Recent training is a completed-calendar-day lookback.  Including today
+    # before it is over makes "no activity yet" look like a completed rest day
+    # and drops the actual seventh prior day from the strip.
     trailing_days: list[TrailingCalendarDay] = []
-    for offset in range(6, -1, -1):
+    for offset in range(7, 0, -1):
         calendar_date = local_now.date() - timedelta(days=offset)
         activities = [
             run for run in run_history
@@ -247,17 +378,187 @@ def load_latest_weekly_schedule(connection: sqlite3.Connection) -> WeeklySchedul
     # global preference.  Ignore it during the one-time schema transition.
     payload.pop("preferred_time", None)
     result = WeeklyScheduleResponse.model_validate(payload)
-    projected_low, projected_high = result.projected_distance_range_miles
-    target_low, target_high = result.target_distance_range_miles
-    if result.target_evidence.capacity_reference_miles <= 0:
-        summary = "This is a starter plan until more runs are available."
-    elif projected_high < target_low:
-        summary = "This week stays below your usual range."
-    elif projected_low > target_high:
-        summary = "This week is above your usual range, so review each workout before following it."
-    else:
-        summary = "This fits your recent training."
-    return result.model_copy(update={"summary": summary})
+    # The builder's summary may explain forced-rest constraints, deferred
+    # sessions, or readiness substitutions in addition to mileage alignment.
+    # Preserve that context when the saved plan is reloaded.
+    return result
+
+
+def _today_plan_time_is_stale(
+    schedule: WeeklyScheduleResponse,
+    local_now: datetime,
+    config: dict,
+) -> bool:
+    """Refresh today when its feasible time set changes during the day."""
+    today = next((day for day in schedule.days if day.date == local_now.date()), None)
+    if today is None:
+        return False
+    configured_hours = config.get("weather", {}).get(
+        "automatic_run_time_hours_local", [7, 12, 19]
+    )
+    if not configured_hours:
+        return False
+    hours = sorted({int(hour) for hour in configured_hours})
+
+    if today.recommendation is None:
+        # A constraint or an already-completed run is stable.  An ordinary
+        # planner-created rest day is not: once an early candidate closes, run
+        # the whole-week optimizer again around the remaining slots.  Exclude
+        # the final slot because it intentionally remains available all day.
+        if today.forced_rest or today.completed_activities:
+            return False
+        generated_local = schedule.generated_at.astimezone(local_now.tzinfo)
+        return any(
+            generated_local
+            < datetime.combine(
+                local_now.date(),
+                time(hour, 0),
+                tzinfo=local_now.tzinfo,
+            )
+            - timedelta(minutes=10)
+            <= local_now
+            for hour in hours[:-1]
+        )
+
+    if today.planned_at is None:
+        return True
+    final_slot = datetime.combine(
+        local_now.date(),
+        time(hours[-1], 0),
+        tzinfo=local_now.tzinfo,
+    )
+    planned_at = today.planned_at.astimezone(local_now.tzinfo)
+    return planned_at < local_now and planned_at < final_slot
+
+
+def _weekly_plan_shape_is_stale(schedule: WeeklyScheduleResponse) -> bool:
+    """Reject saved plans produced before visible-week volume coordination."""
+    return (
+        getattr(schedule, "planner_version", 1) < WEEKLY_PLANNER_VERSION
+        or schedule.projected_distance_range_miles[1]
+        > schedule.target_distance_range_miles[1]
+        or len(schedule.trailing_days) != 7
+        or schedule.trailing_days[-1].date
+        != schedule.start_date - timedelta(days=1)
+    )
+
+
+def _weekly_emergency_alerts_are_stale(
+    schedule: WeeklyScheduleResponse,
+    local_now: datetime,
+    config: dict,
+) -> bool:
+    """Refresh an actionable same-day plan when its official alert check ages."""
+    if not bool(config.get("weather", {}).get("emergency_alerts_enabled", False)):
+        return False
+    today = next(
+        (day for day in schedule.days if day.date == local_now.date()),
+        None,
+    )
+    if (
+        today is None
+        or today.recommendation is None
+    ):
+        return False
+    checked_at = (
+        getattr(schedule, "emergency_alerts_checked_at", None)
+        or schedule.generated_at
+    )
+    age_seconds = (
+        local_now - checked_at.astimezone(local_now.tzinfo)
+    ).total_seconds()
+    return age_seconds >= NWS_ALERT_CACHE_SECONDS
+
+
+def _refresh_saved_schedule_emergency_alerts(
+    connection: sqlite3.Connection,
+    schedule: WeeklyScheduleResponse,
+    config: dict,
+    project_root: str | Path,
+    local_now: datetime,
+) -> WeeklyScheduleResponse | None:
+    """Patch unchanged alerts cheaply; return None when a replan is required."""
+    today_index = next(
+        (
+            index
+            for index, day in enumerate(schedule.days)
+            if day.date == local_now.date() and day.recommendation is not None
+        ),
+        None,
+    )
+    if today_index is None:
+        return schedule
+    day = schedule.days[today_index]
+    result = day.recommendation
+    assert result is not None
+    alerts, checked = _active_nws_alerts(
+        connection,
+        config,
+        project_root,
+    )
+    planned_at = result.planned_for or day.planned_at
+    alert_moment = (
+        max(planned_at.astimezone(local_now.tzinfo), local_now)
+        if planned_at
+        else None
+    )
+    applicable = _alerts_for_time(alerts, alert_moment) if alert_moment else []
+    existing = (
+        result.planned_weather.emergency_alerts
+        if result.planned_weather
+        else []
+    )
+    if not checked:
+        # A transient API failure must not erase a warning that the saved plan
+        # already knew about. The next refresh can remove it once the official
+        # check succeeds or its own expiry makes it inapplicable.
+        applicable = existing
+    old_blocking = {
+        alert.alert_id for alert in existing if alert.blocks_outdoor_run
+    }
+    new_blocking = {
+        alert.alert_id for alert in applicable if alert.blocks_outdoor_run
+    }
+    if old_blocking != new_blocking:
+        return None
+
+    updated_result = result
+    if result.planned_weather is not None:
+        updated_result = result.model_copy(
+            update={
+                "planned_weather": result.planned_weather.model_copy(
+                    update={
+                        "emergency_alerts_checked": checked,
+                        "emergency_alerts": applicable,
+                    }
+                )
+            }
+        )
+    updated_days = list(schedule.days)
+    updated_days[today_index] = day.model_copy(
+        update={"recommendation": updated_result}
+    )
+    refreshed = schedule.model_copy(
+        update={
+            "emergency_alerts_checked_at": local_now,
+            "days": updated_days,
+        }
+    )
+    connection.execute(
+        """
+        INSERT INTO app_state(key,value_json,updated_at_utc)
+        VALUES ('weekly_schedule',?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value_json=excluded.value_json,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        (
+            refreshed.model_dump_json(),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    connection.commit()
+    return refreshed
 
 
 def ensure_current_weekly_schedule(
@@ -265,14 +566,31 @@ def ensure_current_weekly_schedule(
     config: dict,
     project_root: str | Path,
 ) -> WeeklyScheduleResponse:
-    """Return tomorrow's leading schedule, regenerating stale saved state."""
+    """Return today's leading schedule, regenerating stale saved state."""
 
     current = load_latest_weekly_schedule(connection)
-    local_today = datetime.now(timezone.utc).astimezone(
+    local_now = datetime.now(timezone.utc).astimezone(
         ZoneInfo(str(config.get("timezone_default", "UTC")))
-    ).date()
-    if current is not None and current.start_date == local_today + timedelta(days=1):
-        return current
+    )
+    reusable = (
+        current is not None
+        and current.start_date == local_now.date()
+        and not _today_plan_time_is_stale(current, local_now, config)
+        and not _weekly_plan_shape_is_stale(current)
+    )
+    if reusable and current is not None:
+        if _weekly_emergency_alerts_are_stale(current, local_now, config):
+            refreshed = _refresh_saved_schedule_emergency_alerts(
+                connection,
+                current,
+                config,
+                project_root,
+                local_now,
+            )
+            if refreshed is not None:
+                return refreshed
+        else:
+            return current
     saved = load_current_status(connection)
     return generate_weekly_schedule(
         connection,

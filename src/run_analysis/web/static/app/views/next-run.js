@@ -14,26 +14,36 @@ function weeklyScheduleMarkup(schedule, goal) {
     const label = day.planned_at
       ? `${calendarDateLabel(day.date)} · ${daypartLabel(day.planned_at)}`
       : calendarDateLabel(day.date);
+    const restToggle = `<button type="button" class="rest-toggle" data-rest-date="${day.date}" data-forced-rest="${day.forced_rest ? "true" : "false"}" aria-pressed="${day.forced_rest ? "true" : "false"}">${day.forced_rest ? "Allow a run" : result ? "Make run rest day" : "Protect as no-run day"}</button>`;
     if (day.completed_activities?.length) {
       const completed = day.completed_activities.map((activity) => `<a href="#run/${activity.activity_id}"><strong>${number(activity.distance_miles)} mi · ${titleCase(activity.workout_type)}</strong><small>${titleCase(activity.health_tag)}</small></a>`).join("");
       return `<article class="schedule-day completed-day"><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>Run completed</h2>${completed}<p>${escapeHtml(day.rationale)}</p></article>`;
     }
-    if (!result) return `<article class="schedule-day rest-day"><p class="eyebrow">${label}</p><h2>Rest day</h2><p>Recovery between planned runs.</p></article>`;
+    if (!result) return `<article class="schedule-day rest-day ${day.forced_rest ? "forced-rest-day" : ""}"><p class="eyebrow">${label}${day.forced_rest ? " · Your constraint" : ""}</p><h2>${day.forced_rest ? "Run rest day" : "No run planned"}</h2><p>${escapeHtml(day.rationale)}</p>${restToggle}</article>`;
     const extent = result.distance_range_miles
       ? `${number(result.distance_range_miles[0])}–${number(result.distance_range_miles[1])} miles`
       : result.duration_range_minutes
         ? `${number(result.duration_range_minutes[0], 0)}–${number(result.duration_range_minutes[1], 0)} minutes`
         : "No run";
     const weather = result.planned_weather;
+    const weatherTrace = result.rule_trace.find((item) => item.rule_id === "planned_weather");
+    const recoveryTrace = result.rule_trace.find((item) => item.rule_id === "recent_recovery_load");
+    const weatherStress = weatherTrace?.facts?.stress_band;
+    const alertEvents = weather?.emergency_alerts?.map((alert) => `NWS ${alert.event}`).join(" · ");
     const weatherLine = weather
-      ? `${number(weather.temperature_f, 0)}°F · feels like ${number(weather.apparent_temperature_f, 0)}°F · dew point ${number(weather.dewpoint_f, 0)}°F · wind ${number(weather.wind_speed_mph, 0)} mph`
+      ? `${number(weather.temperature_f, 0)}°F · feels like ${number(weather.apparent_temperature_f, 0)}°F · dew point ${number(weather.dewpoint_f, 0)}°F · wind ${number(weather.wind_speed_mph, 0)} mph${weatherStress ? ` · ${titleCase(weatherStress)} training stress` : ""}${alertEvents ? ` · ${escapeHtml(alertEvents)}` : ""}`
       : "No forecast. Recent training is still included in the plan.";
+    const easyRecoveryHours = recoveryTrace?.facts?.hours_until_easy;
+    const taxingRecoveryHours = recoveryTrace?.facts?.hours_until_taxing;
+    const recoveryLine = Number(taxingRecoveryHours) > 0
+      ? `<small class="recovery-readout">At this start: ${Number(easyRecoveryHours) > 0 ? `${number(easyRecoveryHours, 0)} hr until normal easy-run recovery` : "easy-run recovery range reached"} · ${number(taxingRecoveryHours, 0)} hr until long/quality recovery</small>`
+      : "";
     const steps = result.structure.map((step) => `<li>${escapeHtml(step.instruction)} <small>${step.target_zones.map(escapeHtml).join(" · ")}</small></li>`).join("");
     const reasons = result.reasons.map(escapeHtml).join(" ");
     const readinessExplanation = result.readiness !== "ready" && result.readiness_reason
       ? `<details><summary>Why is this flexible?</summary><p>${escapeHtml(result.readiness_reason)}</p></details>`
       : "";
-    return `<article class="schedule-day ${result.readiness}"><div class="card-heading"><div><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>${escapeHtml(result.title)}</h2></div><span class="quality ${result.confidence}">${readinessLabel(result.readiness)}</span></div><strong class="prescription-extent">${extent}</strong><p>${result.target_zones.map(escapeHtml).join(" · ") || "Recovery"}</p><small>${escapeHtml(weatherLine)}</small>${steps ? `<details><summary>Workout details</summary><ol>${steps}</ol></details>` : ""}${readinessExplanation}<details><summary>Why this workout?</summary><p>${reasons}</p></details></article>`;
+    return `<article class="schedule-day ${result.readiness}"><div class="card-heading"><div><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>${escapeHtml(result.title)}</h2></div><span class="quality ${result.confidence}">${readinessLabel(result.readiness)}</span></div><strong class="prescription-extent">${extent}</strong><p>${result.target_zones.map(escapeHtml).join(" · ") || "Recovery"}</p><small>${escapeHtml(weatherLine)}</small>${recoveryLine}${steps ? `<details><summary>Workout details</summary><ol>${steps}</ol></details>` : ""}${readinessExplanation}<details><summary>Why this workout?</summary><p>${reasons}</p></details>${restToggle}</article>`;
   }).join("");
   const trailingCards = schedule.trailing_days.map((day) => {
     const activities = day.activities.map((activity) => `<a href="#run/${activity.activity_id}"><strong>${number(activity.distance_miles)} mi · ${titleCase(activity.workout_type)}</strong><small>${titleCase(activity.health_tag)}</small></a>`).join("");
@@ -52,9 +62,9 @@ function weeklyScheduleMarkup(schedule, goal) {
   const versusCapacity = plannedRatio === null ? ""
     : `<p class="plan-versus">${directionValue(planDirection, planSentiment, `${number(plannedRatio * 100, 0)}% of your ${number(capacity)} mi/week demonstrated capacity`)}</p>`;
   const referenceText = evidence.capacity_reference_miles > 0
-    ? `Your recent training supports about ${number(evidence.demonstrated_run_days_per_week, 1)} run days and ${number(schedule.target_distance_range_miles[0])}–${number(schedule.target_distance_range_miles[1])} miles per week.`
+    ? `Your current cadence plus recent consistency supports ${schedule.target_run_count} run days; retained training supports ${number(schedule.target_distance_range_miles[0])}–${number(schedule.target_distance_range_miles[1])} miles this week.`
     : `This is a starter plan. It will adjust after more runs are uploaded.`;
-  return `<div class="plan-summary-grid"><article class="wide-card schedule-summary"><div><p class="eyebrow">${calendarDateLabel(schedule.start_date)} through ${calendarDateLabel(schedule.end_date)}</p><h2>${schedule.completed_run_count ? `${schedule.completed_run_count} completed · ` : ""}${schedule.run_count} planned runs · ${number(schedule.projected_distance_range_miles[0])}–${number(schedule.projected_distance_range_miles[1])} miles</h2><p>${escapeHtml(schedule.summary)}</p>${versusCapacity}<small>${escapeHtml(referenceText)}</small><details><summary>How was this range chosen?</summary><p>${escapeHtml(evidence.rationale)}</p></details></div></article>${goalMarkup(goal, "panel")}</div><div class="week-grid">${dayCards}</div><article class="wide-card trailing-summary"><p class="eyebrow">Recent training</p><h2>Last 7 days</h2><div class="week-grid trailing-week">${trailingCards}</div></article>`;
+  return `<div class="plan-summary-grid"><article class="wide-card schedule-summary"><div><p class="eyebrow">${calendarDateLabel(schedule.start_date)} through ${calendarDateLabel(schedule.end_date)}</p><h2>${schedule.completed_run_count ? `${schedule.completed_run_count} completed · ` : ""}${schedule.run_count} planned runs · ${number(schedule.projected_distance_range_miles[0])}–${number(schedule.projected_distance_range_miles[1])} miles</h2><p>${escapeHtml(schedule.summary)}</p>${versusCapacity}<small>${escapeHtml(referenceText)}</small><details><summary>How was this range chosen?</summary><p>${escapeHtml(evidence.rationale)}</p></details></div></article>${goalMarkup(goal, "panel")}</div><div class="week-grid">${dayCards}</div><article class="wide-card trailing-summary"><p class="eyebrow">Recent training</p><h2>Previous 7 days</h2><div class="week-grid trailing-week">${trailingCards}</div></article>`;
 }
 
 export async function renderNextRun() {
@@ -77,6 +87,27 @@ export async function renderNextRun() {
       <div id="recommendation-result">${weeklyScheduleMarkup(latest, goal)}</div>
       <div class="state-strip"><span><b>${number(state.recent_load.trailing_7d.distance_miles)} mi</b>last 7 days</span><span><b>${Number.isFinite(state.recent_load.acute_distance_to_capacity_ratio) ? `${number(state.recent_load.acute_distance_to_capacity_ratio * 100, 0)}%` : "—"}</b>of usual weekly mileage</span><span><b>${number((state.moderate_fraction_14d ?? 0) * 100, 0)}%</b>moderate-intensity time</span><span><b>${state.running_days_28d}</b>run days in 28</span></div>
     </section>`;
+  view.querySelector("#recommendation-result").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-rest-date]");
+    if (!button) return;
+    const makeRest = button.dataset.forcedRest !== "true";
+    const originalText = button.textContent;
+    button.parentElement.querySelector(".rest-toggle-error")?.remove();
+    button.disabled = true;
+    button.textContent = "Replanning…";
+    try {
+      const result = await api("/api/weekly-schedule/rest-day", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: button.dataset.restDate, is_rest_day: makeRest }),
+      });
+      view.querySelector("#recommendation-result").innerHTML = weeklyScheduleMarkup(result, goal);
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = originalText;
+      button.title = error.message;
+      button.insertAdjacentHTML("afterend", `<p class="rest-toggle-error" role="alert">${escapeHtml(error.message)}</p>`);
+    }
+  });
   view.querySelector("#health-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);

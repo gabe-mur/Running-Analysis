@@ -87,6 +87,25 @@ def test_drift_rejects_short_or_variable_intensity_runs() -> None:
     assert "Variable-intensity" in result.reason
 
 
+def test_drift_rejects_a_material_finishing_surge() -> None:
+    intervals = [
+        _interval(
+            index,
+            index * 100,
+            125 if index >= 36 else 100,
+            60,
+            162 if index >= 36 else 145,
+        )
+        for index in range(40)
+    ]
+
+    result = assess_cardiac_drift(intervals, WorkoutType.LONG)
+
+    assert result.valid is False
+    assert "final 10%" in result.reason
+    assert "not a steady-state" in result.reason
+
+
 def test_assessment_is_a_run_specific_single_sentence() -> None:
     difficulty = SessionDifficulty(
         distance_miles=4.4,

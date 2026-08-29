@@ -67,6 +67,7 @@ class WorkoutType(StrEnum):
 
 
 class QualitySessionType(StrEnum):
+    FARTLEK = "fartlek"
     SHORT_INTERVALS = "short_intervals"
     LONG_INTERVALS = "long_intervals"
     THRESHOLD = "threshold"
@@ -627,6 +628,16 @@ class DashboardResponse(ApiModel):
     setup: SetupNudge | None = None
 
 
+class WeatherExposureBaseline(ApiModel):
+    """Recent conditions in which the athlete has actually trained."""
+
+    lookback_days: int = Field(default=28, gt=0)
+    sample_count: int = Field(ge=0)
+    warm_apparent_temperature_f: float | None = None
+    cold_apparent_temperature_f: float | None = None
+    humid_dewpoint_f: float | None = None
+
+
 class FitnessState(ApiModel):
     """Compact, serializable input to the Python recommendation engine."""
 
@@ -645,6 +656,7 @@ class FitnessState(ApiModel):
     last_run_workout_type: WorkoutType | None = None
     last_run_drift_percent: float | None = None
     longest_run_30d_miles: float = Field(default=0, ge=0)
+    retained_long_run_capacity_miles: float = Field(default=0, ge=0)
     quality_sessions_14d: int = Field(default=0, ge=0)
     completed_quality_session_count: int = Field(default=0, ge=0)
     running_days_28d: int = Field(default=0, ge=0)
@@ -660,7 +672,22 @@ class FitnessState(ApiModel):
     data_quality_flags: list[str] = Field(default_factory=list)
     context_evidence: list[ContextEvidence] = Field(default_factory=list)
     known_blind_spots: list[str] = Field(default_factory=list)
+    weather_exposure_baseline: WeatherExposureBaseline | None = None
     planned_weather: "PlannedWeather | None" = None
+
+
+class WeatherEmergencyAlert(ApiModel):
+    alert_id: str
+    event: str
+    headline: str
+    severity: str
+    urgency: str
+    certainty: str
+    onset: datetime | None = None
+    ends: datetime | None = None
+    expires: datetime | None = None
+    blocks_outdoor_run: bool = False
+    source_url: str | None = None
 
 
 class PlannedWeather(ApiModel):
@@ -674,6 +701,11 @@ class PlannedWeather(ApiModel):
     wind_gust_mph: float | None = None
     precipitation_probability_percent: float | None = Field(default=None, ge=0, le=100)
     precipitation_in: float | None = Field(default=None, ge=0)
+    snowfall_in: float | None = Field(default=None, ge=0)
+    visibility_miles: float | None = Field(default=None, ge=0)
+    weather_code: int | None = Field(default=None, ge=0, le=99)
+    emergency_alerts_checked: bool = False
+    emergency_alerts: list[WeatherEmergencyAlert] = Field(default_factory=list)
     source: str = "Open-Meteo forecast"
     location_basis: str = "privacy-jittered recent route centroid"
     confidence: ConfidenceLevel = ConfidenceLevel.MODERATE
@@ -737,12 +769,18 @@ class WeeklyScheduleRequest(ApiModel):
     health_status: CurrentHealthStatus
 
 
+class WeeklyRestDayRequest(ApiModel):
+    date: date
+    is_rest_day: bool = True
+
+
 class WeeklyScheduleDay(ApiModel):
     date: date
     planned_at: datetime | None = None
     recommendation: RecommendationResponse | None = None
     day_role: str
     rationale: str
+    forced_rest: bool = False
     completed_activities: list["TrailingDayActivity"] = Field(default_factory=list)
 
 
@@ -766,13 +804,16 @@ class WeeklyTargetEvidence(ApiModel):
     chronic_42d_weekly_miles: float = Field(ge=0)
     best_sustained_28d_weekly_miles: float = Field(ge=0)
     peak_7d_miles: float = Field(ge=0)
+    current_run_days_per_week: float | None = Field(default=None, ge=0, le=7)
     demonstrated_run_days_per_week: float = Field(ge=0, le=7)
     capacity_reference_miles: float = Field(ge=0)
     rationale: str
 
 
 class WeeklyScheduleResponse(ApiModel):
+    planner_version: int = Field(default=1, ge=1)
     generated_at: datetime
+    emergency_alerts_checked_at: datetime | None = None
     start_date: date
     end_date: date
     target_run_count: int = Field(ge=0, le=7)
@@ -828,6 +869,7 @@ class MovingTimeSettings(ApiModel):
 
 
 class QualitySessionSettings(ApiModel):
+    fartlek: bool = True
     short_intervals: bool = True
     long_intervals: bool = True
     threshold: bool = True
@@ -846,6 +888,7 @@ class CoachingSettings(ApiModel):
     goal_date: date | None = None
     goal_pace_min_mile: float | None = Field(default=None, ge=4, le=20)
     long_run_progression_factor: float = Field(ge=1, le=1.5)
+    long_run_target_progression_fraction: float = Field(ge=0, le=0.10)
     high_load_ratio: float = Field(gt=1, le=3)
     moderate_intensity_leakage_fraction: float = Field(ge=0, le=1)
     minimum_days_between_quality_sessions: float = Field(ge=1, le=14)
@@ -853,6 +896,8 @@ class CoachingSettings(ApiModel):
     typical_rest_days_between_runs: int = Field(ge=0, le=3)
     capacity_retention_half_life_days: float = Field(ge=14, le=120)
     capacity_retention_grace_days: int = Field(ge=0, le=90)
+    long_run_retention_half_life_days: float = Field(ge=30, le=365)
+    long_run_retention_grace_days: int = Field(ge=0, le=120)
     minimum_running_days_28d_for_quality: int = Field(ge=1, le=28)
     long_run_recency_reference_days: float = Field(ge=5, le=30)
     reduced_volume_factor: float = Field(gt=0, le=1)

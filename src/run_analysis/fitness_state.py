@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 import sqlite3
 
+from .durability import retained_long_run_capacity
 from .progress import build_progress
 from .run_feedback import get_run_feedback, list_runs
 from .web.schemas import (
@@ -15,6 +16,7 @@ from .web.schemas import (
     EvidenceAvailability,
     FitnessState,
     PaceChange,
+    WeatherExposureBaseline,
     WorkoutType,
 )
 
@@ -81,6 +83,66 @@ def _unplanned_moderate_context(runs, as_of: datetime) -> tuple[float | None, in
     return (moderate / known if known else None, evidence_runs)
 
 
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _weather_exposure_baseline(
+    connection: sqlite3.Connection,
+    runs,
+    evaluation_time: datetime,
+    *,
+    lookback_days: int = 28,
+) -> WeatherExposureBaseline | None:
+    activity_ids = [
+        run.activity_id
+        for run in runs
+        if run.start_time
+        and evaluation_time - timedelta(days=lookback_days)
+        < run.start_time.astimezone(timezone.utc)
+        <= evaluation_time
+        and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
+    ]
+    if not activity_ids:
+        return None
+    placeholders = ",".join("?" for _ in activity_ids)
+    rows = connection.execute(
+        f"""
+        SELECT temperature_f, apparent_temperature_f, dewpoint_f
+        FROM activity_weather
+        WHERE activity_id IN ({placeholders})
+        """,
+        activity_ids,
+    ).fetchall()
+    apparent = [
+        float(row["apparent_temperature_f"] or row["temperature_f"])
+        for row in rows
+        if row["apparent_temperature_f"] is not None
+        or row["temperature_f"] is not None
+    ]
+    dewpoints = [
+        float(row["dewpoint_f"])
+        for row in rows
+        if row["dewpoint_f"] is not None
+    ]
+    if not apparent and not dewpoints:
+        return None
+    return WeatherExposureBaseline(
+        lookback_days=lookback_days,
+        sample_count=max(len(apparent), len(dewpoints)),
+        warm_apparent_temperature_f=_percentile(apparent, 0.75),
+        cold_apparent_temperature_f=_percentile(apparent, 0.25),
+        humid_dewpoint_f=_percentile(dewpoints, 0.75),
+    )
+
+
 def build_fitness_state(
     connection: sqlite3.Connection,
     config: dict,
@@ -117,6 +179,21 @@ def build_fitness_state(
         run for run in runs
         if run.start_time and run.session_difficulty and run.session_difficulty.is_long_run
     ]
+    coaching = config.get("coaching", {})
+    retained_long_capacity = retained_long_run_capacity(
+        (
+            (run.start_time.astimezone(timezone.utc), run.distance_miles)
+            for run in runs
+            if run.start_time
+            and run.health_tag.value == "normal"
+            and run.workout_type not in {WorkoutType.RUN_WALK, WorkoutType.HIKE, WorkoutType.BIKE}
+        ),
+        evaluation_time,
+        grace_days=float(coaching.get("long_run_retention_grace_days", 90)),
+        half_life_days=float(
+            coaching.get("long_run_retention_half_life_days", 180)
+        ),
+    )
     days_since_quality = (
         max(0.0, (evaluation_time - quality[0].start_time.astimezone(timezone.utc)).total_seconds() / 86400)
         if quality else None
@@ -180,6 +257,35 @@ def build_fitness_state(
     unplanned_moderate, unplanned_moderate_runs = _unplanned_moderate_context(
         runs, evaluation_time
     )
+    weather_exposure = _weather_exposure_baseline(
+        connection, runs, evaluation_time
+    )
+    context.append(
+        ContextEvidence(
+            factor="recent weather exposure",
+            availability=(
+                EvidenceAvailability.OBSERVED
+                if weather_exposure and weather_exposure.sample_count >= 3
+                else EvidenceAvailability.INFERRED
+                if weather_exposure
+                else EvidenceAvailability.MISSING
+            ),
+            reliability=(
+                ConfidenceLevel.HIGH
+                if weather_exposure and weather_exposure.sample_count >= 6
+                else ConfidenceLevel.MODERATE
+                if weather_exposure and weather_exposure.sample_count >= 3
+                else ConfidenceLevel.LOW
+                if weather_exposure
+                else ConfidenceLevel.UNAVAILABLE
+            ),
+            detail=(
+                f"Recent adaptation references {weather_exposure.sample_count} runs with weather in the past {weather_exposure.lookback_days} days."
+                if weather_exposure
+                else "No recent run-weather samples are available for adaptation."
+            ),
+        )
+    )
     return FitnessState(
         as_of=as_of,
         window_days=window_days,
@@ -200,6 +306,7 @@ def build_fitness_state(
             else None
         ),
         longest_run_30d_miles=progress.consistency.longest_run_miles,
+        retained_long_run_capacity_miles=retained_long_capacity,
         quality_sessions_14d=progress_14.consistency.quality_sessions,
         completed_quality_session_count=len(quality),
         running_days_28d=progress.consistency.running_days,
@@ -218,4 +325,5 @@ def build_fitness_state(
         ),
         context_evidence=context,
         known_blind_spots=blind_spots,
+        weather_exposure_baseline=weather_exposure,
     )

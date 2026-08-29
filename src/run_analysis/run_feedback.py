@@ -232,6 +232,49 @@ def assess_cardiac_drift(
     if total_elapsed and stopped / total_elapsed > 0.10:
         return DriftAssessment(valid=False, confidence=ConfidenceLevel.LOW, reason="Stops exceed 10% of elapsed interval time.")
 
+    def window_speed(start_fraction: float, end_fraction: float) -> float | None:
+        """Return distance/time for an exact moving-time slice of the run."""
+        window_start = total_moving * start_fraction
+        window_end = total_moving * end_fraction
+        completed_time = 0.0
+        distance = moving_time = 0.0
+        for interval in moving:
+            interval_start = completed_time
+            interval_end = completed_time + interval.moving_time_s
+            overlap = max(
+                0.0,
+                min(interval_end, window_end) - max(interval_start, window_start),
+            )
+            if overlap:
+                share = overlap / interval.moving_time_s
+                distance += interval.distance_m * share
+                moving_time += overlap
+            completed_time = interval_end
+        return distance / moving_time if distance > 0 and moving_time > 0 else None
+
+    # Decoupling is meaningful only when the athlete is trying to hold a
+    # broadly steady effort.  HR kinetics are nonlinear during a finishing
+    # surge or cool-down, so pace-adjusting the two halves does not make those
+    # changes a valid fatigue test. Compare the final 10% with the preceding
+    # 30%; the wider reference is resistant to one noisy GPS interval.
+    finish_speed = window_speed(0.90, 1.0)
+    preceding_speed = window_speed(0.60, 0.90)
+    finish_change = (
+        finish_speed / preceding_speed - 1
+        if finish_speed is not None and preceding_speed
+        else None
+    )
+    if finish_change is not None and abs(finish_change) > 0.08:
+        direction = "faster" if finish_change > 0 else "slower"
+        return DriftAssessment(
+            valid=False,
+            confidence=ConfidenceLevel.LOW,
+            reason=(
+                f"The final 10% was {abs(finish_change) * 100:.0f}% {direction} "
+                "than the preceding portion, so this was not a steady-state drift test."
+            ),
+        )
+
     halves = [dict(time=0.0, distance=0.0, hr_weighted=0.0, hr_seconds=0.0) for _ in range(2)]
     completed = 0.0
     for interval in moving:

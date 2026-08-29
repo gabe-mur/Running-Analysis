@@ -351,11 +351,17 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .schedule-day .card-heading { display: block; }
 .schedule-day .prescription-extent { display: block; margin: .8rem 0; color: var(--accent); }
 .schedule-day > small, .schedule-day details small { color: var(--muted); }
+.schedule-day > .recovery-readout { display: block; margin-top: .45rem; color: var(--accent); }
 .completed-day { border-color: #3b7666; background: #10241f; }
 .completed-day a { display: flex; flex-direction: column; gap: .2rem; color: var(--accent); text-decoration: none; margin: .8rem 0; }
 .schedule-day details { margin-top: .8rem; }
 .schedule-day ol { padding-left: 1.2rem; color: var(--muted); }
 .rest-day { opacity: .72; background: #0c1219; }
+.forced-rest-day { opacity: 1; border-color: #6f6282; background: #17131f; }
+.rest-toggle { width: 100%; margin-top: 1rem; background: transparent; border-color: var(--line); color: var(--muted); }
+.rest-toggle:hover, .rest-toggle:focus-visible { border-color: var(--accent); color: var(--accent); }
+.forced-rest-day .rest-toggle { border-color: #6f6282; color: #d8c6ea; }
+.rest-toggle-error { margin: .65rem 0 0; color: var(--danger); font-size: .85rem; }
 .trailing-day { min-height: 10rem; padding: .9rem; }
 .trailing-day h2 { font-size: 1rem; }
 .trailing-day a { display: flex; flex-direction: column; gap: .2rem; color: var(--accent); text-decoration: none; }

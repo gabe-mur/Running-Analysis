@@ -9,7 +9,16 @@ import pytest
 import yaml
 
 from run_analysis.db import connect, initialize
-from run_analysis.forecast import choose_planned_forecast, get_planned_forecast
+from run_analysis.forecast import (
+    _active_nws_alerts,
+    _alert_blocks_outdoor_run,
+    _forecast_options_from_response,
+    _forecast_response,
+    _forecast_values,
+    choose_planned_forecast,
+    choose_planned_forecasts,
+    get_planned_forecast,
+)
 from run_analysis.importer import import_files
 from run_analysis.processing import process_activities
 from run_analysis.geo import haversine_m
@@ -71,6 +80,145 @@ def test_planned_forecast_is_a_separate_opt_in(tmp_path: Path) -> None:
     assert called is False
 
 
+def test_forecast_carries_extreme_weather_detection_fields() -> None:
+    moment = datetime(2026, 12, 10, 12, tzinfo=timezone.utc)
+    values = _forecast_values(
+        {
+            "hourly": {
+                "time": [int(moment.timestamp())],
+                "temperature_2m": [20.0],
+                "snowfall": [1.25],
+                "visibility": [300.0],
+                "weather_code": [75],
+            }
+        },
+        moment,
+    )
+
+    assert values["snowfall_in"] == pytest.approx(1.25)
+    assert values["visibility_miles"] == pytest.approx(300 / 1609.344)
+    assert values["weather_code"] == 75
+
+
+def test_planning_forecast_response_is_cached_by_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def downloader(_url: str, _timeout: float) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"hourly": {"time": []}}
+
+    monkeypatch.setattr(
+        "run_analysis.forecast._recent_route_centroid", lambda *_args: (40.0, -74.0)
+    )
+    config = {
+        "weather": {
+            "forecast_enabled": True,
+            "privacy_jitter_radius_km": 0,
+            "privacy_salt_path": "weather_salt",
+            "request_timeout_seconds": 1,
+        }
+    }
+    with connect(tmp_path / "forecast-cache.sqlite") as connection:
+        initialize(connection)
+        first = _forecast_response(
+            connection, config, tmp_path, downloader
+        )
+        second = _forecast_response(
+            connection, config, tmp_path, downloader
+        )
+
+    assert first == second == {"hourly": {"time": []}}
+    assert calls == 1
+
+
+def test_nws_active_alerts_are_parsed_blocking_and_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(timezone.utc)
+    calls = 0
+
+    def downloader(url: str, _timeout: float) -> dict:
+        nonlocal calls
+        calls += 1
+        assert "point=" in url
+        return {
+            "features": [
+                {
+                    "id": "https://api.weather.gov/alerts/test-warning",
+                    "properties": {
+                        "event": "Tornado Warning",
+                        "headline": "Tornado Warning issued for the test area",
+                        "severity": "Extreme",
+                        "urgency": "Immediate",
+                        "certainty": "Observed",
+                        "onset": (now - timedelta(hours=1)).isoformat(),
+                        "expires": (now + timedelta(hours=2)).isoformat(),
+                    },
+                },
+                {
+                    "id": "https://api.weather.gov/alerts/test-watch",
+                    "properties": {
+                        "event": "Tornado Watch",
+                        "headline": "Tornado Watch issued for the test area",
+                        "severity": "Severe",
+                        "urgency": "Future",
+                        "certainty": "Possible",
+                        "onset": (now - timedelta(hours=1)).isoformat(),
+                        "expires": (now + timedelta(hours=2)).isoformat(),
+                    },
+                },
+            ]
+        }
+
+    monkeypatch.setattr(
+        "run_analysis.forecast._recent_route_centroid", lambda *_args: (40.0, -74.0)
+    )
+    config = {
+        "weather": {
+            "emergency_alerts_enabled": True,
+            "privacy_jitter_radius_km": 0,
+            "privacy_salt_path": "weather_salt",
+            "request_timeout_seconds": 1,
+        }
+    }
+    with connect(tmp_path / "alerts.sqlite") as connection:
+        initialize(connection)
+        first, checked = _active_nws_alerts(
+            connection, config, tmp_path, downloader=downloader
+        )
+        second, cached_checked = _active_nws_alerts(
+            connection, config, tmp_path, downloader=downloader
+        )
+
+    assert checked is True and cached_checked is True
+    assert calls == 1
+    assert [item.blocks_outdoor_run for item in first] == [True, False]
+    assert [item.alert_id for item in second] == [item.alert_id for item in first]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "High Wind Warning",
+        "Excessive Heat Warning",
+        "Wind Chill Warning",
+        "Flood Warning",
+        "Coastal Flood Warning",
+        "Lake Effect Snow Warning",
+    ],
+)
+def test_common_dangerous_nws_warnings_block_outdoor_running(event: str) -> None:
+    assert _alert_blocks_outdoor_run(
+        event,
+        "Severe",
+        "Expected",
+        "Likely",
+    ) is True
+
+
 def test_weekly_planner_selects_each_days_time_from_forecast_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -96,8 +244,118 @@ def test_weekly_planner_selects_each_days_time_from_forecast_candidates(
         selected, weather = choose_planned_forecast(
             connection, {"weather": {"forecast_enabled": True}}, tmp_path, candidates
         )
-    assert selected.hour == 19
-    assert weather is not None and weather.temperature_f == pytest.approx(70)
+    # Rain is neutral, so equally low-stress conditions keep the earliest slot.
+    assert selected.hour == 7
+    assert weather is not None and weather.temperature_f == pytest.approx(60)
+
+
+def test_minor_weather_differences_do_not_push_ready_run_to_evening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    day = (datetime.now(timezone.utc) + timedelta(days=2)).date()
+    candidates = [
+        datetime.combine(day, datetime.min.time(), timezone.utc)
+        + timedelta(hours=hour)
+        for hour in (7, 12, 19)
+    ]
+    response = {
+        "hourly": {
+            "time": [int(item.timestamp()) for item in candidates],
+            "temperature_2m": [74.0, 70.0, 66.0],
+            "relative_humidity_2m": [55.0, 55.0, 55.0],
+            "dew_point_2m": [57.0, 53.0, 49.0],
+            "apparent_temperature": [75.0, 71.0, 67.0],
+            "precipitation_probability": [0.0, 0.0, 0.0],
+            "precipitation": [0.0, 0.0, 0.0],
+            "wind_speed_10m": [7.0, 5.0, 2.0],
+            "wind_direction_10m": [0.0, 0.0, 0.0],
+            "wind_gusts_10m": [10.0, 8.0, 4.0],
+        }
+    }
+    monkeypatch.setattr(
+        "run_analysis.forecast._forecast_response", lambda *_args: response
+    )
+
+    with connect(tmp_path / "minor-weather.sqlite") as connection:
+        initialize(connection)
+        selected, _ = choose_planned_forecast(
+            connection,
+            {"weather": {"forecast_enabled": True}},
+            tmp_path,
+            candidates,
+        )
+
+    assert selected.hour == 7
+
+
+def test_same_day_evening_slot_remains_valid_after_its_clock_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 8, 25, 23, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr("run_analysis.forecast.datetime", FixedDateTime)
+    evening = datetime(2026, 8, 25, 19, tzinfo=timezone.utc)
+
+    options = _forecast_options_from_response([evening], None)
+
+    assert options == [(evening, None)]
+
+
+def test_multi_day_planner_reuses_one_forecast_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_day = (datetime.now(timezone.utc) + timedelta(days=2)).date()
+    groups = [
+        [
+            datetime.combine(
+                first_day + timedelta(days=offset),
+                datetime.min.time(),
+                timezone.utc,
+            )
+            + timedelta(hours=hour)
+            for hour in (7, 12, 19)
+        ]
+        for offset in range(2)
+    ]
+    times = [item for group in groups for item in group]
+    response = {
+        "hourly": {
+            "time": [int(item.timestamp()) for item in times],
+            "temperature_2m": [65.0] * len(times),
+            "relative_humidity_2m": [50.0] * len(times),
+            "dew_point_2m": [50.0] * len(times),
+            "apparent_temperature": [65.0] * len(times),
+            "precipitation_probability": [0.0] * len(times),
+            "precipitation": [0.0] * len(times),
+            "wind_speed_10m": [4.0] * len(times),
+            "wind_direction_10m": [0.0] * len(times),
+            "wind_gusts_10m": [6.0] * len(times),
+        }
+    }
+    calls = 0
+
+    def fake_response(*_args) -> dict:
+        nonlocal calls
+        calls += 1
+        return response
+
+    monkeypatch.setattr("run_analysis.forecast._forecast_response", fake_response)
+    with connect(tmp_path / "forecast.sqlite") as connection:
+        initialize(connection)
+        results = choose_planned_forecasts(
+            connection,
+            {"weather": {"forecast_enabled": True}},
+            tmp_path,
+            groups,
+        )
+    assert calls == 1
+    assert len(results) == 2
 
 
 def test_meteorological_wind_direction_components() -> None:

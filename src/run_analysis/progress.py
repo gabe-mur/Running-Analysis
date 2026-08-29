@@ -513,7 +513,7 @@ def build_progress(
     )
     capacity_settings = {
         "retention_half_life_days": float(
-            (config or {}).get("coaching", {}).get("capacity_retention_half_life_days", 42)
+            (config or {}).get("coaching", {}).get("capacity_retention_half_life_days", 84)
         ),
         "retention_grace_days": int(
             (config or {}).get("coaching", {}).get("capacity_retention_grace_days", 28)

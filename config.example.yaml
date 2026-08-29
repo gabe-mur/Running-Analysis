@@ -112,17 +112,23 @@ coaching:
   goal_date: null
   goal_pace_min_mile: null
   long_run_progression_factor: 1.10
+  # Ordinary build target; the separate progression factor remains the ceiling.
+  long_run_target_progression_fraction: 0.05
   high_load_ratio: 1.30
   moderate_intensity_leakage_fraction: 0.17
   minimum_days_between_quality_sessions: 4
   quality_recency_reference_days: 7
   typical_rest_days_between_runs: 1
-  capacity_retention_half_life_days: 42
+  capacity_retention_half_life_days: 84
   capacity_retention_grace_days: 28
+  # Single-run durability fades smoothly instead of vanishing after 30 days.
+  long_run_retention_half_life_days: 180
+  long_run_retention_grace_days: 90
   minimum_running_days_28d_for_quality: 8
-  long_run_recency_reference_days: 10
+  long_run_recency_reference_days: 7
   reduced_volume_factor: 0.70
   quality_sessions:
+    fartlek: true
     short_intervals: true
     long_intervals: true
     threshold: true
@@ -134,6 +140,10 @@ weather:
   # route centroids to Open-Meteo.
   historical_enabled: false
   forecast_enabled: false
+  # Uses the same privacy-jittered route point to query active official NWS
+  # alerts. Enable only after approving that additional network request.
+  emergency_alerts_enabled: false
+  emergency_alerts_endpoint: https://api.weather.gov/alerts/active
   automatic_run_time_hours_local: [7, 12, 19]
   coordinate_precision: 2
   privacy_jitter_radius_km: 2.0

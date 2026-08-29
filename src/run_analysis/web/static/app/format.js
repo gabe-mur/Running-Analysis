@@ -14,7 +14,13 @@ const pace = (value) => {
 };
 const number = (value, digits = 1) => Number.isFinite(value) ? Number(value).toFixed(digits) : "—";
 const dateLabel = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "Unknown date";
-const calendarDateLabel = (value) => value ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(`${value}T12:00:00`)) : "Unknown date";
+const calendarDateLabel = (value) => {
+  if (!value) return "Unknown date";
+  const date = new Date(`${value}T12:00:00`);
+  const weekday = new Intl.DateTimeFormat("en-US", { weekday: "short" }).format(date);
+  const month = new Intl.DateTimeFormat("en-US", { month: "short" }).format(date);
+  return `${weekday}. ${month}, ${date.getDate()}`;
+};
 const daypartLabel = (value) => {
   if (!value) return null;
   const hour = new Date(value).getHours();

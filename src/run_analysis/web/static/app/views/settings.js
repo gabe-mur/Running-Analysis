@@ -28,12 +28,15 @@ export async function renderSettings() {
   };
   const coachingLabels = {
     long_run_progression_factor: "Long-run growth warning",
+    long_run_target_progression_fraction: "Ordinary long-run target increase",
     high_load_ratio: "High-load warning",
     moderate_intensity_leakage_fraction: "Moderate-intensity warning",
     minimum_days_between_quality_sessions: "Minimum days between hard workouts",
     quality_recency_reference_days: "Quality-workout target spacing (days)",
     typical_rest_days_between_runs: "Typical rest days between runs",
     capacity_retention_half_life_days: "How gradually old capacity fades (days)",
+    long_run_retention_half_life_days: "How gradually long-run durability fades (days)",
+    long_run_retention_grace_days: "Days before long-run durability starts fading",
     capacity_retention_grace_days: "Short-break grace period (days)",
     minimum_running_days_28d_for_quality: "Run days needed before hard workouts",
     long_run_recency_reference_days: "Long-run target spacing (days)",

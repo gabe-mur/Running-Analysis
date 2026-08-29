@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 import sqlite3
 import time
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -30,8 +31,10 @@ from ..recommendation_service import (
     generate_recommendation,
     generate_weekly_schedule,
     ensure_current_weekly_schedule,
+    load_forced_rest_dates,
     load_current_status,
     load_latest_recommendation,
+    save_forced_rest_dates,
 )
 from ..settings_service import (
     recalculate_for_settings,
@@ -65,6 +68,7 @@ from .schemas import (
     UploadResponse,
     WeeklyScheduleRequest,
     WeeklyScheduleResponse,
+    WeeklyRestDayRequest,
 )
 from .upload_service import MAX_UPLOAD_BYTES, UploadPayload, run_upload_pipeline
 
@@ -433,6 +437,52 @@ def create_app(
         with connect(database) as connection:
             initialize(connection)
             return generate_weekly_schedule(connection, config, request, root)
+
+    @api.post(
+        "/weekly-schedule/rest-day",
+        response_model=WeeklyScheduleResponse,
+        tags=["coaching"],
+    )
+    def set_weekly_rest_day(request: WeeklyRestDayRequest) -> WeeklyScheduleResponse:
+        config = load_config(selected_config)
+        local_today = datetime.now(timezone.utc).astimezone(
+            ZoneInfo(str(config.get("timezone_default", "UTC")))
+        ).date()
+        if not local_today <= request.date <= local_today + timedelta(days=6):
+            raise HTTPException(
+                status_code=422,
+                detail="Choose a date in the current seven-day plan.",
+            )
+        database = resolve_project_path(root, config["paths"]["database"])
+        with connect(database) as connection:
+            initialize(connection)
+            current = ensure_current_weekly_schedule(connection, config, root)
+            selected_day = next(
+                (day for day in current.days if day.date == request.date),
+                None,
+            )
+            if selected_day and selected_day.completed_activities:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A completed run cannot be replaced with a rest-day constraint.",
+                )
+            forced_dates = {
+                value
+                for value in load_forced_rest_dates(connection)
+                if value >= local_today
+            }
+            if request.is_rest_day:
+                forced_dates.add(request.date)
+            else:
+                forced_dates.discard(request.date)
+            save_forced_rest_dates(connection, forced_dates)
+            status = load_current_status(connection)
+            return generate_weekly_schedule(
+                connection,
+                config,
+                WeeklyScheduleRequest(health_status=status.health_status),
+                root,
+            )
 
     @api.get(
         "/weekly-schedule/latest",

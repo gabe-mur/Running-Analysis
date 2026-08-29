@@ -9,13 +9,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import ceil, floor, sqrt
 from typing import Any
 
-from .race_goals import RACE_GOALS, configured_race_goal, format_pace
+from .environmental_stress import assess_training_weather
+from .race_goals import (
+    RACE_GOALS,
+    build_weeks_before_taper,
+    configured_race_goal,
+    format_pace,
+    required_compound_progression,
+)
+from .recovery import (
+    EASY_RUN_RESIDUAL_LIMIT,
+    EASY_VOLUME_RESIDUAL_FLOOR,
+    TAXING_RUN_RESIDUAL_LIMIT,
+    estimate_recovery,
+)
 from .web.schemas import (
     ConfidenceLevel,
     CurrentHealthStatus,
     FitnessState,
+    LoadContext,
     QualitySessionType,
     ReadinessFlag,
     RecommendationRequest,
@@ -34,22 +49,23 @@ class RuleDefinition:
 
 RULE_CATALOG: tuple[RuleDefinition, ...] = (
     RuleDefinition("planned_timing", "Recovery spacing and rolling load are projected to the planned run time."),
-    RuleDefinition("planned_weather", "Forecast heat, humidity, wind, and precipitation can make a future workout more costly."),
+    RuleDefinition("planned_weather", "Forecast stress is graded against recent training exposure, with absolute guardrails for extreme conditions; ordinary rain is neutral."),
     RuleDefinition("health_pain", "Pain or injury concern blocks a running prescription."),
     RuleDefinition("health_sick", "Sick/recovering limits training to a short, low-load return-to-running check. Judging symptom severity is the athlete's call, not the app's."),
-    RuleDefinition("long_or_hard_yesterday", "A long/hard run within 36 hours favors rest or short recovery."),
-    RuleDefinition("high_recent_load", "A high 7-day mileage load relative to retained demonstrated capacity blocks added volume or quality."),
-    RuleDefinition("moderate_leakage", "Excess recent Z3 time redirects the next run to deliberate Z1/Z2."),
-    RuleDefinition("recent_costly_response", "Unusually costly performance or high drift blocks quality."),
+    RuleDefinition("recent_recovery_load", "Athlete-relative session load decays continuously; easy and taxing workouts use different readiness levels."),
+    RuleDefinition("high_recent_load", "High recent load combines retained mileage capacity with confidence-weighted HR-load evidence."),
+    RuleDefinition("moderate_leakage", "Recent Z3 time contributes graded evidence based on its excess and sample size."),
+    RuleDefinition("recent_costly_response", "Corroborated response cost scales workout load instead of creating a binary penalty."),
+    RuleDefinition("recent_drift_caution", "Only drift above the reference contributes, and contradictory strong performance discounts it."),
     RuleDefinition("recent_high_rpe", "A high reported effort adds recovery caution without replacing recorded HR load."),
     RuleDefinition("mechanical_load", "Available elevation data can identify hilly or downhill-heavy mechanical stress."),
     RuleDefinition("returning_consistency", "Sparse recent running favors rebuilding routine before quality."),
     RuleDefinition("post_illness_quality_check", "Sick/recovering remains blocked until the current self-report returns to normal; no hidden clearance stage is added afterward."),
-    RuleDefinition("quality_variant", "Enabled quality-session types rotate deterministically, with short intervals used after a long quality gap."),
+    RuleDefinition("quality_variant", "Enabled quality stimuli vary deterministically; a long gap favors adaptable effort-based work rather than forcing track intervals."),
     RuleDefinition("race_goal", "A validated race goal changes workout composition and taper priority without overriding health or load guardrails."),
-    RuleDefinition("weekly_sequence_priority", "The seven-day planner can coordinate earlier sessions, but the final session receives no workout-type bonus merely for ending the horizon."),
+    RuleDefinition("weekly_sequence_priority", "The rolling planner applies only a small workout-composition preference; recovery and training evidence remain primary."),
     RuleDefinition("workout_scoring", "Easy, long, and quality candidates receive additive evidence scores."),
-    RuleDefinition("long_run_eligible", "Long-run recency raises priority but does not independently prescribe one."),
+    RuleDefinition("long_run_eligible", "Long-run recency adds priority only when demonstrated progression supports a meaningful distance beyond ordinary easy running."),
     RuleDefinition("quality_eligible", "Quality readiness depends on several signals; longest-run distance is not a gate."),
     RuleDefinition("default_aerobic", "When no higher-priority rule fires, prescribe ordinary aerobic running."),
 )
@@ -60,25 +76,92 @@ RULES = {rule.rule_id: rule for rule in RULE_CATALOG}
 def _settings(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "long_run_progression_factor": 1.10,
+        "long_run_target_progression_fraction": 0.05,
         "high_load_ratio": 1.30,
         "moderate_intensity_leakage_fraction": 0.17,
         "minimum_days_between_quality_sessions": 4,
         "quality_recency_reference_days": 7,
         "typical_rest_days_between_runs": 1,
-        "capacity_retention_half_life_days": 42,
+        "capacity_retention_half_life_days": 84,
         "capacity_retention_grace_days": 28,
         "minimum_running_days_28d_for_quality": 8,
-        "long_run_recency_reference_days": 10,
+        "long_run_recency_reference_days": 7,
         "reduced_volume_factor": 0.70,
+        **{
+            key: value
+            for key, value in config.get("coaching", {}).items()
+            if key != "quality_sessions"
+        },
         "quality_sessions": {
+            "fartlek": True,
             "short_intervals": True,
             "long_intervals": True,
             "threshold": True,
             "progression": True,
             "hill_repeats": False,
+            **(
+                config.get("coaching", {}).get("quality_sessions") or {}
+            ),
         },
-        **config.get("coaching", {}),
     }
+
+
+def _moderate_leakage_strength(
+    state: FitnessState,
+    settings: dict[str, Any],
+) -> tuple[float, float]:
+    """Return graded excess-Z3 evidence and its uncertainty transition band."""
+    evidence_runs = state.moderate_evidence_runs_14d
+    fraction = state.moderate_fraction_14d
+    # Correlated minute-by-minute HR samples cannot be treated as independent.
+    # Use run count as the effective sample size and retain a practical floor
+    # so a tiny numerical crossing never becomes a full coaching reversal.
+    uncertainty_band = max(0.015, 0.06 / sqrt(max(1, evidence_runs)))
+    if fraction is None or evidence_runs < 2:
+        return 0.0, uncertainty_band
+    reference = float(settings["moderate_intensity_leakage_fraction"])
+    strength = min(
+        1.0,
+        max(0.0, (fraction - reference) / uncertainty_band),
+    )
+    return strength, uncertainty_band
+
+
+def effective_load_ratio(load: LoadContext) -> float | None:
+    """Combine retained mileage capacity with confidence-weighted HR load.
+
+    Distance is the stable primary signal because its retained capacity has a
+    meaningful long-term denominator.  HR-derived load still matters when it
+    rises faster than mileage, but its influence is limited by confidence so a
+    weak or temporarily depressed prior-load norm cannot take over the plan.
+    The combined value never reduces a mileage-based caution.
+    """
+    distance_ratio = load.acute_distance_to_capacity_ratio
+    hr_ratio = load.acute_to_prior_ratio
+    # Future sessions have distance and workout structure, but no observed HR
+    # response. Their estimated zone load must not create an HR premium and
+    # then penalize the same planned work a second time; projected recovery
+    # load already accounts for workout intensity and spacing.
+    if "includes_planned_sessions" in load.flags and distance_ratio is not None:
+        return distance_ratio
+    if distance_ratio is None:
+        return hr_ratio
+    if hr_ratio is None or hr_ratio <= distance_ratio:
+        return distance_ratio
+    confidence_weight = {
+        ConfidenceLevel.HIGH: 0.35,
+        ConfidenceLevel.MODERATE: 0.20,
+        ConfidenceLevel.LOW: 0.10,
+    }[load.confidence]
+    # A temporarily depressed prior-HR-load denominator can make the raw
+    # ratio arbitrarily large. HR disagreement may add a meaningful caution,
+    # but it cannot contribute more than 0.25 ratio points above the retained
+    # distance-capacity signal by itself.
+    hr_premium = min(
+        0.25,
+        (hr_ratio - distance_ratio) * confidence_weight,
+    )
+    return distance_ratio + hr_premium
 
 
 def _zone_copy(config: dict[str, Any], zone: str) -> str:
@@ -99,23 +182,68 @@ def _zone_copy(config: dict[str, Any], zone: str) -> str:
 LONG_RUN_CONVENTIONAL_FLOOR_MILES = 5.0
 
 
+def long_run_reference_miles(state: FitnessState) -> float:
+    """Best retained evidence of general single-run durability."""
+
+    return max(
+        state.longest_run_30d_miles,
+        state.retained_long_run_capacity_miles,
+    )
+
+
+def single_session_progression_reference_miles(state: FitnessState) -> float:
+    """Current progression guardrail, with a conservative re-entry fallback."""
+
+    if state.longest_run_30d_miles > 0:
+        return state.longest_run_30d_miles
+    return state.retained_long_run_capacity_miles * 0.80
+
+
 def _long_run_distance(
-    cap_miles: float, weekly_norm_miles: float
+    cap_miles: float,
+    weekly_norm_miles: float,
+    recent_single_run_miles: float,
+    demonstrated_runs_per_week: float,
+    target_progression_fraction: float,
+    returning_to_retained_capacity: bool,
 ) -> tuple[float, float, bool]:
-    """Resolve a long-run range that respects the progression ceiling.
+    """Resolve the next step in a maintained long-run progression lane.
 
     Returns ``(lower, upper, capped_by_progression)``.  The conventional
-    five-mile floor is applied only when the 110%-of-longest-recent-run
-    ceiling already supports it; a runner whose longest recent run was three
-    miles must never be handed five.  Half-mile rounding stays as the only
-    thing that may exceed the ceiling, and only by rounding, which the
-    prescription's warning already discloses.
+    five-mile floor is applied only when the single-session progression
+    ceiling supports it. The target is a proportional increase from maintained
+    recent distance, separate from the larger maximum guardrail in
+    ``cap_miles``. Current weekly capacity also has to absorb the run;
+    low-frequency runners may reasonably put a larger share of their mileage
+    into one run than high-frequency runners.
     """
 
-    practical = min(cap_miles, weekly_norm_miles * 0.35 if weekly_norm_miles else cap_miles)
-    practical = min(cap_miles, max(LONG_RUN_CONVENTIONAL_FLOOR_MILES, practical))
-    upper = max(1.0, round(practical * 2) / 2)
-    lower = max(1.0, upper - 0.5)
+    runs_per_week = max(1.0, demonstrated_runs_per_week)
+    share_ceiling = min(0.45, 1.0 / runs_per_week + 0.15)
+    if returning_to_retained_capacity:
+        share_ceiling = max(share_ceiling, 0.50)
+    weekly_ceiling = (
+        weekly_norm_miles * share_ceiling if weekly_norm_miles else cap_miles
+    )
+    target = recent_single_run_miles * (1.0 + target_progression_fraction)
+    practical = min(cap_miles, weekly_ceiling, target)
+    practical = min(
+        cap_miles,
+        max(min(LONG_RUN_CONVENTIONAL_FLOOR_MILES, cap_miles), practical),
+    )
+    # Center the range on a practical quarter mile. Quarter-mile endpoints
+    # keep a proportional target from turning into either a fixed half-mile
+    # jump or zero midpoint progression after display rounding.
+    center = max(
+        1.0,
+        (
+            ceil(practical * 4 - 1e-9) / 4
+            if returning_to_retained_capacity
+            else floor(practical * 4 + 0.5) / 4
+        ),
+    )
+    lower = max(1.0, center - 0.25)
+    upper = center + 0.25
     return (lower, max(upper, lower), cap_miles < LONG_RUN_CONVENTIONAL_FLOOR_MILES)
 
 
@@ -126,7 +254,7 @@ def typical_easy_distance(state: FitnessState) -> tuple[float, float]:
     average = load.distance_miles / load.activity_count
     lower = max(2.0, round((average * 0.85) * 2) / 2)
     upper = lower + 0.5
-    durability_cap = max(3.0, state.longest_run_30d_miles * 0.8)
+    durability_cap = max(3.0, long_run_reference_miles(state) * 0.8)
     return (min(lower, durability_cap), min(upper, durability_cap))
 
 
@@ -187,15 +315,27 @@ def _result(
     )
 
 
+def _weather_scaled_distance(
+    distance: tuple[float, float], weather_stress: float
+) -> tuple[float, float]:
+    if weather_stress <= 0:
+        return distance
+    factor = max(0.70, 1.0 - 0.12 * weather_stress)
+    low = round(max(2.0, distance[0] * factor) * 4) / 4
+    high = round(max(low, distance[1] * factor) * 4) / 4
+    return low, high
+
+
 def _select_quality_variant(
     state: FitnessState, settings: dict[str, Any]
 ) -> QualitySessionType:
     configured = settings.get("quality_sessions") or {}
     ordinary_order = [
-        QualitySessionType.SHORT_INTERVALS,
-        QualitySessionType.THRESHOLD,
-        QualitySessionType.LONG_INTERVALS,
+        QualitySessionType.FARTLEK,
         QualitySessionType.PROGRESSION,
+        QualitySessionType.THRESHOLD,
+        QualitySessionType.SHORT_INTERVALS,
+        QualitySessionType.LONG_INTERVALS,
         QualitySessionType.HILL_REPEATS,
     ]
     goal_name = str(settings.get("training_goal", "general_fitness"))
@@ -206,47 +346,76 @@ def _select_quality_variant(
     if not enabled:
         # Settings validation prevents this in the application; retain a safe
         # deterministic fallback for direct library callers.
-        return QualitySessionType.SHORT_INTERVALS
-    if (
-        QualitySessionType.SHORT_INTERVALS in enabled
-        and (state.days_since_quality_run is None or state.days_since_quality_run >= 21)
-    ):
-        return QualitySessionType.SHORT_INTERVALS
+        return QualitySessionType.FARTLEK
+    if profile:
+        # Goal-specific order describes the useful stimulus, not a mandatory
+        # workout. Rotate within it so even race preparation does not repeat
+        # the same structure indefinitely.
+        preferred_enabled = [item for item in preferred if item in enabled]
+        if preferred_enabled:
+            return preferred_enabled[
+                state.completed_quality_session_count % len(preferred_enabled)
+            ]
+    if state.days_since_quality_run is None or state.days_since_quality_run >= 21:
+        adaptable = [
+            item
+            for item in (
+                QualitySessionType.FARTLEK,
+                QualitySessionType.PROGRESSION,
+                QualitySessionType.THRESHOLD,
+            )
+            if item in enabled
+        ]
+        if adaptable:
+            return adaptable[
+                state.completed_quality_session_count % len(adaptable)
+            ]
     return enabled[state.completed_quality_session_count % len(enabled)]
 
 
 def _quality_prescription(kind: QualitySessionType) -> dict[str, Any]:
     prescriptions: dict[QualitySessionType, dict[str, Any]] = {
+        QualitySessionType.FARTLEK: {
+            "workout_type": WorkoutType.INTERVALS,
+            "title": "Fartlek by feel",
+            "distance": (4.0, 5.0),
+            "zones": ["Z1", "Z2", "controlled strong effort"],
+            "structure": [
+                WorkoutStep(instruction="Warm up easily until stride and breathing feel natural; 10–15 minutes is usually enough.", target_zones=["Z1", "Z2"]),
+                WorkoutStep(instruction="For 20 minutes, add 8 controlled surges using natural landmarks on the route. Let each surge last roughly 45–90 seconds, then run easily until breathing is composed before starting the next one. Do not force identical repetitions.", target_zones=["Z3", "Z4 effort"]),
+                WorkoutStep(instruction="Cool down easily. Finish while another controlled surge would still have been possible.", target_zones=["Z1", "Z2"]),
+            ],
+        },
         QualitySessionType.SHORT_INTERVALS: {
             "workout_type": WorkoutType.INTERVALS,
-            "title": "Controlled 400 m intervals",
+            "title": "Short controlled pickups",
             "distance": (4.0, 4.5),
             "zones": ["Z1", "Z2", "Z4 effort"],
             "structure": [
                 WorkoutStep(instruction="Easy warm-up.", duration_minutes=12, target_zones=["Z1", "Z2"]),
-                WorkoutStep(instruction="6 × 400 m controlled fast, each followed by 200 m slow jog. Do not sprint or chase HR lag.", distance_miles=2.25, target_zones=["Z4 effort"]),
+                WorkoutStep(instruction="Run 8 × 1 minute at controlled fast effort with 90 seconds of easy jogging after each. Keep the final pickup as smooth as the first; do not sprint or chase HR lag.", target_zones=["Z4 effort"]),
                 WorkoutStep(instruction="Easy cool-down.", duration_minutes=10, target_zones=["Z1", "Z2"]),
             ],
         },
         QualitySessionType.LONG_INTERVALS: {
             "workout_type": WorkoutType.INTERVALS,
-            "title": "Controlled 800 m intervals",
+            "title": "Long controlled efforts",
             "distance": (4.5, 5.0),
             "zones": ["Z1", "Z2", "Z4 effort"],
             "structure": [
                 WorkoutStep(instruction="Easy warm-up.", duration_minutes=12, target_zones=["Z1", "Z2"]),
-                WorkoutStep(instruction="4 × 800 m at controlled hard effort, each followed by 400 m easy jog. Keep the final rep consistent.", distance_miles=3.0, target_zones=["Z4 effort"]),
+                WorkoutStep(instruction="Run 3 × 5 minutes at controlled hard effort with 2 minutes of easy jogging between efforts. Finish the third segment at the same effort as the first.", target_zones=["upper Z3", "low Z4"]),
                 WorkoutStep(instruction="Easy cool-down.", duration_minutes=10, target_zones=["Z1", "Z2"]),
             ],
         },
         QualitySessionType.THRESHOLD: {
             "workout_type": WorkoutType.TEMPO_THRESHOLD,
-            "title": "Cruise threshold intervals",
+            "title": "Continuous threshold run",
             "distance": (4.5, 5.0),
             "zones": ["Z1", "Z2", "upper Z3 / low Z4"],
             "structure": [
                 WorkoutStep(instruction="Easy warm-up.", duration_minutes=12, target_zones=["Z1", "Z2"]),
-                WorkoutStep(instruction="3 × 6 minutes at controlled threshold effort with 2 minutes easy jog between. Finish able to repeat the final interval.", duration_minutes=22, target_zones=["upper Z3", "low Z4"]),
+                WorkoutStep(instruction="Run 18 minutes continuously at controlled threshold effort. Start conservatively and finish feeling that another 2–3 minutes would have been possible.", duration_minutes=18, target_zones=["upper Z3", "low Z4"]),
                 WorkoutStep(instruction="Easy cool-down.", duration_minutes=10, target_zones=["Z1", "Z2"]),
             ],
         },
@@ -262,17 +431,251 @@ def _quality_prescription(kind: QualitySessionType) -> dict[str, Any]:
         },
         QualitySessionType.HILL_REPEATS: {
             "workout_type": WorkoutType.INTERVALS,
-            "title": "Short hill repeats",
+            "title": "Hills by terrain",
             "distance": (4.0, 4.5),
             "zones": ["Z1", "Z2", "strong controlled effort"],
             "structure": [
                 WorkoutStep(instruction="Easy warm-up on flat terrain.", duration_minutes=12, target_zones=["Z1", "Z2"]),
-                WorkoutStep(instruction="8 × 45 seconds uphill at strong controlled effort; jog gently downhill and fully regain control.", duration_minutes=16, target_zones=["strong controlled effort"]),
+                WorkoutStep(instruction="Run 8 × 45 seconds uphill at strong controlled effort. Jog gently downhill, regain control, and stop early if form changes.", target_zones=["strong controlled effort"]),
                 WorkoutStep(instruction="Easy cool-down.", duration_minutes=10, target_zones=["Z1", "Z2"]),
             ],
         },
     }
     return prescriptions[kind]
+
+
+def scale_quality_session(
+    result: RecommendationResponse,
+    original_distance: tuple[float, float],
+    allocated_distance: tuple[float, float],
+) -> RecommendationResponse:
+    """Scale the work dose when weekly allocation shortens a quality run."""
+
+    kind = result.quality_session_type
+    if kind is None or len(result.structure) < 2:
+        return result
+    original_midpoint = sum(original_distance) / 2
+    allocated_midpoint = sum(allocated_distance) / 2
+    # Small range normalization (for example 4.0–5.0 becoming 4.0–4.5)
+    # trims discretionary easy mileage, not the coached work segment. Scale
+    # the actual quality dose only after a material reduction.
+    if original_midpoint <= 0 or allocated_midpoint >= original_midpoint * 0.90:
+        return result
+    scale = max(0.70, min(1.0, allocated_midpoint / original_midpoint))
+    if kind == QualitySessionType.FARTLEK:
+        minutes = max(12, round(20 * scale))
+        repetitions = max(5, round(8 * scale))
+        work = WorkoutStep(
+            instruction=(
+                f"For {minutes} minutes, add {repetitions} controlled surges using natural landmarks. "
+                "Let each last roughly 45–90 seconds, then run easily until breathing is composed."
+            ),
+            target_zones=["Z3", "Z4 effort"],
+        )
+    elif kind == QualitySessionType.SHORT_INTERVALS:
+        repetitions = max(5, round(8 * scale))
+        work = WorkoutStep(
+            instruction=(
+                f"Run {repetitions} × 1 minute at controlled fast effort with 90 seconds easy after each. "
+                "Keep the final pickup as smooth as the first."
+            ),
+            target_zones=["Z4 effort"],
+        )
+    elif kind == QualitySessionType.LONG_INTERVALS:
+        repetitions = max(2, round(3 * scale))
+        work = WorkoutStep(
+            instruction=(
+                f"Run {repetitions} × 5 minutes at controlled hard effort with 2 minutes easy between efforts. "
+                "Finish the final segment at the same effort as the first."
+            ),
+            target_zones=["upper Z3", "low Z4"],
+        )
+    elif kind == QualitySessionType.THRESHOLD:
+        minutes = max(12, round(18 * scale))
+        work = WorkoutStep(
+            instruction=(
+                f"Run {minutes} minutes continuously at controlled threshold effort. "
+                "Start conservatively and finish with another 2–3 minutes available."
+            ),
+            duration_minutes=float(minutes),
+            target_zones=["upper Z3", "low Z4"],
+        )
+    elif kind == QualitySessionType.HILL_REPEATS:
+        repetitions = max(5, round(8 * scale))
+        work = WorkoutStep(
+            instruction=(
+                f"Run {repetitions} × 45 seconds uphill at strong controlled effort. "
+                "Jog gently downhill and stop early if form changes."
+            ),
+            target_zones=["strong controlled effort"],
+        )
+    else:
+        # A progression workout already defines its work by fractions of the
+        # total run, so shortening the allocated distance scales it directly.
+        return result.model_copy(
+            update={
+                "reasons": [
+                    *result.reasons,
+                    "The progression stimulus was retained while total distance was shortened to fit the weekly load.",
+                ]
+            }
+        )
+    return result.model_copy(
+        update={
+            "structure": [
+                result.structure[0],
+                work,
+                *result.structure[2:],
+            ],
+            "reasons": [
+                *result.reasons,
+                "The quality dose was shortened instead of deleting the week's quality stimulus.",
+            ],
+        }
+    )
+
+
+EXTENDED_QUALITY_DURATION_MINUTES = 120.0
+
+
+def structure_extended_quality_session(
+    result: RecommendationResponse,
+    estimated_duration_minutes: float,
+) -> RecommendationResponse:
+    """Turn a 2–3 hour quality day into one bounded multi-part workout.
+
+    Extending the ordinary repetitions would turn an endurance session into
+    hours of hard work. The quality dose therefore stays finite while easy
+    aerobic running supplies the additional duration.
+    """
+    if (
+        result.quality_session_type is None
+        or result.workout_type
+        not in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD}
+    ):
+        return result
+    kind = result.quality_session_type
+    if estimated_duration_minutes < EXTENDED_QUALITY_DURATION_MINUTES:
+        ordinary_template_minutes = {
+            QualitySessionType.FARTLEK: 45.0,
+            QualitySessionType.SHORT_INTERVALS: 42.0,
+            QualitySessionType.LONG_INTERVALS: 41.0,
+            QualitySessionType.THRESHOLD: 40.0,
+            QualitySessionType.HILL_REPEATS: 35.0,
+        }.get(kind)
+        # A progression prescription already defines effort by portions of the
+        # whole run. Other fixed-dose quality templates need to say where any
+        # mileage added by the weekly allocator belongs.
+        if (
+            ordinary_template_minutes is None
+            or estimated_duration_minutes <= ordinary_template_minutes + 5
+        ):
+            return result
+        extra_minutes = int(
+            round(
+                (estimated_duration_minutes - ordinary_template_minutes) / 5
+            )
+            * 5
+        )
+        if extra_minutes < 5:
+            return result
+        added_easy = WorkoutStep(
+            instruction=(
+                f"After the quality work, add about {extra_minutes} minutes of easy Z2 running before the cool-down so the full prescribed distance is accounted for."
+            ),
+            duration_minutes=float(extra_minutes),
+            target_zones=["Z2"],
+        )
+        insertion = max(0, len(result.structure) - 1)
+        return result.model_copy(
+            update={
+                "structure": [
+                    *result.structure[:insertion],
+                    added_easy,
+                    *result.structure[insertion:],
+                ],
+                "reasons": [
+                    *result.reasons,
+                    "Any distance beyond the fixed quality dose is assigned to easy aerobic running.",
+                ],
+            }
+        )
+    work: dict[QualitySessionType, tuple[str, WorkoutStep]] = {
+        QualitySessionType.FARTLEK: (
+            "Extended fartlek aerobic session",
+            WorkoutStep(
+                instruction="Complete 3 sets of 4 × 1-minute controlled surges with 90 seconds easy after each surge and 8 minutes easy between sets.",
+                target_zones=["Z3", "Z4 effort"],
+            ),
+        ),
+        QualitySessionType.SHORT_INTERVALS: (
+            "Extended aerobic session with short pickups",
+            WorkoutStep(
+                instruction="Complete 2 sets of 6 × 1 minute controlled fast with 90 seconds easy after each pickup and 8 minutes easy between sets.",
+                target_zones=["Z4 effort"],
+            ),
+        ),
+        QualitySessionType.LONG_INTERVALS: (
+            "Extended aerobic session with long efforts",
+            WorkoutStep(
+                instruction="Run 3 × 8 minutes at controlled hard effort with 3 minutes easy between efforts.",
+                target_zones=["upper Z3", "low Z4"],
+            ),
+        ),
+        QualitySessionType.THRESHOLD: (
+            "Extended aerobic session with threshold blocks",
+            WorkoutStep(
+                instruction="Run 3 × 12 minutes at controlled threshold effort with 5 minutes easy between blocks.",
+                target_zones=["upper Z3", "low Z4"],
+            ),
+        ),
+        QualitySessionType.PROGRESSION: (
+            "Extended aerobic progression session",
+            WorkoutStep(
+                instruction="After the opening aerobic running, progress for 30 minutes from steady Z2 to controlled Z3, then return to easy effort.",
+                duration_minutes=30,
+                target_zones=["Z2", "Z3"],
+            ),
+        ),
+        QualitySessionType.HILL_REPEATS: (
+            "Extended aerobic session with hills",
+            WorkoutStep(
+                instruction="Complete 2 sets of 4 × 45 seconds uphill at strong controlled effort, jogging gently downhill and running 10 minutes easy between sets.",
+                target_zones=["strong controlled effort"],
+            ),
+        ),
+    }
+    title, quality_step = work[kind]
+    rounded_duration = int(round(estimated_duration_minutes / 5) * 5)
+    return result.model_copy(
+        update={
+            "title": title,
+            "structure": [
+                WorkoutStep(
+                    instruction="Run the first 20 minutes easily before beginning any quality work.",
+                    duration_minutes=20,
+                    target_zones=["Z1", "Z2"],
+                ),
+                quality_step,
+                WorkoutStep(
+                    instruction=f"Run all remaining time easily to finish about {rounded_duration} minutes total. Do not add more quality work to fill the duration.",
+                    target_zones=["Z1", "Z2"],
+                ),
+            ],
+            "reasons": [
+                *result.reasons,
+                "Because the estimated session is at least two hours, the quality dose is capped and embedded inside aerobic endurance running.",
+            ],
+            "warnings": [
+                *result.warnings,
+                "Only the defined work blocks are quality effort; the rest of this extended session stays easy.",
+            ],
+            "modification_rules": [
+                *result.modification_rules,
+                "If normal fueling, hydration, or long-duration preparation is unavailable, shorten the total easy duration rather than compressing or extending the quality blocks.",
+            ],
+        }
+    )
 
 
 def _goal_quality_context(
@@ -305,6 +708,7 @@ def recommend_next_run(
     config: dict[str, Any],
     *,
     weekly_role: str | None = None,
+    allowed_candidates: set[str] | None = None,
 ) -> RecommendationResponse:
     """Evaluate guardrails, then long/quality eligibility, then easy default."""
 
@@ -312,17 +716,22 @@ def recommend_next_run(
     trace: list[RuleTrace] = []
     health = request.health_status
     easy_distance = typical_easy_distance(state)
-    load_ratio = (
-        state.recent_load.acute_distance_to_capacity_ratio
-        if state.recent_load.acute_distance_to_capacity_ratio is not None
-        else state.recent_load.acute_to_prior_ratio
+    load_ratio = effective_load_ratio(state.recent_load)
+    high_load_threshold = float(settings["high_load_ratio"])
+    # Only surplus above the load reference contributes, growing to the
+    # configured maximum reduction across a further 0.30 ratio. Crossing the
+    # reference by a rounding error therefore cannot trigger the full penalty.
+    load_stress = (
+        min(1.0, max(0.0, (load_ratio - high_load_threshold) / 0.30))
+        if load_ratio is not None
+        else 0.0
     )
-    high_load = load_ratio is not None and load_ratio >= float(settings["high_load_ratio"])
-    z3_leakage = (
-        state.moderate_fraction_14d is not None
-        and state.moderate_evidence_runs_14d >= 2
-        and state.moderate_fraction_14d >= float(settings["moderate_intensity_leakage_fraction"])
+    high_load = load_stress > 0
+    moderate_leakage_strength, moderate_uncertainty_band = (
+        _moderate_leakage_strength(state, settings)
     )
+    z3_leakage = moderate_leakage_strength >= 0.5
+    recovery = estimate_recovery(state)
 
     trace.append(
         _trace(
@@ -337,31 +746,43 @@ def recommend_next_run(
         )
     )
     weather = state.planned_weather
-    hot_or_humid = bool(
-        weather
-        and (
-            (weather.apparent_temperature_f is not None and weather.apparent_temperature_f >= 85)
-            or (weather.temperature_f is not None and weather.temperature_f >= 85)
-            or (weather.dewpoint_f is not None and weather.dewpoint_f >= 70)
-        )
+    weather_stress = assess_training_weather(
+        weather, state.weather_exposure_baseline
     )
-    strong_wind = bool(
-        weather
-        and (
-            (weather.wind_speed_mph is not None and weather.wind_speed_mph >= 20)
-            or (weather.wind_gust_mph is not None and weather.wind_gust_mph >= 30)
-        )
-    )
-    environmental_caution = hot_or_humid or strong_wind
+    environmental_adaptation = weather_stress.needs_adaptation
+    environmental_caution = weather_stress.caution
     trace.append(
         _trace(
             RULES["planned_weather"],
-            environmental_caution,
+            environmental_adaptation,
             forecast_available=weather is not None,
             temperature_f=weather.temperature_f if weather else None,
             apparent_temperature_f=weather.apparent_temperature_f if weather else None,
             dewpoint_f=weather.dewpoint_f if weather else None,
             wind_speed_mph=weather.wind_speed_mph if weather else None,
+            stress_score=round(weather_stress.score, 3),
+            stress_band=weather_stress.band,
+            heat_component=round(weather_stress.heat, 3),
+            humidity_component=round(weather_stress.humidity, 3),
+            cold_component=round(weather_stress.cold, 3),
+            wind_component=round(weather_stress.wind, 3),
+            precipitation_component=round(weather_stress.precipitation, 3),
+            relative_spike=round(weather_stress.relative_spike, 3),
+            recent_weather_samples=(
+                state.weather_exposure_baseline.sample_count
+                if state.weather_exposure_baseline
+                else 0
+            ),
+            extreme_weather=weather_stress.extreme,
+            extreme_reasons="; ".join(weather_stress.extreme_reasons),
+            emergency_alerts_checked=(
+                weather.emergency_alerts_checked if weather else False
+            ),
+            emergency_alerts=(
+                "; ".join(alert.event for alert in weather.emergency_alerts)
+                if weather
+                else ""
+            ),
         )
     )
 
@@ -409,27 +830,117 @@ def recommend_next_run(
             trace=trace,
         )
 
+    if weather_stress.extreme:
+        return _result(
+            state,
+            workout_type=WorkoutType.REST,
+            title="Extreme-weather no-run window",
+            reasons=[
+                "The forecast indicates "
+                + ", ".join(weather_stress.extreme_reasons)
+                + "."
+            ],
+            warnings=[
+                "Forecast data can miss local warnings and rapidly changing conditions; official emergency guidance always takes precedence."
+            ],
+            modifications=[
+                "Move the run to a non-extreme time rather than trying to preserve the planned outdoor session."
+            ],
+            confidence=ConfidenceLevel.HIGH,
+            readiness=ReadinessFlag.NOT_READY,
+            readiness_reason="The forecast crosses an absolute extreme-weather guardrail.",
+            trace=trace,
+        )
+
     goal = configured_race_goal(config, on_date=state.as_of.date())
 
-    rule = RULES["long_or_hard_yesterday"]
-    recent = state.days_since_last_run is not None and state.days_since_last_run < 1.5
-    taxing_last = bool(state.last_run and (state.last_run.is_long_run or state.last_run.is_quality_session))
-    fired = recent and taxing_last
-    trace.append(_trace(rule, fired, days_since_last_run=state.days_since_last_run, last_run_taxing=taxing_last))
-    if fired:
-        if health == CurrentHealthStatus.LITTLE_TIRED or (state.days_since_last_run or 0) < 0.75:
+    rule = RULES["recent_recovery_load"]
+    easy_recovery_pressure = (
+        min(
+            1.0,
+            max(
+                0.0,
+                (recovery.residual_load - EASY_RUN_RESIDUAL_LIMIT) / 0.50,
+            ),
+        )
+        if recovery is not None
+        else 0.0
+    )
+    # Readiness and volume answer different questions. Falling below the
+    # easy-run guardrail means an easy run is permissible; it does not mean
+    # the latest session has become physiologically free. Keep a smaller,
+    # continuous volume adjustment inside the ready range so next-day easy
+    # mileage grows back gradually as residual load decays. The volume floor
+    # ignores sub-display residue, while a genuinely cheap prior run produces
+    # little or no visible change after half-mile rounding.
+    easy_volume_recovery_pressure = (
+        min(
+            1.0,
+            max(
+                0.0,
+                (recovery.residual_load - EASY_VOLUME_RESIDUAL_FLOOR)
+                / (
+                    EASY_RUN_RESIDUAL_LIMIT
+                    - EASY_VOLUME_RESIDUAL_FLOOR
+                ),
+            ),
+        )
+        if recovery is not None
+        else 0.0
+    )
+    taxing_recovery_pressure = (
+        min(
+            1.0,
+            max(
+                0.0,
+                (recovery.residual_load - TAXING_RUN_RESIDUAL_LIMIT) / 0.30,
+            ),
+        )
+        if recovery is not None
+        else 0.0
+    )
+    # Ignore sub-rounding numerical residue in athlete-facing caution copy.
+    # The underlying score remains continuous at every value.
+    recovery_caution = easy_recovery_pressure >= 0.05
+    trace.append(
+        _trace(
+            rule,
+            taxing_recovery_pressure > 0,
+            elapsed_hours=(round(recovery.elapsed_hours, 1) if recovery else None),
+            initial_relative_load=(round(recovery.initial_load, 3) if recovery else None),
+            residual_load=(round(recovery.residual_load, 3) if recovery else None),
+            easy_run_limit=EASY_RUN_RESIDUAL_LIMIT,
+            hours_until_easy=(round(recovery.hours_until_easy, 1) if recovery else 0.0),
+            hours_until_taxing=(round(recovery.hours_until_taxing, 1) if recovery else 0.0),
+            easy_recovery_pressure=round(easy_recovery_pressure, 3),
+            easy_volume_recovery_pressure=round(
+                easy_volume_recovery_pressure, 3
+            ),
+            taxing_recovery_pressure=round(taxing_recovery_pressure, 3),
+            distance_ratio=(round(recovery.distance_ratio, 3) if recovery and recovery.distance_ratio is not None else None),
+            duration_ratio=(round(recovery.duration_ratio, 3) if recovery and recovery.duration_ratio is not None else None),
+            zone_load_ratio=(round(recovery.zone_load_ratio, 3) if recovery and recovery.zone_load_ratio is not None else None),
+        )
+    )
+    if recovery_caution:
+        if health == CurrentHealthStatus.LITTLE_TIRED:
             return _result(
                 state,
                 workout_type=WorkoutType.REST,
                 title="Recovery day",
-                reasons=["The last run was long or hard and occurred within the last 36 hours."],
+                reasons=[f"About {recovery.hours_until_easy:.0f} more recovery hours are projected before even an easy run fits normally."],
                 warnings=["Same-day recovery data such as sleep and soreness are unavailable."],
                 modifications=["Easy walking is optional if it is comfortable; no workout needs to be made up."],
                 confidence=ConfidenceLevel.MODERATE,
                 readiness=ReadinessFlag.CAUTION,
                 trace=trace,
             )
-        reduced = (max(2.0, easy_distance[0] * 0.6), max(2.5, easy_distance[1] * 0.7))
+    if recovery is not None and recovery.residual_load > 1.25:
+        reduction = max(0.55, 1.0 - 0.30 * easy_recovery_pressure)
+        reduced = (
+            max(2.0, easy_distance[0] * reduction),
+            max(2.5, easy_distance[1] * reduction),
+        )
         return _result(
             state,
             workout_type=WorkoutType.RECOVERY,
@@ -437,7 +948,7 @@ def recommend_next_run(
             distance=tuple(round(value * 2) / 2 for value in reduced),
             zones=["Z1", "low Z2"],
             structure=[WorkoutStep(instruction="Keep the entire run conversational; no fast finish.", target_zones=["Z1", "low Z2"])],
-            reasons=["The last run was long or hard and occurred within the last 36 hours."],
+            reasons=["The latest session still carries elevated athlete-relative recovery load, so only a short easy run fits."],
             modifications=["Stop early if effort or HR is unusually high for the pace."],
             confidence=ConfidenceLevel.MODERATE,
             readiness=ReadinessFlag.CAUTION,
@@ -451,8 +962,11 @@ def recommend_next_run(
             high_load,
             acute_distance_to_capacity_ratio=state.recent_load.acute_distance_to_capacity_ratio,
             raw_hr_load_to_prior_ratio=state.recent_load.acute_to_prior_ratio,
+            effective_load_ratio=(round(load_ratio, 3) if load_ratio is not None else None),
             capacity_reference_miles=state.recent_load.capacity_reference_miles,
             threshold=settings["high_load_ratio"],
+            surplus_strength=round(load_stress, 3),
+            full_penalty_ratio=round(high_load_threshold + 0.30, 2),
         )
     )
     rule = RULES["moderate_leakage"]
@@ -464,6 +978,8 @@ def recommend_next_run(
             eligible_easy_runs=state.moderate_evidence_runs_14d,
             minimum_evidence_runs=2,
             threshold=settings["moderate_intensity_leakage_fraction"],
+            evidence_strength=round(moderate_leakage_strength, 3),
+            uncertainty_band=round(moderate_uncertainty_band, 3),
         )
     )
     high_rpe = bool(
@@ -499,11 +1015,64 @@ def recommend_next_run(
             substantial_downhill_load="substantial_downhill_load" in mechanical_flags,
         )
     )
-    costly = high_rpe or state.recent_performance_anomaly == "unusually_costly" or (
-        state.last_run_drift_percent is not None and state.last_run_drift_percent > 5
+    drift_percent = state.last_run_drift_percent
+    raw_drift_strength = (
+        min(1.0, max(0.0, (drift_percent - 5.0) / 7.0))
+        if drift_percent is not None
+        else 0.0
     )
+    # Strong whole-run pace-at-HR evidence does not erase genuine drift, but
+    # it sharply discounts the claim that drift alone proves a costly run.
+    drift_strength = raw_drift_strength * (
+        0.25
+        if state.recent_performance_anomaly == "unusually_strong"
+        else 1.0
+    )
+    anomaly_strength = (
+        0.75
+        if state.recent_performance_anomaly == "unusually_costly"
+        else 0.0
+    )
+    rpe_strength = 1.0 if high_rpe else 0.0
+    # Independent evidence combines without double-counting to more than one.
+    response_stress = 1.0 - (
+        (1.0 - drift_strength)
+        * (1.0 - anomaly_strength)
+        * (1.0 - rpe_strength)
+    )
+    costly = response_stress >= 0.5
+    drift_caution = 0.0 < response_stress < 0.5
     rule = RULES["recent_costly_response"]
-    trace.append(_trace(rule, costly, performance_anomaly=state.recent_performance_anomaly, drift_percent=state.last_run_drift_percent))
+    trace.append(
+        _trace(
+            rule,
+            costly,
+            performance_anomaly=state.recent_performance_anomaly,
+            drift_percent=drift_percent,
+            drift_excess_strength=round(drift_strength, 3),
+            performance_strength=anomaly_strength,
+            rpe_strength=rpe_strength,
+            response_stress=round(response_stress, 3),
+            maximum_volume_reduction=(
+                1.0 - float(settings["reduced_volume_factor"])
+            ),
+        )
+    )
+    trace.append(
+        _trace(
+            RULES["recent_drift_caution"],
+            drift_caution,
+            drift_percent=drift_percent,
+            performance_anomaly=state.recent_performance_anomaly,
+            response_stress=round(response_stress, 3),
+            quality_penalty_points=round(3.0 * response_stress, 2),
+            volume_reduction_fraction=round(
+                response_stress
+                * (1.0 - float(settings["reduced_volume_factor"])),
+                3,
+            ),
+        )
+    )
     sparse = state.running_days_28d < int(settings["minimum_running_days_28d_for_quality"])
     rule = RULES["returning_consistency"]
     trace.append(_trace(rule, sparse, running_days_28d=state.running_days_28d, minimum=settings["minimum_running_days_28d_for_quality"]))
@@ -528,6 +1097,11 @@ def recommend_next_run(
     def add(candidate: str, value: float, reason: str) -> None:
         scores[candidate] += value
         evidence[candidate].append(f"{reason} {value:+g}")
+
+    if taxing_recovery_pressure > 0:
+        add("easy", 2.0 * taxing_recovery_pressure, "remaining recovery load")
+        add("long", -3.0 * taxing_recovery_pressure, "remaining recovery load")
+        add("quality", -4.0 * taxing_recovery_pressure, "remaining recovery load")
 
     days_to_goal = None
     tapering = False
@@ -585,17 +1159,17 @@ def recommend_next_run(
             trace=trace,
         )
 
-    if high_load:
-        add("easy", 3, "high acute load")
-        add("long", -3, "high acute load")
-        add("quality", -4, "high acute load")
-    if z3_leakage:
-        add("easy", 2, "excess Z3")
-        add("quality", -2, "excess Z3")
-    if costly:
-        add("easy", 2, "costly recent response")
-        add("long", -2, "costly recent response")
-        add("quality", -3, "costly recent response")
+    if load_stress > 0:
+        add("easy", 3 * load_stress, "graded acute-load surplus")
+        add("long", -3 * load_stress, "graded acute-load surplus")
+        add("quality", -4 * load_stress, "graded acute-load surplus")
+    if moderate_leakage_strength > 0:
+        add("easy", 2 * moderate_leakage_strength, "graded excess Z3")
+        add("quality", -2 * moderate_leakage_strength, "graded excess Z3")
+    if response_stress > 0:
+        add("easy", 2 * response_stress, "graded recent-response cost")
+        add("long", -2 * response_stress, "graded recent-response cost")
+        add("quality", -3 * response_stress, "graded recent-response cost")
     if mechanical_load:
         add("easy", 1, "recent mechanical load")
         add("long", -1, "recent mechanical load")
@@ -616,21 +1190,104 @@ def recommend_next_run(
         add("easy", 2, "reported tiredness")
         add("long", -2, "reported tiredness")
         add("quality", -3, "reported tiredness")
-    if environmental_caution:
-        add("easy", 2, "weather caution")
-        add("long", -2, "weather caution")
-        add("quality", -2, "weather caution")
+    if weather_stress.score > 0:
+        # Mild stress adapts the prescription without erasing the planned
+        # workout. Only genuinely high stress strongly redirects long or
+        # quality work, and every transition is continuous.
+        severe_excess = max(0.0, (weather_stress.score - 0.75) / 0.75)
+        add(
+            "easy",
+            0.50 * weather_stress.score + 3.0 * severe_excess,
+            f"graded {weather_stress.band} weather stress",
+        )
+        add(
+            "long",
+            -0.25 * weather_stress.score - 3.0 * severe_excess,
+            f"graded {weather_stress.band} weather stress",
+        )
+        add(
+            "quality",
+            -0.75 * weather_stress.score - 4.0 * severe_excess,
+            f"graded {weather_stress.band} weather stress",
+        )
 
     recency_reference = float(settings["long_run_recency_reference_days"])
     if state.days_since_long_run is None or state.days_since_long_run >= recency_reference:
-        add("long", 2, "long-run recency")
+        add("long", 2.0, "rolling long-run recency pressure")
         add("quality", -1, "long-run recency opportunity cost")
-    elif state.days_since_long_run >= recency_reference * 0.6:
-        add("long", 1, "long-run recency")
+    elif state.days_since_long_run >= max(0.0, recency_reference - 1.0):
+        add("long", 0.5, "approaching long-run target spacing")
     else:
         add("long", -1, "recent long run")
-    if state.longest_run_30d_miles <= 0:
+    progression_reference = single_session_progression_reference_miles(state)
+    if progression_reference <= 0:
         add("long", -4, "no recent long-run baseline")
+    easy_midpoint = sum(easy_distance) / 2
+    meaningful_long_threshold = max(
+        easy_distance[1] + 0.5,
+        round(easy_midpoint * 1.15 * 2) / 2,
+    )
+    progression_ceiling = (
+        round(
+            progression_reference
+            * float(settings["long_run_progression_factor"])
+            * 2
+        )
+        / 2
+    )
+    ordinary_progression_fraction = float(
+        settings["long_run_target_progression_fraction"]
+    )
+    maximum_progression_fraction = max(
+        0.0,
+        float(settings["long_run_progression_factor"]) - 1.0,
+    )
+    retained_return_gap_fraction = (
+        max(
+            0.0,
+            state.retained_long_run_capacity_miles / progression_reference - 1.0,
+        )
+        if progression_reference > 0
+        else 0.0
+    )
+    target_progression_fraction = min(
+        maximum_progression_fraction,
+        max(
+            ordinary_progression_fraction,
+            retained_return_gap_fraction * 0.5,
+        ),
+    )
+    goal_required_long_progression = 0.0
+    if goal and not tapering:
+        goal_required_long_progression = required_compound_progression(
+            progression_reference,
+            goal_profile.peak_long_run_miles,
+            build_weeks_before_taper(
+                goal_profile,
+                goal_date,
+                state.as_of.date(),
+            ),
+        )
+        target_progression_fraction = min(
+            maximum_progression_fraction,
+            max(target_progression_fraction, goal_required_long_progression),
+        )
+    returning_to_retained_capacity = (
+        retained_return_gap_fraction >= ordinary_progression_fraction
+    )
+    if (
+        returning_to_retained_capacity
+        and state.days_since_long_run is not None
+        and state.days_since_long_run >= 7.0
+    ):
+        add("long", 1.0, "return toward retained long-run capacity")
+        add("quality", -0.5, "return-to-capacity opportunity cost")
+    if progression_ceiling < meaningful_long_threshold:
+        add(
+            "long",
+            -5,
+            "progression ceiling does not support a run meaningfully longer than ordinary easy distance",
+        )
 
     minimum_quality_spacing = float(settings["minimum_days_between_quality_sessions"])
     quality_recency_reference = float(settings["quality_recency_reference_days"])
@@ -639,7 +1296,7 @@ def recommend_next_run(
     if not quality_spacing:
         add("quality", -5, "insufficient quality spacing")
     elif quality_due:
-        add("quality", 1, "weekly quality opportunity")
+        add("quality", 1.0, "rolling quality-session recency pressure")
     else:
         add("quality", -2, "quality already completed this week")
     if state.quality_sessions_14d == 0:
@@ -655,19 +1312,30 @@ def recommend_next_run(
     }:
         add("long", 0.5, "improving efficiency signal")
         add("quality", 1.5, "improving efficiency signal")
+    sequence_preference_points = 1.0
     if weekly_role in scores:
-        add(weekly_role, 3, "coordinated weekly sequence")
+        add(weekly_role, sequence_preference_points, "coordinated weekly sequence")
     trace.append(
         _trace(
             RULES["weekly_sequence_priority"],
             weekly_role in scores,
             preferred_role=weekly_role,
-            preference_points=3 if weekly_role in scores else 0,
+            preference_points=(sequence_preference_points if weekly_role in scores else 0),
         )
     )
 
     tie_priority = {"easy": 2, "long": 1, "quality": 0}
-    selected = max(scores, key=lambda candidate: (scores[candidate], tie_priority[candidate]))
+    available = [
+        candidate
+        for candidate in scores
+        if allowed_candidates is None or candidate in allowed_candidates
+    ]
+    if not available:
+        available = ["easy"]
+    selected = max(
+        available,
+        key=lambda candidate: (scores[candidate], tie_priority[candidate]),
+    )
     trace.append(
         _trace(
             RULES["workout_scoring"],
@@ -676,6 +1344,11 @@ def recommend_next_run(
             easy_score=round(scores["easy"], 2),
             long_score=round(scores["long"], 2),
             quality_score=round(scores["quality"], 2),
+            allowed_candidates=(
+                ", ".join(sorted(allowed_candidates))
+                if allowed_candidates is not None
+                else "easy, long, quality"
+            ),
             easy_evidence="; ".join(evidence["easy"]),
             long_evidence="; ".join(evidence["long"]),
             quality_evidence="; ".join(evidence["quality"]),
@@ -688,6 +1361,19 @@ def recommend_next_run(
             score=round(scores["long"], 2),
             days_since_long_run=state.days_since_long_run,
             recency_reference_days=recency_reference,
+            meaningful_long_threshold_miles=meaningful_long_threshold,
+            progression_ceiling_miles=progression_ceiling,
+            retained_long_run_capacity_miles=round(
+                state.retained_long_run_capacity_miles, 2
+            ),
+            target_progression_fraction=round(
+                target_progression_fraction, 3
+            ),
+            goal_required_long_progression_fraction=(
+                round(goal_required_long_progression, 3)
+                if goal and not tapering
+                else 0.0
+            ),
         )
     )
     trace.append(
@@ -713,25 +1399,46 @@ def recommend_next_run(
     )
 
     if selected == "long":
-        cap = state.longest_run_30d_miles * float(settings["long_run_progression_factor"])
+        cap = progression_reference * float(settings["long_run_progression_factor"])
         weekly_norm = max(
             state.recent_load.trailing_28d.distance_miles / 4,
             state.recent_load.capacity_reference_miles or 0,
         )
-        lower, upper, capped_by_progression = _long_run_distance(cap, weekly_norm)
-        warnings = ["The distance is rounded to a practical half mile; the progression limit is a warning, not a hard safety line."]
+        lower, upper, capped_by_progression = _long_run_distance(
+            cap,
+            weekly_norm,
+            progression_reference,
+            state.running_days_28d / 4.0,
+            target_progression_fraction,
+            returning_to_retained_capacity,
+        )
+        long_distance = _weather_scaled_distance(
+            (lower, upper), weather_stress.score
+        )
+        warnings = ["The target is proportional to maintained recent distance and rounded to a practical quarter mile; the separate progression limit is a warning, not a hard safety line."]
         if capped_by_progression:
             warnings.append(
-                f"Your longest run in the past 30 days was {state.longest_run_30d_miles:.1f} miles, "
+                f"Your current single-run progression reference is {progression_reference:.1f} miles, "
                 f"so the progression limit is about {cap:.1f} miles and this long run follows that "
                 "rather than a conventional distance. Half-mile rounding may put the upper end "
                 "level with the limit."
+            )
+        if environmental_adaptation:
+            warnings.append(
+                f"The forecast adds {weather_stress.band} environmental stress relative to recent training exposure; ordinary rain does not count against the workout."
+            )
+        modifications = [
+            "Cut the run to ordinary easy distance if fatigue, pain, or illness symptoms appear."
+        ]
+        if environmental_adaptation:
+            modifications.append(
+                "Run by easy effort rather than normal-weather pace and use the lower end if conditions feel more costly than forecast."
             )
         return _result(
             state,
             workout_type=WorkoutType.LONG,
             title="Easy long run",
-            distance=(lower, upper),
+            distance=long_distance,
             zones=["Z1", "Z2"],
             structure=[
                 WorkoutStep(instruction="First 10 minutes relaxed in Z1 or low Z2.", duration_minutes=10, target_zones=["Z1", "low Z2"]),
@@ -739,9 +1446,18 @@ def recommend_next_run(
             ],
             reasons=["A long run fits your recent mileage, recovery, and time since the last one.", "The distance stays close to your longest run in the past 30 days."],
             warnings=warnings,
-            modifications=["Cut the run to ordinary easy distance if fatigue, pain, or illness symptoms appear."],
+            modifications=modifications,
             confidence=ConfidenceLevel.MODERATE,
-            readiness=ReadinessFlag.READY,
+            readiness=(
+                ReadinessFlag.CAUTION
+                if environmental_caution
+                else ReadinessFlag.READY
+            ),
+            readiness_reason=(
+                "The workout still fits, but the graded forecast stress calls for effort-based pacing and flexible distance."
+                if environmental_caution
+                else None
+            ),
             trace=trace,
         )
 
@@ -764,20 +1480,25 @@ def recommend_next_run(
                 enabled_variants=", ".join(enabled_quality),
                 completed_quality_session_count=state.completed_quality_session_count,
                 days_since_quality_run=state.days_since_quality_run,
+                adaptable_return_from_quality_gap=(
+                    state.days_since_quality_run is None
+                    or state.days_since_quality_run >= 21
+                ),
             )
         )
         quality_warnings = [
             "Historical workout pace is context only; today’s prescription is controlled effort, not a fixed split mandate."
         ]
         quality_modifications = [
-            "Convert to an ordinary easy run if warm-up HR/effort is abnormal or any pain appears."
+            "Follow the single prescribed structure, but use effort rather than pace to adapt it to the route and conditions.",
+            "Convert to an ordinary easy run if warm-up HR/effort is abnormal or any pain appears.",
         ]
-        if environmental_caution:
+        if environmental_adaptation:
             quality_warnings.append(
-                "The planned forecast adds heat, humidity, or wind stress to this workout."
+                f"The planned forecast adds {weather_stress.band} graded environmental stress to this workout."
             )
             quality_modifications.append(
-                "Prefer a cooler time; if conditions remain oppressive, replace the intervals with ordinary easy running."
+                "Use effort rather than normal-weather pace; if conditions feel oppressive during the warm-up, replace the quality work with ordinary easy running."
             )
         return _result(
             state,
@@ -789,7 +1510,7 @@ def recommend_next_run(
             structure=structure,
             reasons=[
                 "Recent training, recovery, and workout spacing support a harder session.",
-                f"{quality_kind.value.replace('_', ' ').title()} is the next enabled workout in your rotation.",
+                f"{quality_kind.value.replace('_', ' ').title()} provides variety while matching the current quality stimulus and enabled preferences.",
             ],
             warnings=quality_warnings,
             modifications=quality_modifications,
@@ -798,18 +1519,30 @@ def recommend_next_run(
             trace=trace,
         )
 
-    factor = float(settings["reduced_volume_factor"]) if (high_load or costly) else 1.0
+    response_factor = 1.0 - response_stress * (
+        1.0 - float(settings["reduced_volume_factor"])
+    )
+    load_factor = 1.0 - load_stress * (
+        1.0 - float(settings["reduced_volume_factor"])
+    )
+    factor = min(
+        load_factor,
+        response_factor,
+        1.0 - 0.25 * easy_volume_recovery_pressure,
+    )
     if tapering:
         factor = min(factor, 0.80)
-    if environmental_caution:
-        factor = min(factor, 0.85)
+    factor *= max(0.70, 1.0 - 0.12 * weather_stress.score)
     prescribed_distance = tuple(round(max(2.0, value * factor) * 2) / 2 for value in easy_distance)
-    cautions = high_load or z3_leakage or costly or sparse or health == CurrentHealthStatus.LITTLE_TIRED or environmental_caution
+    cautions = high_load or z3_leakage or response_stress > 0 or recovery_caution or sparse or health == CurrentHealthStatus.LITTLE_TIRED or environmental_caution
     reasons = ["An easy run best fits your recent training and recovery."]
     caution_explanations: list[str] = []
-    if high_load: reasons.append(f"Your last 7 days are about {load_ratio * 100:.0f}% of your usual weekly capacity.")
+    if high_load: reasons.append(f"Your projected recent load is about {load_ratio * 100:.0f}% of your usual weekly capacity.")
     if high_load:
-        caution_explanations.append("You have already run more than usual this week, so added mileage is limited.")
+        load_reduction_percent = (1.0 - load_factor) * 100
+        caution_explanations.append(
+            f"Load is above the reference, so ordinary distance is reduced by about {load_reduction_percent:.0f}% before rounding; the reduction grows with the surplus."
+        )
     if z3_leakage:
         z3_percent = state.moderate_fraction_14d * 100
         z3_threshold_percent = float(settings["moderate_intensity_leakage_fraction"]) * 100
@@ -817,21 +1550,43 @@ def recommend_next_run(
         caution_explanations.append(
             f"Moderate effort was {z3_percent:.0f}% of recent HR time, above the {z3_threshold_percent:.0f}% easy-running reference. Keep this run truly easy."
         )
-    if costly:
-        reasons.append("Your latest run cost more effort than usual or showed meaningful second-half drift.")
-        caution_explanations.append("The latest comparable response was unusually costly, so the run is kept easy or reduced.")
+    if response_stress > 0:
+        reduction_percent = (1.0 - response_factor) * 100
+        reasons.append(
+            f"The latest response adds {response_stress * 100:.0f}% of the maximum recent-response penalty."
+        )
+        caution_explanations.append(
+            f"Recent-response evidence reduces ordinary distance by about {reduction_percent:.0f}% before rounding; the adjustment scales with the excess rather than switching on all at once."
+        )
+    if easy_volume_recovery_pressure >= 0.05 and recovery is not None:
+        recovery_reduction_percent = easy_volume_recovery_pressure * 25
+        reasons.append(
+            f"The latest session's remaining recovery load reduces ordinary distance by about {recovery_reduction_percent:.0f}% before rounding."
+        )
+        if recovery_caution:
+            caution_explanations.append(
+                f"Recovery load is still above the easy-run reference and is projected to decay into the normal range in about {recovery.hours_until_easy:.0f} hours."
+            )
     if sparse:
         reasons.append("Recent running has been less consistent than usual.")
         caution_explanations.append("Recent consistency is below the quality-work reference, so this remains an easy session.")
     if health == CurrentHealthStatus.LITTLE_TIRED:
         caution_explanations.append("Current status is a little tired, so ordinary easy running is favored over added stress.")
     if environmental_caution:
-        caution_explanations.append("The forecast adds meaningful heat, humidity, or wind stress, so pace and distance should remain flexible.")
+        caution_explanations.append("The graded forecast stress is meaningful, so pace and distance should remain flexible.")
+    elif environmental_adaptation:
+        reasons.append(
+            f"The forecast adds {weather_stress.band} environmental stress, so the distance and pacing guidance are adjusted gradually."
+        )
     if post_illness_check: reasons.append("This is the final easy aerobic check before reintroducing quality, provided the response is normal.")
     easy_modifications = ["Keep the run easy or shorten it if today’s HR/effort is unusually high."]
     if post_illness_check:
         easy_modifications.append(
             "If respiratory symptoms meaningfully return during or after this run, replace the planned quality session with an easy run."
+        )
+    if environmental_adaptation:
+        easy_modifications.append(
+            "Use easy effort rather than normal-weather pace and shorten only if conditions feel more costly than forecast."
         )
     return _result(
         state,

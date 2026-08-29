@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-from run_analysis.recommendation import recommend_next_run
+from run_analysis.environmental_stress import assess_training_weather
+from run_analysis.recommendation import (
+    recommend_next_run,
+    scale_quality_session,
+    structure_extended_quality_session,
+    typical_easy_distance,
+)
 from run_analysis.web.schemas import (
     ConfidenceLevel,
     CurrentHealthStatus,
@@ -13,8 +19,11 @@ from run_analysis.web.schemas import (
     FitnessTrend,
     LoadContext,
     LoadWindow,
+    PlannedWeather,
     RecommendationRequest,
     SessionDifficulty,
+    WeatherExposureBaseline,
+    WeatherEmergencyAlert,
     WorkoutType,
     ZoneBreakdown,
 )
@@ -32,7 +41,7 @@ CONFIG = {
         "moderate_intensity_leakage_fraction": 0.17,
         "minimum_days_between_quality_sessions": 4,
         "minimum_running_days_28d_for_quality": 8,
-        "long_run_recency_reference_days": 10,
+        "long_run_recency_reference_days": 7,
         "reduced_volume_factor": 0.70,
     }
 }
@@ -102,6 +111,192 @@ def test_low_load_three_days_rest_and_no_recent_quality_can_be_quality_eligible(
     assert any(item.rule_id == "quality_eligible" and item.fired for item in result.rule_trace)
 
 
+def _planned_weather(*, apparent: float, dewpoint: float) -> PlannedWeather:
+    return PlannedWeather(
+        forecast_time=datetime.now(timezone.utc),
+        temperature_f=apparent - 5,
+        apparent_temperature_f=apparent,
+        dewpoint_f=dewpoint,
+        wind_speed_mph=3,
+        wind_gust_mph=7,
+        precipitation_probability_percent=0,
+        precipitation_in=0,
+    )
+
+
+def test_weather_stress_is_continuous_across_old_dewpoint_cutoff() -> None:
+    below = assess_training_weather(_planned_weather(apparent=84.2, dewpoint=69.9))
+    above = assess_training_weather(_planned_weather(apparent=84.2, dewpoint=70.1))
+
+    assert below.band == above.band == "none"
+    assert 0 < above.score - below.score < 0.02
+
+
+def test_weather_spike_adapts_but_does_not_erase_due_long_run() -> None:
+    baseline = WeatherExposureBaseline(
+        sample_count=6,
+        warm_apparent_temperature_f=75,
+        cold_apparent_temperature_f=60,
+        humid_dewpoint_f=60,
+    )
+    result = recommend_next_run(
+        _state(
+            planned_weather=_planned_weather(apparent=84.2, dewpoint=71.3),
+            weather_exposure_baseline=baseline,
+            days_since_long_run=12,
+            days_since_quality_run=3,
+            quality_sessions_14d=1,
+        ),
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="long",
+    )
+    weather_trace = next(
+        item for item in result.rule_trace if item.rule_id == "planned_weather"
+    )
+
+    assert result.workout_type == WorkoutType.LONG
+    assert result.readiness.value == "caution"
+    assert weather_trace.fired is True
+    assert weather_trace.facts["stress_band"] == "moderate"
+
+
+def test_severe_combined_heat_and_humidity_can_redirect_long_run() -> None:
+    result = recommend_next_run(
+        _state(
+            planned_weather=_planned_weather(apparent=105, dewpoint=80),
+            days_since_long_run=12,
+            days_since_quality_run=3,
+            quality_sessions_14d=1,
+        ),
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="long",
+    )
+
+    assert result.workout_type == WorkoutType.REST
+    assert result.readiness.value == "not_ready"
+
+
+def test_conditions_within_recent_exposure_do_not_penalize_training() -> None:
+    baseline = WeatherExposureBaseline(
+        sample_count=9,
+        warm_apparent_temperature_f=87,
+        cold_apparent_temperature_f=72,
+        humid_dewpoint_f=73,
+    )
+    assessed = assess_training_weather(
+        _planned_weather(apparent=84.2, dewpoint=71.3), baseline
+    )
+
+    assert assessed.score == 0
+    assert assessed.band == "none"
+
+
+def test_relative_weather_does_not_penalize_absolute_comfort_zone() -> None:
+    cool_month = WeatherExposureBaseline(
+        sample_count=8,
+        warm_apparent_temperature_f=55,
+        cold_apparent_temperature_f=45,
+        humid_dewpoint_f=40,
+    )
+    hot_month = WeatherExposureBaseline(
+        sample_count=8,
+        warm_apparent_temperature_f=88,
+        cold_apparent_temperature_f=80,
+        humid_dewpoint_f=72,
+    )
+
+    pleasant_warm = assess_training_weather(
+        _planned_weather(apparent=75, dewpoint=45), cool_month
+    )
+    pleasant_cool = assess_training_weather(
+        _planned_weather(apparent=60, dewpoint=45), hot_month
+    )
+
+    assert pleasant_warm.band == "none"
+    assert pleasant_cool.band == "none"
+
+
+def test_ordinary_rain_is_neutral_training_context() -> None:
+    dry = _planned_weather(apparent=68, dewpoint=58)
+    rain = dry.model_copy(
+        update={
+            "precipitation_probability_percent": 100,
+            "precipitation_in": 1.5,
+            "weather_code": 65,
+        }
+    )
+
+    assert assess_training_weather(rain).score == assess_training_weather(dry).score
+    assert assess_training_weather(rain).extreme is False
+
+
+def test_thunderstorm_is_an_absolute_extreme_weather_guardrail() -> None:
+    storm = _planned_weather(apparent=75, dewpoint=65).model_copy(
+        update={"weather_code": 95}
+    )
+    result = _recommend(_state(planned_weather=storm))
+
+    assert result.workout_type == WorkoutType.REST
+    assert result.readiness.value == "not_ready"
+    assert "thunderstorm" in result.reasons[0]
+
+
+def test_blizzard_like_conditions_are_an_absolute_guardrail() -> None:
+    blizzard = _planned_weather(apparent=15, dewpoint=10).model_copy(
+        update={
+            "weather_code": 75,
+            "wind_gust_mph": 40,
+            "visibility_miles": 0.2,
+            "snowfall_in": 1.0,
+        }
+    )
+    result = _recommend(_state(planned_weather=blizzard))
+
+    assert result.workout_type == WorkoutType.REST
+    assert "blizzard-like" in result.reasons[0]
+
+
+def test_hurricane_force_wind_is_an_absolute_guardrail() -> None:
+    hurricane = _planned_weather(apparent=78, dewpoint=72).model_copy(
+        update={"wind_speed_mph": 75, "wind_gust_mph": 90}
+    )
+    result = _recommend(_state(planned_weather=hurricane))
+
+    assert result.workout_type == WorkoutType.REST
+    assert "hurricane-force" in result.reasons[0]
+
+
+def test_official_dangerous_warning_blocks_only_its_outdoor_window() -> None:
+    warning = WeatherEmergencyAlert(
+        alert_id="https://api.weather.gov/alerts/example",
+        event="Tornado Warning",
+        headline="Tornado Warning issued for the planned route area",
+        severity="Extreme",
+        urgency="Immediate",
+        certainty="Observed",
+        blocks_outdoor_run=True,
+    )
+    weather = _planned_weather(apparent=75, dewpoint=62).model_copy(
+        update={
+            "emergency_alerts_checked": True,
+            "emergency_alerts": [warning],
+        }
+    )
+
+    result = _recommend(_state(planned_weather=weather))
+    trace = next(
+        item for item in result.rule_trace if item.rule_id == "planned_weather"
+    )
+
+    assert result.workout_type == WorkoutType.REST
+    assert result.title == "Extreme-weather no-run window"
+    assert "official NWS Tornado Warning" in result.reasons[0]
+    assert trace.facts["emergency_alerts_checked"] is True
+    assert trace.facts["emergency_alerts"] == "Tornado Warning"
+
+
 def test_quality_is_prioritized_weekly_not_every_four_days() -> None:
     result = _recommend(
         _state(
@@ -115,10 +310,15 @@ def test_quality_is_prioritized_weekly_not_every_four_days() -> None:
     assert quality.facts["quality_recency_reference_days"] == 7
 
 
-def test_long_run_yesterday_produces_rest_or_short_recovery() -> None:
+def test_long_run_recovery_load_suppresses_quality_without_forcing_rest() -> None:
     result = _recommend(_state(days_since_last_run=0.8, last_run=_difficulty(long=True, miles=8)))
-    assert result.workout_type in {WorkoutType.REST, WorkoutType.RECOVERY}
-    assert any(item.rule_id == "long_or_hard_yesterday" and item.fired for item in result.rule_trace)
+    assert result.workout_type == WorkoutType.EASY
+    recovery = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_recovery_load"
+    )
+    assert recovery.fired
+    assert 0 < recovery.facts["hours_until_easy"] < recovery.facts["hours_until_taxing"]
 
 
 def test_high_z3_leakage_forces_easy_z1_z2() -> None:
@@ -131,10 +331,76 @@ def test_high_z3_leakage_forces_easy_z1_z2() -> None:
     assert "Keep this run truly easy" in result.readiness_reason
 
 
+def test_marginal_z3_excess_does_not_trigger_full_caution() -> None:
+    result = _recommend(
+        _state(
+            moderate_fraction_14d=0.175,
+            moderate_evidence_runs_14d=3,
+        )
+    )
+    trace = next(
+        item for item in result.rule_trace if item.rule_id == "moderate_leakage"
+    )
+
+    assert trace.fired is False
+    assert 0 < trace.facts["evidence_strength"] < 0.5
+    assert "above the 17%" not in (result.readiness_reason or "")
+
+
 def test_recent_illness_and_poor_response_reduce_easy_volume() -> None:
     result = _recommend(_state(recent_illness_or_recovery=True, normal_runs_since_health_event=1, recent_performance_anomaly="unusually_costly"))
     assert result.workout_type == WorkoutType.EASY
     assert result.distance_range_miles[1] < 5
+
+
+def test_strong_response_is_not_overridden_by_modest_drift() -> None:
+    state = _state(
+        recent_performance_anomaly="unusually_strong",
+        last_run_drift_percent=7.1,
+        days_since_quality_run=3,
+        quality_sessions_14d=1,
+    )
+    baseline = _recommend(
+        state.model_copy(update={"last_run_drift_percent": None})
+    )
+    result = _recommend(
+        state
+    )
+    costly = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_costly_response"
+    )
+    drift = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_drift_caution"
+    )
+
+    assert costly.fired is False
+    assert costly.facts["response_stress"] < 0.1
+    assert drift.fired is True
+    assert 0 < drift.facts["volume_reduction_fraction"] < 0.05
+    assert result.distance_range_miles == baseline.distance_range_miles
+
+
+def test_moderate_standalone_drift_scales_volume_instead_of_using_full_penalty() -> None:
+    state = _state(
+        recent_performance_anomaly="within_recent_range",
+        last_run_drift_percent=7.1,
+        days_since_quality_run=3,
+        quality_sessions_14d=1,
+    )
+    result = _recommend(state)
+    drift = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_drift_caution"
+    )
+
+    assert drift.fired is True
+    assert 0 < drift.facts["response_stress"] < 0.5
+    assert 0 < drift.facts["volume_reduction_fraction"] < 0.30
+    assert result.workout_type == WorkoutType.EASY
+    assert result.distance_range_miles[0] < typical_easy_distance(state)[0]
+    assert result.distance_range_miles[1] < typical_easy_distance(state)[1]
 
 
 def test_several_normal_runs_after_illness_can_restore_normal_eligibility() -> None:
@@ -180,6 +446,40 @@ def test_high_rpe_on_easy_run_adds_recovery_caution() -> None:
     assert trace.fired
 
 
+def test_ready_next_day_easy_distance_recovers_continuously_after_long_run() -> None:
+    state = _state(
+        as_of=datetime(2026, 8, 29, 19, tzinfo=timezone.utc),
+        days_since_last_run=1.0,
+        last_run=_difficulty(long=True, miles=6.4),
+        last_run_workout_type=WorkoutType.LONG,
+    )
+
+    next_day = recommend_next_run(
+        state,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="easy",
+    )
+    recovered = recommend_next_run(
+        state.model_copy(update={"days_since_last_run": 3.0}),
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="easy",
+    )
+    recovery_trace = next(
+        item
+        for item in next_day.rule_trace
+        if item.rule_id == "recent_recovery_load"
+    )
+
+    assert next_day.readiness.value == "ready"
+    assert recovery_trace.facts["easy_recovery_pressure"] == 0
+    assert recovery_trace.facts["easy_volume_recovery_pressure"] > 0
+    assert next_day.distance_range_miles == (3.0, 3.5)
+    assert recovered.distance_range_miles == (4.0, 5.0)
+    assert any("remaining recovery load reduces" in reason for reason in next_day.reasons)
+
+
 def test_recent_hilly_run_counts_as_mechanical_load_without_inventing_hr_points() -> None:
     result = _recommend(
         _state(
@@ -199,7 +499,7 @@ def test_high_acute_load_avoids_added_volume_orquality() -> None:
     assert any(item.rule_id == "high_recent_load" and item.fired for item in result.rule_trace)
 
 
-def test_depressed_raw_hr_norm_does_not_override_normal_retained_mileage_capacity() -> None:
+def test_high_confidence_hr_load_disagreement_adds_caution_to_mileage_capacity() -> None:
     load = _state().recent_load.model_copy(
         update={
             "acute_to_prior_ratio": 2.2,
@@ -209,8 +509,48 @@ def test_depressed_raw_hr_norm_does_not_override_normal_retained_mileage_capacit
     )
     result = _recommend(_state(recent_load=load))
     high_load = next(item for item in result.rule_trace if item.rule_id == "high_recent_load")
+    assert high_load.fired is True
+    assert high_load.facts["effective_load_ratio"] == 1.35
+    assert 0 < high_load.facts["surplus_strength"] < 0.5
+    assert result.workout_type != WorkoutType.REST
+
+
+def test_low_confidence_hr_load_disagreement_cannot_take_over_mileage_capacity() -> None:
+    load = _state().recent_load.model_copy(
+        update={
+            "acute_to_prior_ratio": 2.2,
+            "acute_distance_to_capacity_ratio": 1.1,
+            "capacity_reference_miles": 16.0,
+            "confidence": ConfidenceLevel.LOW,
+        }
+    )
+
+    result = _recommend(_state(recent_load=load))
+    high_load = next(
+        item for item in result.rule_trace if item.rule_id == "high_recent_load"
+    )
+
     assert high_load.fired is False
-    assert result.workout_type == WorkoutType.INTERVALS
+    assert high_load.facts["effective_load_ratio"] == 1.21
+
+
+def test_synthetic_hr_load_does_not_penalize_planned_week_twice() -> None:
+    load = _state().recent_load.model_copy(
+        update={
+            "acute_to_prior_ratio": 2.2,
+            "acute_distance_to_capacity_ratio": 1.1,
+            "capacity_reference_miles": 16.0,
+            "flags": ["includes_planned_sessions"],
+        }
+    )
+
+    result = _recommend(_state(recent_load=load))
+    high_load = next(
+        item for item in result.rule_trace if item.rule_id == "high_recent_load"
+    )
+
+    assert high_load.fired is False
+    assert high_load.facts["effective_load_ratio"] == 1.1
 
 
 def test_long_run_uses_rough_110_percent_reference_with_practical_rounding() -> None:
@@ -222,7 +562,8 @@ def test_long_run_uses_rough_110_percent_reference_with_practical_rounding() -> 
     )
     result = _recommend(_state(days_since_long_run=12, longest_run_30d_miles=8, recent_load=load))
     assert result.workout_type == WorkoutType.LONG
-    assert result.distance_range_miles[1] == 9.0
+    # Progression targets 5% while the separate 10% value remains a ceiling.
+    assert result.distance_range_miles == (8.25, 8.75)
     assert "rounded" in result.warnings[0]
 
 
@@ -236,9 +577,70 @@ def test_long_run_progression_cap_outranks_the_conventional_five_mile_floor() ->
     )
     result = _recommend(_state(days_since_long_run=12, longest_run_30d_miles=3, recent_load=load))
     assert result.workout_type == WorkoutType.LONG
-    # 3 miles * 1.10 = 3.3, rounded to a practical half mile.
+    # The five-mile convention cannot override the recent-session evidence.
     assert result.distance_range_miles == (3.0, 3.5)
     assert any("progression limit" in warning for warning in result.warnings)
+
+
+def test_historical_long_capacity_accelerates_return_without_replacing_guardrail() -> None:
+    load = _state().recent_load.model_copy(
+        update={"capacity_reference_miles": 18.0}
+    )
+    result = _recommend(
+        _state(
+            days_since_long_run=12,
+            longest_run_30d_miles=6.4,
+            retained_long_run_capacity_miles=8.2,
+            recent_load=load,
+        )
+    )
+
+    assert result.workout_type == WorkoutType.LONG
+    assert result.distance_range_miles == (7.0, 7.5)
+
+
+def test_completed_long_progression_can_grow_instead_of_following_decay_down() -> None:
+    load = _state().recent_load.model_copy(
+        update={"capacity_reference_miles": 30.0}
+    )
+    first = _recommend(
+        _state(
+            days_since_long_run=12,
+            longest_run_30d_miles=8.0,
+            retained_long_run_capacity_miles=8.2,
+            recent_load=load,
+        )
+    )
+    assert first.distance_range_miles is not None
+    second = _recommend(
+        _state(
+            days_since_long_run=12,
+            longest_run_30d_miles=first.distance_range_miles[1],
+            retained_long_run_capacity_miles=first.distance_range_miles[1],
+            recent_load=load,
+        )
+    )
+
+    assert first.distance_range_miles == (8.25, 8.75)
+    assert second.distance_range_miles == (9.0, 9.5)
+
+
+def test_long_run_needs_capacity_to_exceed_ordinary_easy_distance() -> None:
+    result = _recommend(
+        _state(
+            longest_run_30d_miles=2.0,
+            days_since_long_run=30.0,
+            days_since_quality_run=2.0,
+        )
+    )
+
+    trace = next(
+        item for item in result.rule_trace if item.rule_id == "long_run_eligible"
+    )
+    assert trace.facts["progression_ceiling_miles"] < trace.facts[
+        "meaningful_long_threshold_miles"
+    ]
+    assert result.workout_type != WorkoutType.LONG
 
 
 def test_easy_run_zone_instruction_follows_configured_zones() -> None:
@@ -254,6 +656,7 @@ def test_quality_session_types_rotate_and_respect_disabled_settings() -> None:
         "coaching": {
             **CONFIG["coaching"],
             "quality_sessions": {
+                "fartlek": False,
                 "short_intervals": False,
                 "long_intervals": False,
                 "threshold": False,
@@ -269,6 +672,130 @@ def test_quality_session_types_rotate_and_respect_disabled_settings() -> None:
     )
     assert result.quality_session_type == "progression"
     assert result.workout_type == WorkoutType.TEMPO_THRESHOLD
+
+
+def test_long_quality_gap_favors_adaptable_fartlek_not_forced_intervals() -> None:
+    result = _recommend(
+        _state(
+            days_since_quality_run=30,
+            completed_quality_session_count=0,
+            days_since_long_run=3,
+        )
+    )
+
+    assert result.quality_session_type == "fartlek"
+    assert result.title == "Fartlek by feel"
+    assert any(
+        "landmarks" in step.instruction and "8 controlled surges" in step.instruction
+        for step in result.structure
+    )
+    assert any("single prescribed structure" in rule for rule in result.modification_rules)
+
+
+def test_quality_workout_recommends_one_structure_not_a_menu() -> None:
+    result = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=2,
+            days_since_long_run=3,
+        )
+    )
+
+    assert result.quality_session_type == "threshold"
+    instructions = " ".join(step.instruction for step in result.structure)
+    assert "Run 18 minutes continuously" in instructions
+    assert "Choose" not in instructions
+    assert " or " not in instructions
+
+
+def test_shortened_quality_scales_work_dose_instead_of_deleting_quality() -> None:
+    settings = {
+        **CONFIG,
+        "coaching": {
+            **CONFIG["coaching"],
+            "quality_sessions": {
+                "fartlek": False,
+                "short_intervals": False,
+                "long_intervals": False,
+                "threshold": True,
+                "progression": False,
+                "hill_repeats": False,
+            },
+        },
+    }
+    original = _recommend(
+        _state(days_since_quality_run=12, days_since_long_run=3),
+        config=settings,
+    )
+
+    shortened = scale_quality_session(
+        original,
+        original.distance_range_miles,
+        (3.0, 3.5),
+    )
+
+    assert shortened.workout_type == WorkoutType.TEMPO_THRESHOLD
+    assert shortened.quality_session_type == "threshold"
+    assert shortened.structure[1].duration_minutes == 13
+    assert "Run 13 minutes continuously" in shortened.structure[1].instruction
+    assert any("instead of deleting" in reason for reason in shortened.reasons)
+
+
+def test_only_two_hour_quality_sessions_expand_to_multi_part_structure() -> None:
+    ordinary = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=2,
+            days_since_long_run=3,
+        )
+    )
+
+    assert structure_extended_quality_session(ordinary, 45.0) == ordinary
+
+    allocated = structure_extended_quality_session(ordinary, 60.0)
+    assert allocated.title == ordinary.title
+    assert any(
+        "full prescribed distance is accounted for" in step.instruction
+        for step in allocated.structure
+    )
+    assert any(
+        "fixed quality dose" in reason for reason in allocated.reasons
+    )
+
+    extended = structure_extended_quality_session(ordinary, 150.0)
+    instructions = " ".join(step.instruction for step in extended.structure)
+    assert extended.title == "Extended aerobic session with threshold blocks"
+    assert "3 × 12 minutes" in instructions
+    assert "150 minutes total" in instructions
+    assert "Do not add more quality work" in instructions
+    assert any("quality dose is capped" in reason for reason in extended.reasons)
+
+
+def test_general_fitness_quality_stimuli_rotate_without_random_plan_churn() -> None:
+    first = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=0,
+            days_since_long_run=3,
+        )
+    )
+    second = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=1,
+            days_since_long_run=3,
+        )
+    )
+
+    assert first.quality_session_type == "fartlek"
+    assert second.quality_session_type == "progression"
+    assert _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=0,
+            days_since_long_run=3,
+        )
+    ).quality_session_type == first.quality_session_type
 
 
 def test_long_run_recency_is_outweighed_by_high_load() -> None:
