@@ -164,6 +164,7 @@ class FitnessObservation(ApiModel):
     contributions: list[AdjustmentContribution] = Field(default_factory=list)
     confidence: ConfidenceLevel
     included_in_trend: bool
+    trend_weight: float = Field(default=0.0, ge=0, le=1)
     exclusion_reasons: list[str] = Field(default_factory=list)
 
 
@@ -515,6 +516,20 @@ class FitnessCoverageItem(ApiModel):
     reason: str
 
 
+class QualityPerformancePoint(ApiModel):
+    """A workout-specific work block, kept separate from aerobic trend pace."""
+
+    activity_id: int
+    start_time: datetime
+    workout_type: WorkoutType
+    source: str
+    duration_minutes: float = Field(gt=0)
+    distance_miles: float | None = Field(default=None, gt=0)
+    pace_min_mile: float | None = Field(default=None, gt=0)
+    average_hr_bpm: float | None = Field(default=None, gt=0)
+    maximum_hr_bpm: float | None = Field(default=None, gt=0)
+
+
 class Vo2TrendPoint(ApiModel):
     as_of: datetime
     value_ml_kg_min: float = Field(gt=0)
@@ -578,6 +593,7 @@ class ProgressResponse(ApiModel):
     trend_28d: list[FitnessTrendPoint]
     steady_aerobic: FitnessBenchmarkSummary
     activity_coverage: list[FitnessCoverageItem] = Field(default_factory=list)
+    quality_performance: list[QualityPerformancePoint] = Field(default_factory=list)
     period_comparison: PeriodComparison
     current_load: LoadContext
     consistency: ConsistencySummary

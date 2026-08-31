@@ -8,6 +8,7 @@ import json
 import sqlite3
 
 from .analytics import build_fitness_analytics
+from .fitness_evidence import trend_evidence_reason, trend_evidence_weight
 from .segmentation import METERS_PER_MILE
 from .training_load import (
     TrainingSession,
@@ -24,6 +25,7 @@ from .web.schemas import (
     FitnessPoint,
     FitnessBenchmarkSummary,
     FitnessCoverageItem,
+    QualityPerformancePoint,
     FitnessTrend,
     FitnessTrendPoint,
     IntensitySummary,
@@ -72,23 +74,12 @@ def _workout(value: str | None) -> WorkoutType:
         return WorkoutType.UNKNOWN
 
 
-def _trend_evidence_weight(health_tag: str, workout: WorkoutType) -> float:
-    """Reliability weight for trend interpretation; load always remains full weight."""
-    health_weight = {
-        "normal": 1.0,
-        "illness_recovery": 0.65,
-        "illness": 0.25,
-        "injury_affected": 0.25,
-    }.get(health_tag, 0.5)
-    workout_weight = {
-        WorkoutType.INTERVALS: 0.0,
-        WorkoutType.TEMPO_THRESHOLD: 0.0,
-        WorkoutType.RACE: 0.0,
-        WorkoutType.RUN_WALK: 0.5,
-        WorkoutType.HIKE: 0.0,
-        WorkoutType.BIKE: 0.0,
-    }.get(workout, 1.0)
-    return health_weight * workout_weight
+def _trend_evidence_weight(
+    health_tag: str, workout: WorkoutType, result: dict | None = None
+) -> float:
+    """Backward-compatible local name for the shared evidence policy."""
+
+    return trend_evidence_weight(health_tag, workout, result)
 
 
 def _load_window(value) -> LoadWindow:
@@ -171,7 +162,7 @@ def _scored_runs(
         health_tag = str(row["health_tag"] or "normal")
         activity_id = int(row["id"])
         workout = details.get(activity_id, {}).get("workout") or _workout(row["workout_type"])
-        trend_weight = _trend_evidence_weight(health_tag, workout)
+        trend_weight = _trend_evidence_weight(health_tag, workout, result)
         included_in_trend = trend_weight > 0
         if included_in_trend:
             analytics_rows.append(
@@ -311,7 +302,7 @@ def _activity_coverage(
         workout = _workout(row["workout_type"])
         health_tag = str(row["health_tag"] or "normal")
         result = json.loads(row["result_json"]) if row["result_json"] else None
-        trend_weight = _trend_evidence_weight(health_tag, workout) if result else 0.0
+        trend_weight = _trend_evidence_weight(health_tag, workout, result) if result else 0.0
         included = trend_weight > 0
         estimate_quality = str(result.get("estimate_quality") or "full_sensor") if result else ""
         if result and estimate_quality != "full_sensor" and included:
@@ -320,17 +311,18 @@ def _activity_coverage(
             added_uncertainty = float(result.get("fallback_uncertainty_95_min_mile") or 0.0) * 60.0
             reason = (
                 f"Estimated from Garmin distance because GPS covered {gps_percent:.0f}% of the run. "
-                f"Allow about {added_uncertainty:.0f} sec/mi of extra variation."
+                f"Allow about {added_uncertainty:.0f} sec/mi of extra variation. "
+                + trend_evidence_reason(health_tag, workout, trend_weight, result)
             )
-        elif result and trend_weight == 1:
+        elif result and trend_weight >= 0.999:
             status = "trend_evidence"
-            reason = "Used normally in the fitness trend."
+            reason = trend_evidence_reason(health_tag, workout, trend_weight, result)
         elif result and included:
             status = "reduced_weight"
-            reason = f"Used with less influence because it is tagged {health_tag.replace('_', ' ')}."
+            reason = trend_evidence_reason(health_tag, workout, trend_weight, result)
         elif result:
             status = "context_only"
-            reason = f"Shown here, but {workout.value.replace('_', ' ')} is not compared with ordinary aerobic runs."
+            reason = trend_evidence_reason(health_tag, workout, trend_weight, result)
         elif workout == WorkoutType.INTERVALS:
             status = "workout_specific"
             reason = "Analyzed as an interval workout, not as a steady aerobic run."
@@ -355,6 +347,42 @@ def _activity_coverage(
                 included_in_trend=included,
                 trend_weight=trend_weight,
                 reason=reason,
+            )
+        )
+    return output
+
+
+def _quality_performance(
+    connection: sqlite3.Connection, start: datetime, end: datetime
+) -> list[QualityPerformancePoint]:
+    rows = connection.execute(
+        """
+        SELECT a.id,a.start_time_utc,o.workout_type,mr.result_json
+        FROM model_runs mr JOIN activities a ON a.id=mr.activity_id
+        LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        WHERE mr.model_name='standardized_pace_at_target_hr'
+          AND a.start_time_utc_epoch>? AND a.start_time_utc_epoch<=?
+        ORDER BY a.start_time_utc_epoch DESC,a.id DESC
+        """,
+        (start.timestamp(), end.timestamp()),
+    ).fetchall()
+    output: list[QualityPerformancePoint] = []
+    for row in rows:
+        result = json.loads(row["result_json"])
+        quality = result.get("quality_performance")
+        if not isinstance(quality, dict) or not quality.get("duration_minutes"):
+            continue
+        output.append(
+            QualityPerformancePoint(
+                activity_id=int(row["id"]),
+                start_time=datetime.fromisoformat(row["start_time_utc"]),
+                workout_type=_workout(row["workout_type"]),
+                source=str(quality.get("source") or "detected_work_block"),
+                duration_minutes=float(quality["duration_minutes"]),
+                distance_miles=_optional_float(quality.get("distance_miles")),
+                pace_min_mile=_optional_float(quality.get("pace_min_mile")),
+                average_hr_bpm=_optional_float(quality.get("average_hr_bpm")),
+                maximum_hr_bpm=_optional_float(quality.get("maximum_hr_bpm")),
             )
         )
     return output
@@ -613,6 +641,7 @@ def build_progress(
         trend_28d=trend_28d_points,
         steady_aerobic=steady_summary,
         activity_coverage=_activity_coverage(connection, current_start, as_of),
+        quality_performance=_quality_performance(connection, current_start, as_of),
         period_comparison=comparison,
         current_load=current_load,
         consistency=consistency,

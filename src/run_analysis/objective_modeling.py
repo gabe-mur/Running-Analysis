@@ -21,9 +21,10 @@ import numpy as np
 
 from .model_windows import load_model_window_sets, load_overlapping_model_windows
 from .physiology import estimated_shade_wbgt_f
+from .quality_phases import ContinuousQualityPhase, detect_continuous_quality_phase
 
 METERS_PER_MILE = 1609.344
-MODEL_VERSION = "aerobic-v9-shared-time-effect"
+MODEL_VERSION = "aerobic-v10-quality-phase-aware"
 
 
 def pace_to_speed_mps(pace_min_mile: float) -> float:
@@ -181,7 +182,12 @@ def _robust_weighted_speed(values: list[float], weights: list[float]) -> float:
 
 
 def _reference_time_support(
-    minutes_into_run: list[float], reference_minutes: float, config: dict
+    minutes_into_run: list[float],
+    reference_minutes: float,
+    config: dict,
+    *,
+    maximum_gap_override: float | None = None,
+    uncertainty_scale_override: float | None = None,
 ) -> tuple[bool, float, float, str]:
     """Classify interpolation/extrapolation support without using total duration."""
 
@@ -192,16 +198,43 @@ def _reference_time_support(
         return True, 1.0, 0.0, "interpolation"
     gap = min(abs(reference_minutes - low), abs(reference_minutes - high))
     settings = config["model"]
-    maximum_gap = float(settings.get("maximum_reference_extrapolation_minutes", 5.0))
+    maximum_gap = (
+        float(maximum_gap_override)
+        if maximum_gap_override is not None
+        else float(settings.get("maximum_reference_extrapolation_minutes", 5.0))
+    )
     if gap > maximum_gap:
         return False, float("inf"), gap, "unsupported_extrapolation"
-    scale = float(
-        settings.get(
-            "reference_extrapolation_uncertainty_scale_minutes",
-            max(0.5, float(settings["primary_window_seconds"]) / 120.0),
+    scale = (
+        float(uncertainty_scale_override)
+        if uncertainty_scale_override is not None
+        else float(
+            settings.get(
+                "reference_extrapolation_uncertainty_scale_minutes",
+                max(0.5, float(settings["primary_window_seconds"]) / 120.0),
+            )
         )
     )
     return True, math.sqrt(1.0 + (gap / scale) ** 2), gap, "limited_extrapolation"
+
+
+def _pre_quality_indexes(
+    rows: list[dict[str, Any]],
+    indexes: list[int],
+    phase: ContinuousQualityPhase | None,
+) -> list[int]:
+    """Keep only windows completed before a structured quality block starts."""
+
+    if phase is None:
+        return indexes
+    activity_start = datetime.fromisoformat(rows[indexes[0]]["start_time_utc"])
+    quality_start = activity_start.timestamp() + phase.start_offset_seconds
+    return [
+        index
+        for index in indexes
+        if datetime.fromisoformat(rows[index]["window_end_time_utc"]).timestamp()
+        <= quality_start
+    ]
 
 
 def _weighted_mean(values: list[float], weights: list[float]) -> float:
@@ -593,6 +626,13 @@ def fit_published_reference_model(
     grouped: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
         grouped[int(row["activity_id"])].append(index)
+    quality_phases: dict[int, ContinuousQualityPhase] = {}
+    for activity_id, indexes in grouped.items():
+        if str(rows[indexes[0]].get("workout_type") or "") != "tempo_threshold":
+            continue
+        phase = detect_continuous_quality_phase(connection, config, activity_id)
+        if phase is not None:
+            quality_phases[activity_id] = phase
     # Use every reliable overlapping window. Relevance and transition quality
     # affect weight continuously; no best-section selection determines the run.
     comparable_grouped = grouped
@@ -655,13 +695,21 @@ def fit_published_reference_model(
     benchmark_grouped: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(benchmark_rows):
         benchmark_grouped[int(row["activity_id"])].append(index)
+    phase_safe_benchmark_grouped = {
+        activity_id: _pre_quality_indexes(
+            benchmark_rows, indexes, quality_phases.get(activity_id)
+        )
+        for activity_id, indexes in benchmark_grouped.items()
+    }
     selected_benchmark = {
         activity_id: select_steady_aerobic_window(benchmark_rows, indexes, config)
-        for activity_id, indexes in benchmark_grouped.items()
+        for activity_id, indexes in phase_safe_benchmark_grouped.items()
+        if indexes
     }
     fallback_benchmark = {
         activity_id: select_fixed_time_benchmark_fallback(benchmark_rows, indexes, config)
-        for activity_id, indexes in benchmark_grouped.items()
+        for activity_id, indexes in phase_safe_benchmark_grouped.items()
+        if indexes
     }
     centered_residuals = []
     for indexes in grouped.values():
@@ -700,11 +748,20 @@ def fit_published_reference_model(
     )
     connection.execute(
         "UPDATE activity_metrics SET exclusion_reason=NULL "
-        "WHERE exclusion_reason='reference_time_unsupported_by_run_windows'"
+        "WHERE exclusion_reason IN "
+        "('reference_time_unsupported_by_run_windows','no_pre_quality_aerobic_windows')"
     )
 
     run_paces = []
-    for activity_id, indexes in comparable_grouped.items():
+    for activity_id, all_indexes in comparable_grouped.items():
+        phase = quality_phases.get(activity_id)
+        indexes = _pre_quality_indexes(rows, all_indexes, phase)
+        if not indexes:
+            connection.execute(
+                "UPDATE activity_metrics SET exclusion_reason=? WHERE activity_id=?",
+                ("no_pre_quality_aerobic_windows", activity_id),
+            )
+            continue
         run_rows = [rows[index] for index in indexes]
         weights = [window_weights[index] for index in indexes]
         run_minutes = [float(rows[index]["moving_minutes_into_run"]) for index in indexes]
@@ -883,7 +940,7 @@ def fit_published_reference_model(
             "measurement_uncertainty_95_min_mile": measurement_uncertainty,
             "heat_coefficient_uncertainty_95_min_mile": heat_coefficient_uncertainty,
             "segment_count": len(indexes),
-            "available_window_count": len(grouped[activity_id]),
+            "available_window_count": len(all_indexes),
             "selected_window_count": len(indexes),
             "effective_window_count": effective_n,
             "estimate_quality": (
@@ -904,12 +961,31 @@ def fit_published_reference_model(
             "reference_time_support_multiplier": time_support_multiplier,
             "reference_time_support": reference_support_kind,
             "reference_time_extrapolation_minutes": extrapolation_minutes,
+            "fitness_evidence_phase": (
+                "pre_quality_only" if phase is not None else "whole_run"
+            ),
+            "quality_excluded_window_count": len(all_indexes) - len(indexes),
+            "quality_performance": (
+                {
+                    "source": "recorded_continuous_work_lap",
+                    "lap_number": phase.lap_index + 1,
+                    "duration_minutes": phase.duration_seconds / 60.0,
+                    "distance_miles": phase.distance_miles,
+                    "pace_min_mile": phase.pace_min_mile,
+                    "average_hr_bpm": phase.average_hr_bpm,
+                    "maximum_hr_bpm": phase.maximum_hr_bpm,
+                }
+                if phase is not None
+                else None
+            ),
             "grade_adjusted_windows": grade_adjusted_count,
             "grade_unavailable_windows": len(run_rows) - grade_adjusted_count,
             "contributions_min_mile": contributions,
             "adjustment_evidence": adjustment_evidence,
             "interpretation": (
-                "higher-uncertainty estimate from Garmin device-distance windows at reference HR/time/conditions"
+                "pre-quality aerobic windows only; work and cooldown are tracked separately"
+                if phase is not None
+                else "higher-uncertainty estimate from Garmin device-distance windows at reference HR/time/conditions"
                 if uses_device_fallback
                 else "shared HR/time effects plus robust run-specific performance offset at reference conditions"
             ),

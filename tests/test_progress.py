@@ -43,6 +43,83 @@ def test_illness_recovery_runs_have_65_percent_fitness_trend_weight() -> None:
     assert _trend_evidence_weight("illness", WorkoutType.EASY) == pytest.approx(0.25)
 
 
+def test_quality_runs_receive_evidence_based_influence_instead_of_a_hard_zero() -> None:
+    strict = {
+        "effective_window_count": 6,
+        "reference_time_support": "interpolation",
+        "steady_aerobic_benchmark": {
+            "selection_quality": "strict_observed",
+            "window_evidence_weight": 1.0,
+        },
+    }
+    estimated = {
+        "effective_window_count": 6,
+        "reference_time_support": "interpolation",
+        "steady_aerobic_benchmark": {
+            "selection_quality": "estimated_fixed_time",
+            "window_evidence_weight": 0.1,
+        },
+    }
+
+    strict_tempo = _trend_evidence_weight("normal", WorkoutType.TEMPO_THRESHOLD, strict)
+    estimated_tempo = _trend_evidence_weight(
+        "normal", WorkoutType.TEMPO_THRESHOLD, estimated
+    )
+    estimated_intervals = _trend_evidence_weight(
+        "normal", WorkoutType.INTERVALS, estimated
+    )
+
+    assert strict_tempo == pytest.approx(0.65)
+    assert 0 < estimated_intervals < estimated_tempo < strict_tempo < 1
+    assert _trend_evidence_weight("normal", WorkoutType.HIKE, strict) == 0
+
+
+def test_progress_uses_a_scored_tempo_run_with_reduced_influence(tmp_path: Path) -> None:
+    anchor = datetime.now(timezone.utc)
+    with connect(tmp_path / "tempo-progress.sqlite") as connection:
+        initialize(connection)
+        activity_id = _insert_run(connection, 1, anchor - timedelta(days=1), 4.4, 44, 100)
+        connection.execute(
+            "INSERT INTO run_overrides(activity_id,workout_type,health_tag) "
+            "VALUES ('external-1','tempo_threshold','normal')"
+        )
+        connection.execute(
+            "INSERT INTO model_runs(activity_id,model_name,model_version,result_json) VALUES (?,?,?,?)",
+            (
+                activity_id,
+                "standardized_pace_at_target_hr",
+                "test",
+                json.dumps(
+                    {
+                        "raw_pace_at_target_hr_min_mile": 10.8,
+                        "standardized_pace_at_target_hr_min_mile": 10.6,
+                        "uncertainty_95_min_mile": 0.65,
+                        "effective_window_count": 7.5,
+                        "reference_time_support": "interpolation",
+                        "steady_aerobic_benchmark": {
+                            "selection_quality": "estimated_fixed_time",
+                            "window_evidence_weight": 0.1,
+                            "raw_pace_at_target_hr_min_mile": 10.7,
+                            "standardized_pace_at_target_hr_min_mile": 10.5,
+                            "uncertainty_95_min_mile": 1.0,
+                        },
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+        progress = build_progress(connection, 28)
+
+    point = progress.series[0]
+    coverage = progress.activity_coverage[0]
+    assert point.included_in_trend is True
+    assert point.trend_weight == pytest.approx(0.65 * 0.59)
+    assert coverage.score_status == "reduced_weight"
+    assert coverage.trend_weight == pytest.approx(point.trend_weight)
+    assert "38% influence" in coverage.reason
+    assert progress.current_pace is not None
+
+
 def test_progress_keeps_pace_volume_and_intensity_as_separate_dimensions(tmp_path: Path) -> None:
     anchor = datetime.now(timezone.utc)
     with connect(tmp_path / "progress.sqlite") as connection:

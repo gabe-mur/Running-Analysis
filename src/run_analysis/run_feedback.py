@@ -11,6 +11,7 @@ import sqlite3
 from .config import load_config, resolve_project_path
 from .db import connect, initialize
 from .cadence_feedback import build_cadence_analysis
+from .fitness_evidence import trend_evidence_reason, trend_evidence_weight
 from .movement import MovementInterval, attach_elevation_deltas, classify_movement
 from .processing import _load_points
 from .prescription_matching import prescribed_recommendation_from_row
@@ -304,7 +305,11 @@ def assess_cardiac_drift(
     )
 
 
-def _fitness_observation(row: sqlite3.Row) -> FitnessObservation | None:
+def _fitness_observation(
+    row: sqlite3.Row,
+    workout: WorkoutType,
+    health: ActivityHealthTag,
+) -> FitnessObservation | None:
     if not row["result_json"]:
         return None
     result = json.loads(row["result_json"])
@@ -337,6 +342,7 @@ def _fitness_observation(row: sqlite3.Row) -> FitnessObservation | None:
         )
     uncertainty = float(result.get("uncertainty_95_min_mile") or 0)
     confidence = ConfidenceLevel.MODERATE if uncertainty <= 0.5 else ConfidenceLevel.LOW
+    weight = trend_evidence_weight(health.value, workout, result)
     return FitnessObservation(
         activity_id=int(row["id"]),
         activity_uid=str(row["activity_uid"]),
@@ -348,7 +354,13 @@ def _fitness_observation(row: sqlite3.Row) -> FitnessObservation | None:
         comparable_window_minutes=None,
         contributions=contributions,
         confidence=confidence,
-        included_in_trend=True,
+        included_in_trend=weight > 0,
+        trend_weight=weight,
+        exclusion_reasons=(
+            []
+            if weight >= 0.999
+            else [trend_evidence_reason(health.value, workout, weight, result)]
+        ),
     )
 
 
@@ -609,7 +621,7 @@ def _row_summary(row: sqlite3.Row) -> RunSummary:
         workout_type=workout,
         health_tag=health,
         data_quality=_data_quality(row, load.hr_coverage),
-        fitness_observation=_fitness_observation(row),
+        fitness_observation=_fitness_observation(row, workout, health),
         session_difficulty=_difficulty(row, workout, zones),
     )
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +11,12 @@ from fastapi.testclient import TestClient
 from run_analysis.db import connect, initialize
 from run_analysis.models import Trackpoint
 from run_analysis.movement import MovementInterval
-from run_analysis.run_feedback import _feedback_text, assess_cardiac_drift, build_mile_splits
+from run_analysis.run_feedback import (
+    _feedback_text,
+    _fitness_observation,
+    assess_cardiac_drift,
+    build_mile_splits,
+)
 from run_analysis.web.app import create_app
 from run_analysis.web.schemas import (
     ActivityHealthTag,
@@ -104,6 +111,35 @@ def test_drift_rejects_a_material_finishing_surge() -> None:
     assert result.valid is False
     assert "final 10%" in result.reason
     assert "not a steady-state" in result.reason
+
+
+def test_run_feedback_reports_the_same_reduced_tempo_weight_as_progress() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    result = {
+        "raw_pace_at_target_hr_min_mile": 10.8,
+        "standardized_pace_at_target_hr_min_mile": 10.6,
+        "uncertainty_95_min_mile": 0.65,
+        "effective_window_count": 7.5,
+        "reference_time_support": "interpolation",
+        "steady_aerobic_benchmark": {
+            "selection_quality": "estimated_fixed_time",
+            "window_evidence_weight": 0.1,
+        },
+    }
+    row = connection.execute(
+        "SELECT 1 AS id, 'uid' AS activity_uid, ? AS start_time_utc, ? AS result_json",
+        (datetime.now(timezone.utc).isoformat(), json.dumps(result)),
+    ).fetchone()
+
+    observation = _fitness_observation(
+        row, WorkoutType.TEMPO_THRESHOLD, ActivityHealthTag.NORMAL
+    )
+
+    assert observation is not None
+    assert observation.included_in_trend is True
+    assert observation.trend_weight == pytest.approx(0.65 * 0.59)
+    assert "38% influence" in observation.exclusion_reasons[0]
 
 
 def test_assessment_is_a_run_specific_single_sentence() -> None:

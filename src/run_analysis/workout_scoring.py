@@ -14,6 +14,7 @@ import sqlite3
 
 from .movement import MovementInterval
 from .processing import _load_points
+from .quality_phases import detect_continuous_quality_phase
 from .segmentation import METERS_PER_MILE
 from .web.schemas import (
     ConfidenceLevel,
@@ -652,36 +653,13 @@ def _recorded_continuous_quality_lap(
     config: dict,
     activity_id: int,
 ) -> tuple[float, float | None, int] | None:
-    laps = connection.execute(
-        """
-        SELECT lap_index,total_time_s,average_hr_bpm
-        FROM laps WHERE activity_id=? ORDER BY lap_index
-        """,
-        (activity_id,),
-    ).fetchall()
-    if len(laps) < 3:
+    selected = detect_continuous_quality_phase(connection, config, activity_id)
+    if selected is None:
         return None
-    z3_floor = float(config["zones"]["z3"][0])
-    candidates = [
-        row
-        for row in laps[1:-1]
-        if 8 * 60 <= float(row["total_time_s"] or 0) <= 40 * 60
-        and row["average_hr_bpm"] is not None
-        and float(row["average_hr_bpm"]) >= z3_floor
-    ]
-    if not candidates:
-        return None
-    selected = max(
-        candidates,
-        key=lambda row: (
-            float(row["average_hr_bpm"]),
-            float(row["total_time_s"]),
-        ),
-    )
     return (
-        float(selected["total_time_s"]) / 60,
-        float(selected["average_hr_bpm"]),
-        int(selected["lap_index"]) + 1,
+        selected.duration_seconds / 60,
+        selected.average_hr_bpm,
+        selected.lap_index + 1,
     )
 
 
@@ -708,6 +686,9 @@ def analyze_workout(
             )
             if sustained is not None:
                 minutes, average_hr, lap_number = sustained
+                phase = detect_continuous_quality_phase(
+                    connection, config, activity_id
+                )
                 execution = analysis.execution.model_copy(
                     update={
                         "status": "Structured threshold work detected",
@@ -721,7 +702,11 @@ def analyze_workout(
                             _metric(
                                 "Continuous work lap",
                                 f"{minutes:.1f} min",
-                                f"Recorded lap {lap_number}; average HR {average_hr:.0f} bpm.",
+                                (
+                                    f"Recorded lap {lap_number}; "
+                                    f"{_pace_text(phase.pace_min_mile if phase else None)}; "
+                                    f"average HR {average_hr:.0f} bpm."
+                                ),
                             ),
                         ],
                     }
