@@ -111,6 +111,9 @@ coaching:
   training_goal: general_fitness
   goal_date: null
   goal_pace_min_mile: null
+  # Planning midpoint above demonstrated capacity in general-fitness mode.
+  # This is earned through completed work, not promised week-over-week growth.
+  general_fitness_progression_fraction: 0.08
   long_run_progression_factor: 1.10
   # Ordinary build target; the separate progression factor remains the ceiling.
   long_run_target_progression_fraction: 0.05

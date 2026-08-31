@@ -58,6 +58,7 @@ def settings_response(config: dict[str, Any], stages: list[UploadStage] | None =
         "training_goal": "general_fitness",
         "goal_date": None,
         "goal_pace_min_mile": None,
+        "general_fitness_progression_fraction": 0.08,
         "long_run_progression_factor": 1.10,
         "long_run_target_progression_fraction": 0.05,
         "high_load_ratio": 1.30,

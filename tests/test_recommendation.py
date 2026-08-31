@@ -103,6 +103,12 @@ def _recommend(state: FitnessState, status=CurrentHealthStatus.NORMAL, config=No
     )
 
 
+def test_typical_easy_distance_prefers_observed_easy_run_baseline() -> None:
+    state = _state(typical_easy_run_miles=4.0)
+
+    assert typical_easy_distance(state) == (3.5, 4.0)
+
+
 def test_low_load_three_days_rest_and_no_recent_quality_can_be_quality_eligible() -> None:
     result = _recommend(_state(days_since_quality_run=12, days_since_long_run=3))
     assert result.workout_type == WorkoutType.INTERVALS

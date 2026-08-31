@@ -10,7 +10,7 @@ import sqlite3
 from .privacy import private_directory, private_file
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -227,6 +227,7 @@ def initialize(connection: sqlite3.Connection) -> None:
     _migrate_v11(connection)
     _migrate_v12(connection)
     _migrate_v13(connection)
+    _migrate_v14(connection)
     connection.commit()
 
 
@@ -568,3 +569,39 @@ def _migrate_v13(connection: sqlite3.Connection) -> None:
     """
 
     _add_columns(connection, "trackpoints", ["pause_after_s REAL"])
+
+
+def _migrate_v14(connection: sqlite3.Connection) -> None:
+    """Retain prescriptions so delayed uploads can reconcile against them."""
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS planned_workout_history (
+            id INTEGER PRIMARY KEY,
+            schedule_generated_at TEXT NOT NULL,
+            plan_date TEXT NOT NULL,
+            planned_for TEXT NOT NULL,
+            workout_type TEXT NOT NULL,
+            quality_session_type TEXT,
+            title TEXT NOT NULL,
+            distance_low_miles REAL,
+            distance_high_miles REAL,
+            recommendation_json TEXT NOT NULL,
+            UNIQUE(schedule_generated_at, plan_date, planned_for)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_planned_workout_time
+            ON planned_workout_history(planned_for);
+
+        CREATE TABLE IF NOT EXISTS activity_plan_matches (
+            activity_id INTEGER PRIMARY KEY
+                REFERENCES activities(id) ON DELETE CASCADE,
+            planned_workout_id INTEGER NOT NULL
+                REFERENCES planned_workout_history(id),
+            timing_delta_hours REAL NOT NULL,
+            distance_delta_miles REAL NOT NULL,
+            match_confidence TEXT NOT NULL,
+            matched_at_utc TEXT NOT NULL
+        );
+        """
+    )

@@ -24,6 +24,8 @@ function renderAdjustment(observation, workoutType) {
 
 function renderWorkoutAnalysis(analysis) {
   if (!analysis) return "";
+  const prescribed = analysis.prescription_match;
+  const prescriptionCard = prescribed ? `<article class="wide-card"><div class="card-heading"><div><p class="eyebrow">Prescribed workout match</p><h2>${escapeHtml(prescribed.execution_status)}</h2></div><span class="quality ${prescribed.confidence}">${escapeHtml(prescribed.confidence)}</span></div><p>${escapeHtml(prescribed.summary)}</p><ul class="analysis-metrics"><li><span>Workout</span><strong>${escapeHtml(prescribed.title)}</strong><small>Planned ${dateLabel(prescribed.planned_for)}</small></li><li><span>Quality work</span><strong>${Number.isFinite(prescribed.detected_work_minutes) ? `${number(prescribed.detected_work_minutes, 1)} min detected` : "Not isolated"}</strong><small>${Number.isFinite(prescribed.target_work_minutes) ? `${number(prescribed.target_work_minutes, 0)} min prescribed · ` : ""}${escapeHtml(prescribed.detection_source.replaceAll("_", " "))}</small></li><li><span>Schedule match</span><strong>${number(prescribed.timing_delta_hours, 1)} hr · ${number(prescribed.distance_delta_miles, 2)} mi</strong><small>Absolute difference from the saved prescription</small></li></ul></article>` : "";
   const dimensions = [["Execution", analysis.execution], ["Control", analysis.control], ["Stimulus", analysis.stimulus], ["Recovery", analysis.recovery]];
   const cards = dimensions.map(([name, item]) => `<article class="analysis-dimension"><div class="card-heading"><h3>${name}</h3><span class="quality ${item.confidence}">${escapeHtml(item.status)}</span></div><p>${escapeHtml(item.summary)}</p><ul>${item.metrics.map((metric) => `<li><span>${escapeHtml(metric.name)}</span><strong>${escapeHtml(metric.value)}</strong><small>${escapeHtml(metric.detail)}</small></li>`).join("")}</ul></article>`).join("");
   const intervals = analysis.interval_analysis;
@@ -47,7 +49,7 @@ function renderWorkoutAnalysis(analysis) {
   const progression = analysis.progression_recommendation
     ? `<article class="wide-card progression-note"><p class="eyebrow">Before you repeat this</p><p class="progression-text">${escapeHtml(analysis.progression_recommendation)}</p></article>`
     : "";
-  return `<section class="workout-analysis"><div class="card-heading"><div><p class="eyebrow">Workout analysis</p><h2>How the workout went</h2></div></div><div class="analysis-grid">${cards}</div>${intervalTable}${comparison}${progression}</section>`;
+  return `<section class="workout-analysis"><div class="card-heading"><div><p class="eyebrow">Workout analysis</p><h2>How the workout went</h2></div></div>${prescriptionCard}<div class="analysis-grid">${cards}</div>${intervalTable}${comparison}${progression}</section>`;
 }
 
 function cadenceCard(cadence) {

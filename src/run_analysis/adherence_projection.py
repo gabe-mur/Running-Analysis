@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from statistics import median_high
 
 from .durability import retained_long_run_capacity
 from .training_load import (
@@ -188,6 +189,12 @@ def _state_at(
         run for run in completed
         if as_of - timedelta(days=28) < run.start_time <= as_of
     ]
+    recent_easy_distances = [
+        run.distance_miles
+        for run in recent_28_runs
+        if run.workout_type == WorkoutType.EASY
+        and run.distance_miles > 0
+    ]
     prior_28 = [
         run for run in completed
         if as_of - timedelta(days=35) < run.start_time <= as_of - timedelta(days=7)
@@ -239,6 +246,11 @@ def _state_at(
             ),
             "running_days_28d": len(
                 {run.start_time.date() for run in recent_28_runs}
+            ),
+            "typical_easy_run_miles": (
+                median_high(recent_easy_distances)
+                if recent_easy_distances
+                else template.typical_easy_run_miles
             ),
             "easy_fraction_14d": (
                 max(0.0, 1.0 - (moderate_minutes + hard_minutes) / known_minutes)
@@ -379,7 +391,8 @@ def simulate_adherence(
             miles = sum(item.distance_range_miles) / 2.0
             assumed_total += miles
             workout_labels.append(
-                f"{item.planned_for.strftime('%a')} {item.workout_type.value} {miles:.1f}"
+                f"{item.planned_for.strftime('%a')} {item.workout_type.value} "
+                f"[{item.title}] {miles:.1f}"
             )
             history.append(
                 ProjectionRun(

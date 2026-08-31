@@ -13,6 +13,7 @@ from .db import connect, initialize
 from .cadence_feedback import build_cadence_analysis
 from .movement import MovementInterval, attach_elevation_deltas, classify_movement
 from .processing import _load_points
+from .prescription_matching import prescribed_recommendation_from_row
 from .segmentation import METERS_PER_MILE
 from .training_load import (
     TrainingSession,
@@ -551,7 +552,12 @@ def _feedback_text(
 
 RUN_SELECT = """
     SELECT a.*,m.*,
-           o.workout_type,o.include_in_model,o.illness,o.notes AS override_notes,o.health_tag,o.perceived_exertion,
+           COALESCE(o.workout_type,ph.workout_type) AS workout_type,
+           o.include_in_model,o.illness,o.notes AS override_notes,o.health_tag,o.perceived_exertion,
+           ph.recommendation_json AS prescribed_recommendation_json,
+           ap.timing_delta_hours AS prescription_timing_delta_hours,
+           ap.distance_delta_miles AS prescription_distance_delta_miles,
+           ap.match_confidence AS prescription_match_confidence,
            lo.postal_code,lo.locality AS location_locality,lo.region AS location_region,
            w.temperature_f,w.dewpoint_f,w.apparent_temperature_f,w.relative_humidity_percent,
            w.wind_speed_mph,w.wind_gust_mph,w.headwind_mph,w.precipitation_in,w.weather_quality,
@@ -563,6 +569,8 @@ RUN_SELECT = """
            (SELECT result_json FROM model_runs mr WHERE mr.activity_id=a.id ORDER BY mr.id DESC LIMIT 1) AS result_json
     FROM activities a LEFT JOIN activity_metrics m ON m.activity_id=a.id
     LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+    LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+    LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
     LEFT JOIN activity_location_overrides lo ON lo.activity_id=a.id
     LEFT JOIN activity_weather w ON w.activity_id=a.id
 """
@@ -664,6 +672,16 @@ def get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], act
         drift,
         splits,
         movement.intervals,
+        prescription=prescribed_recommendation_from_row(row),
+        prescription_timing_delta_hours=float(
+            row["prescription_timing_delta_hours"] or 0
+        ),
+        prescription_distance_delta_miles=float(
+            row["prescription_distance_delta_miles"] or 0
+        ),
+        prescription_match_confidence=str(
+            row["prescription_match_confidence"] or "moderate"
+        ),
     )
     assessment, positives, cautions = _feedback_text(
         summary, metadata, drift, workout_analysis

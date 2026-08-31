@@ -16,6 +16,9 @@ from .web.schemas import FitnessState, LoadWindow, SessionDifficulty
 RECOVERY_HALF_LIFE_HOURS = 12.0
 EASY_RUN_RESIDUAL_LIMIT = 0.55
 TAXING_RUN_RESIDUAL_LIMIT = 0.25
+QUALITY_SESSION_LOAD_FACTOR = 1.35
+LONG_RUN_LOAD_FACTOR = 1.15
+RECOVERY_RUN_LOAD_FACTOR = 0.70
 # Below this residue, the effect on an ordinary easy-run distance would be
 # smaller than the prescription's half-mile display precision.
 EASY_VOLUME_RESIDUAL_FLOOR = 0.10
@@ -101,8 +104,11 @@ def athlete_relative_session_load(
         + session.zone_breakdown.moderate_minutes
         + session.zone_breakdown.hard_minutes
     )
-    # Zone load already prices intensity. Fractions are only the fallback for
-    # sessions whose HR-derived load could not be calculated.
+    # Zone load prices the observed intensity response. Fractions are only the
+    # fallback when HR-derived load could not be calculated. Workout role is
+    # accounted for separately below so completing a prescribed quality run
+    # does not make its projected recovery cost disappear on upload. Long-run
+    # recovery retains its separately calibrated distance-led behavior.
     zone_factor = 1.0
     if zone_load_ratio is None and known_zone_minutes > 0:
         moderate_fraction = (
@@ -110,8 +116,11 @@ def athlete_relative_session_load(
         )
         hard_fraction = session.zone_breakdown.hard_minutes / known_zone_minutes
         zone_factor += 0.15 * moderate_fraction + 0.50 * hard_fraction
-    elif zone_load_ratio is None and session.is_quality_session:
-        zone_factor += 0.15
+    session_type_factor = (
+        QUALITY_SESSION_LOAD_FACTOR
+        if session.is_quality_session
+        else 1.0
+    )
 
     rpe_factor = (
         1.0
@@ -137,11 +146,19 @@ def athlete_relative_session_load(
     )
     response_factor = 1.0 + 0.20 * response_strength
 
-    load = relative_work * zone_factor * rpe_factor * mechanical_factor * response_factor
+    load = (
+        relative_work
+        * zone_factor
+        * session_type_factor
+        * rpe_factor
+        * mechanical_factor
+        * response_factor
+    )
     return max(0.10, min(4.0, load)), {
         "distance_ratio": distance_ratio,
         "duration_ratio": duration_ratio,
         "zone_load_ratio": zone_load_ratio,
+        "session_type_factor": session_type_factor,
         "rpe_factor": rpe_factor,
         "mechanical_factor": mechanical_factor,
         "response_factor": response_factor,

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from statistics import median
 import sqlite3
+from statistics import median, median_high
 
 from .durability import retained_long_run_capacity
 from .progress import build_progress
@@ -224,6 +224,16 @@ def build_fitness_state(
         if most_recent_abnormal and most_recent_abnormal.start_time
         else 0
     )
+    recent_easy_distances = [
+        run.distance_miles
+        for run in runs
+        if run.start_time
+        and evaluation_time - run.start_time.astimezone(timezone.utc)
+        <= timedelta(days=28)
+        and run.health_tag.value == "normal"
+        and run.workout_type == WorkoutType.EASY
+        and run.distance_miles > 0
+    ]
 
     context = [
         ContextEvidence(
@@ -310,6 +320,11 @@ def build_fitness_state(
         quality_sessions_14d=progress_14.consistency.quality_sessions,
         completed_quality_session_count=len(quality),
         running_days_28d=progress.consistency.running_days,
+        typical_easy_run_miles=(
+            median_high(recent_easy_distances)
+            if recent_easy_distances
+            else None
+        ),
         easy_fraction_14d=(progress_14.intensity.easy_percent / 100 if progress_14.intensity.easy_percent is not None else None),
         moderate_fraction_14d=unplanned_moderate,
         moderate_evidence_runs_14d=unplanned_moderate_runs,

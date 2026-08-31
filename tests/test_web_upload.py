@@ -228,13 +228,20 @@ def test_actionable_today_plan_refreshes_official_alerts_without_staling_rest() 
     ) is False
 
 
-def test_saved_plan_above_its_visible_week_target_is_stale() -> None:
+def test_saved_plan_above_visible_target_is_not_stale_by_shape_alone() -> None:
+    today = date(2026, 8, 28)
     schedule = SimpleNamespace(
+        planner_version=WEEKLY_PLANNER_VERSION,
         projected_distance_range_miles=(11.5, 13.0),
         target_distance_range_miles=(9.5, 11.0),
+        start_date=today,
+        trailing_days=[
+            SimpleNamespace(date=today - timedelta(days=offset))
+            for offset in range(7, 0, -1)
+        ],
     )
 
-    assert _weekly_plan_shape_is_stale(schedule) is True
+    assert _weekly_plan_shape_is_stale(schedule) is False
 
 
 def test_saved_plan_from_previous_planner_version_is_stale() -> None:
@@ -284,7 +291,16 @@ def test_rest_day_constraint_persists_replans_and_can_be_removed(tmp_path: Path)
     assert forced_day["forced_rest"] is True
     assert forced_day["day_role"] == "forced_rest_day"
     assert forced_day["recommendation"] is None
-    assert forced_plan["run_count"] == original_plan["run_count"]
+    assert forced_plan["run_count"] == forced_plan["target_run_count"]
+    assert {
+        day["date"]
+        for day in forced_plan["days"]
+        if day["recommendation"]
+    } != {
+        day["date"]
+        for day in original_plan["days"]
+        if day["recommendation"]
+    }
     persisted = client.get("/api/weekly-schedule/latest").json()
     assert next(
         day for day in persisted["days"] if day["date"] == selected["date"]

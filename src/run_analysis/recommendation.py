@@ -249,9 +249,12 @@ def _long_run_distance(
 
 def typical_easy_distance(state: FitnessState) -> tuple[float, float]:
     load = state.recent_load.trailing_28d
-    if load.activity_count <= 0 or load.distance_miles <= 0:
+    if state.typical_easy_run_miles is not None:
+        average = state.typical_easy_run_miles
+    elif load.activity_count > 0 and load.distance_miles > 0:
+        average = load.distance_miles / load.activity_count
+    else:
         return (3.0, 4.0)
-    average = load.distance_miles / load.activity_count
     lower = max(2.0, round((average * 0.85) * 2) / 2)
     upper = lower + 0.5
     durability_cap = max(3.0, long_run_reference_miles(state) * 0.8)

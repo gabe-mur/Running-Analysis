@@ -27,6 +27,7 @@ export async function renderSettings() {
     maximum_plausible_speed_mps: "Maximum believable speed (m/s)",
   };
   const coachingLabels = {
+    general_fitness_progression_fraction: "General-fitness productive build",
     long_run_progression_factor: "Long-run growth warning",
     long_run_target_progression_fraction: "Ordinary long-run target increase",
     high_load_ratio: "High-load warning",

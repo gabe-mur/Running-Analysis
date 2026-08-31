@@ -21,6 +21,8 @@ from .web.schemas import (
     HistoricalWorkoutComparison,
     IntervalAnalysis,
     IntervalRepetition,
+    PrescriptionMatchAnalysis,
+    RecommendationResponse,
     SessionDifficulty,
     Split,
     WorkoutAnalysis,
@@ -535,6 +537,154 @@ def _generic_analysis(
     )
 
 
+def _prescription_analysis(
+    connection: sqlite3.Connection,
+    config: dict,
+    activity_id: int,
+    difficulty: SessionDifficulty,
+    prescription: RecommendationResponse,
+    *,
+    timing_delta_hours: float,
+    distance_delta_miles: float,
+    match_confidence: str,
+) -> PrescriptionMatchAnalysis:
+    quality_steps = [
+        step
+        for step in prescription.structure
+        if step.duration_minutes is not None
+        and any(
+            marker in zone.casefold()
+            for zone in step.target_zones
+            for marker in ("z3", "z4", "z5", "strong", "threshold")
+        )
+    ]
+    target_work = sum(
+        float(step.duration_minutes or 0) for step in quality_steps
+    ) or None
+    detected_work: float | None = None
+    source = "heart_rate_zone_exposure"
+    if (
+        prescription.workout_type == WorkoutType.TEMPO_THRESHOLD
+        and target_work is not None
+    ):
+        laps = connection.execute(
+            """
+            SELECT lap_index,total_time_s,average_hr_bpm
+            FROM laps WHERE activity_id=? ORDER BY lap_index
+            """,
+            (activity_id,),
+        ).fetchall()
+        plausible = [
+            row
+            for row in laps
+            if float(row["total_time_s"] or 0) >= target_work * 60 * 0.70
+            and float(row["total_time_s"] or 0) <= target_work * 60 * 1.30
+            and (
+                row["average_hr_bpm"] is None
+                or float(row["average_hr_bpm"])
+                >= float(config["zones"]["z3"][0])
+            )
+        ]
+        if plausible:
+            selected = min(
+                plausible,
+                key=lambda row: abs(
+                    float(row["total_time_s"]) / 60 - target_work
+                ),
+            )
+            detected_work = float(selected["total_time_s"]) / 60
+            source = f"recorded_lap_{int(selected['lap_index']) + 1}"
+    if detected_work is None and target_work is not None:
+        detected_work = (
+            difficulty.zone_breakdown.moderate_minutes
+            + difficulty.zone_breakdown.hard_minutes
+        )
+    work_close = bool(
+        target_work is None
+        or (
+            detected_work is not None
+            and abs(detected_work - target_work)
+            <= max(2.0, target_work * 0.15)
+        )
+    )
+    distance_close = distance_delta_miles <= 0.25
+    if work_close and distance_close:
+        status = "Completed as prescribed"
+        summary = (
+            "Recorded timing, distance, and work dose match the saved "
+            "prescription closely."
+        )
+    elif work_close:
+        status = "Structure completed"
+        summary = (
+            "The prescribed work dose was detected, with total distance "
+            "outside the planned range."
+        )
+    else:
+        status = "Prescription attempted"
+        summary = (
+            "The upload matches the planned workout slot, but the detected "
+            "quality dose differs materially from the prescription."
+        )
+    confidence = (
+        ConfidenceLevel.HIGH
+        if match_confidence == "high" and source.startswith("recorded_lap")
+        else ConfidenceLevel.MODERATE
+    )
+    return PrescriptionMatchAnalysis(
+        confidence=confidence,
+        title=prescription.title,
+        planned_for=prescription.planned_for,
+        quality_session_type=prescription.quality_session_type,
+        target_distance_range_miles=prescription.distance_range_miles,
+        timing_delta_hours=timing_delta_hours,
+        distance_delta_miles=distance_delta_miles,
+        execution_status=status,
+        summary=summary,
+        target_work_minutes=target_work,
+        detected_work_minutes=detected_work,
+        detection_source=source,
+    )
+
+
+def _recorded_continuous_quality_lap(
+    connection: sqlite3.Connection,
+    config: dict,
+    activity_id: int,
+) -> tuple[float, float | None, int] | None:
+    laps = connection.execute(
+        """
+        SELECT lap_index,total_time_s,average_hr_bpm
+        FROM laps WHERE activity_id=? ORDER BY lap_index
+        """,
+        (activity_id,),
+    ).fetchall()
+    if len(laps) < 3:
+        return None
+    z3_floor = float(config["zones"]["z3"][0])
+    candidates = [
+        row
+        for row in laps[1:-1]
+        if 8 * 60 <= float(row["total_time_s"] or 0) <= 40 * 60
+        and row["average_hr_bpm"] is not None
+        and float(row["average_hr_bpm"]) >= z3_floor
+    ]
+    if not candidates:
+        return None
+    selected = max(
+        candidates,
+        key=lambda row: (
+            float(row["average_hr_bpm"]),
+            float(row["total_time_s"]),
+        ),
+    )
+    return (
+        float(selected["total_time_s"]) / 60,
+        float(selected["average_hr_bpm"]),
+        int(selected["lap_index"]) + 1,
+    )
+
+
 def analyze_workout(
     connection: sqlite3.Connection,
     config: dict,
@@ -545,31 +695,107 @@ def analyze_workout(
     drift: DriftAssessment,
     splits: list[Split],
     intervals: list[MovementInterval],
+    prescription: RecommendationResponse | None = None,
+    prescription_timing_delta_hours: float = 0.0,
+    prescription_distance_delta_miles: float = 0.0,
+    prescription_match_confidence: str = "moderate",
 ) -> WorkoutAnalysis:
     if workout not in {WorkoutType.INTERVALS, WorkoutType.RUN_WALK}:
-        return _generic_analysis(workout, difficulty, drift, splits)
-    interval_analysis = analyze_intervals(
-        connection, activity_id, intervals, float(config["zones"]["z4"][0])
-    )
-    execution, control, stimulus, recovery = _interval_dimensions(interval_analysis)
-    comparison = _historical_interval_comparison(
-        connection, config, activity_id, start, interval_analysis
-    ) if workout == WorkoutType.INTERVALS and interval_analysis.available else None
-    if not interval_analysis.available:
-        progression = "Review or correct the inferred workout boundaries before using this session to progress quality training."
-    elif interval_analysis.pacing_pattern == "faded":
-        progression = "Repeat this structure with a more conservative opening pace before adding reps or distance."
-    elif (interval_analysis.final_rep_overspeed_percent or 0) >= 5:
-        progression = "Workout accomplished. Repeat the structure and keep the final rep near the preceding reps before progressing."
-    elif (interval_analysis.work_speed_cv_percent or 99) <= 4 and interval_analysis.recovery_repetition_count:
-        progression = "Execution was controlled. Progress only if health and recent load are normal; prefer adding controlled work over making the final rep faster."
+        analysis = _generic_analysis(workout, difficulty, drift, splits)
+        if workout == WorkoutType.TEMPO_THRESHOLD:
+            sustained = _recorded_continuous_quality_lap(
+                connection, config, activity_id
+            )
+            if sustained is not None:
+                minutes, average_hr, lap_number = sustained
+                execution = analysis.execution.model_copy(
+                    update={
+                        "status": "Structured threshold work detected",
+                        "summary": (
+                            "A sustained manual lap separates the threshold "
+                            "work from the easy warm-up and cool-down."
+                        ),
+                        "confidence": ConfidenceLevel.HIGH,
+                        "metrics": [
+                            *analysis.execution.metrics,
+                            _metric(
+                                "Continuous work lap",
+                                f"{minutes:.1f} min",
+                                f"Recorded lap {lap_number}; average HR {average_hr:.0f} bpm.",
+                            ),
+                        ],
+                    }
+                )
+                analysis = analysis.model_copy(update={"execution": execution})
     else:
-        progression = "Repeat once with steadier work and recovery before progressing."
-    return WorkoutAnalysis(
-        workout_type=workout,
-        definition="Execution, control, stimulus, and recovery remain separate; short-rep pace is primary, HR kinetics secondary, and zones tertiary.",
-        execution=execution, control=control, stimulus=stimulus, recovery=recovery,
-        interval_analysis=interval_analysis,
-        historical_comparison=comparison,
-        progression_recommendation=progression,
+        interval_analysis = analyze_intervals(
+            connection, activity_id, intervals, float(config["zones"]["z4"][0])
+        )
+        execution, control, stimulus, recovery = _interval_dimensions(interval_analysis)
+        comparison = _historical_interval_comparison(
+            connection, config, activity_id, start, interval_analysis
+        ) if workout == WorkoutType.INTERVALS and interval_analysis.available else None
+        if not interval_analysis.available:
+            progression = "Review or correct the inferred workout boundaries before using this session to progress quality training."
+        elif interval_analysis.pacing_pattern == "faded":
+            progression = "Repeat this structure with a more conservative opening pace before adding reps or distance."
+        elif (interval_analysis.final_rep_overspeed_percent or 0) >= 5:
+            progression = "Workout accomplished. Repeat the structure and keep the final rep near the preceding reps before progressing."
+        elif (interval_analysis.work_speed_cv_percent or 99) <= 4 and interval_analysis.recovery_repetition_count:
+            progression = "Execution was controlled. Progress only if health and recent load are normal; prefer adding controlled work over making the final rep faster."
+        else:
+            progression = "Repeat once with steadier work and recovery before progressing."
+        analysis = WorkoutAnalysis(
+            workout_type=workout,
+            definition="Execution, control, stimulus, and recovery remain separate; short-rep pace is primary, HR kinetics secondary, and zones tertiary.",
+            execution=execution, control=control, stimulus=stimulus, recovery=recovery,
+            interval_analysis=interval_analysis,
+            historical_comparison=comparison,
+            progression_recommendation=progression,
+        )
+    if prescription is None or prescription.planned_for is None:
+        return analysis
+    prescription_analysis = _prescription_analysis(
+        connection,
+        config,
+        activity_id,
+        difficulty,
+        prescription,
+        timing_delta_hours=prescription_timing_delta_hours,
+        distance_delta_miles=prescription_distance_delta_miles,
+        match_confidence=prescription_match_confidence,
+    )
+    execution = analysis.execution.model_copy(
+        update={
+            "status": prescription_analysis.execution_status,
+            "summary": prescription_analysis.summary,
+            "confidence": prescription_analysis.confidence,
+            "metrics": [
+                *analysis.execution.metrics,
+                _metric(
+                    "Prescribed work",
+                    (
+                        f"{prescription_analysis.target_work_minutes:.0f} min"
+                        if prescription_analysis.target_work_minutes is not None
+                        else "Structure-based"
+                    ),
+                    prescription.title,
+                ),
+                _metric(
+                    "Detected work",
+                    (
+                        f"{prescription_analysis.detected_work_minutes:.1f} min"
+                        if prescription_analysis.detected_work_minutes is not None
+                        else "Unavailable"
+                    ),
+                    prescription_analysis.detection_source.replace("_", " "),
+                ),
+            ],
+        }
+    )
+    return analysis.model_copy(
+        update={
+            "execution": execution,
+            "prescription_match": prescription_analysis,
+        }
     )

@@ -21,6 +21,7 @@ from ..importer import SUPPORTED_SUFFIXES, import_files
 from ..modeling import InsufficientModelDataError, fit_models
 from ..overrides import sync_overrides
 from ..processing import process_activities
+from ..prescription_matching import match_activities_to_prescriptions
 from ..privacy import private_directory, private_file
 from ..recommendation_service import generate_weekly_schedule, load_current_status
 from ..weather import update_weather
@@ -166,7 +167,33 @@ def run_upload_pipeline(
             try:
                 sync_overrides(connection, overrides_path)
                 process_summary = process_activities(connection, config)
+                imported_activity_ids = [
+                    activity_id
+                    for item in results
+                    for activity_id in item.activity_ids
+                ]
+                matched_activity_ids = match_activities_to_prescriptions(
+                    connection,
+                    imported_activity_ids,
+                )
+                if matched_activity_ids:
+                    # Matching changes the effective workout type. A second
+                    # incremental pass recomputes only activities whose
+                    # fingerprint changed, before modeling and replanning use
+                    # the classification.
+                    process_summary = process_activities(connection, config)
                 stages.append(UploadStage(name="process", status="complete", detail=_detail(process_summary)))
+                if matched_activity_ids:
+                    stages.append(
+                        UploadStage(
+                            name="prescription_match",
+                            status="complete",
+                            detail=(
+                                f"Matched {len(matched_activity_ids)} uploaded run(s) "
+                                "to the prescription saved before the workout."
+                            ),
+                        )
+                    )
             except Exception as exc:
                 stages.append(UploadStage(name="process", status="failed", detail=str(exc)))
 

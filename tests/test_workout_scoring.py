@@ -3,10 +3,26 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import sqlite3
 
+import pytest
+
 from run_analysis.models import Trackpoint
 from run_analysis.movement import MovementInterval
-from run_analysis.web.schemas import WorkoutAnalysis
-from run_analysis.workout_scoring import analyze_intervals
+from run_analysis.web.schemas import (
+    ConfidenceLevel,
+    QualitySessionType,
+    ReadinessFlag,
+    RecommendationResponse,
+    SessionDifficulty,
+    WorkoutAnalysis,
+    WorkoutStep,
+    WorkoutType,
+    ZoneBreakdown,
+)
+from run_analysis.workout_scoring import (
+    _prescription_analysis,
+    _recorded_continuous_quality_lap,
+    analyze_intervals,
+)
 
 
 def _interval(index: int, lap: int, speed: float, seconds: float, hr: int) -> MovementInterval:
@@ -89,6 +105,91 @@ def test_workout_analysis_contract_has_four_dimensions_and_no_composite_score() 
     assert "stimulus" in WorkoutAnalysis.model_fields
     assert "recovery" in WorkoutAnalysis.model_fields
     assert "score" not in WorkoutAnalysis.model_fields
+
+
+def test_prescribed_threshold_uses_recorded_work_lap_not_total_zone_bucket() -> None:
+    connection = _laps_connection()
+    for lap, (seconds, hr) in enumerate(((660, 144), (1081, 168), (896, 152))):
+        connection.execute(
+            "INSERT INTO laps VALUES (1,?,?,?,?,?)",
+            (lap, seconds, 1600, hr, hr + 5),
+        )
+    planned_for = datetime(2026, 8, 30, 19, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.TEMPO_THRESHOLD,
+        quality_session_type=QualitySessionType.THRESHOLD,
+        title="Continuous threshold run",
+        distance_range_miles=(4.5, 5.0),
+        structure=[
+            WorkoutStep(
+                instruction="Warm up",
+                duration_minutes=12,
+                target_zones=["Z1", "Z2"],
+            ),
+            WorkoutStep(
+                instruction="Threshold",
+                duration_minutes=18,
+                target_zones=["upper Z3", "low Z4"],
+            ),
+            WorkoutStep(
+                instruction="Cool down",
+                duration_minutes=10,
+                target_zones=["Z1", "Z2"],
+            ),
+        ],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.41,
+        moving_minutes=43.6,
+        elapsed_minutes=44,
+        stopped_minutes=0.4,
+        zone_load=116.6,
+        zone_breakdown=ZoneBreakdown(
+            easy_minutes=21.5,
+            moderate_minutes=6.7,
+            hard_minutes=13.9,
+        ),
+        is_quality_session=True,
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [151, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=0.6,
+        distance_delta_miles=0.09,
+        match_confidence="high",
+    )
+
+    assert analysis.execution_status == "Completed as prescribed"
+    assert analysis.target_work_minutes == 18
+    assert analysis.detected_work_minutes == pytest.approx(18.016, abs=0.01)
+    assert analysis.detection_source == "recorded_lap_2"
+    assert analysis.confidence == ConfidenceLevel.HIGH
+
+
+def test_threshold_analysis_detects_sustained_manual_lap_without_saved_plan() -> None:
+    connection = _laps_connection()
+    for lap, (seconds, hr) in enumerate(((660, 144), (1081, 168), (896, 152))):
+        connection.execute(
+            "INSERT INTO laps VALUES (1,?,?,?,?,?)",
+            (lap, seconds, 1600, hr, hr + 5),
+        )
+
+    detected = _recorded_continuous_quality_lap(
+        connection,
+        {"zones": {"z3": [151, 166]}},
+        1,
+    )
+
+    assert detected == pytest.approx((18.016, 168, 2), abs=0.01)
 
 
 

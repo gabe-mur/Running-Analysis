@@ -1,4 +1,4 @@
-"""Pure seven-day schedule construction from daily fitness states.
+"""Continuous rolling-lookahead schedule construction from daily fitness states.
 
 The planner chooses run days automatically, then evaluates the existing
 inspectable recommendation rules on those days. Planned sessions are projected
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import combinations
-from math import ceil, exp, floor
+from math import ceil, comb, exp, floor
 from zoneinfo import ZoneInfo
 
 from .environmental_stress import assess_training_weather
@@ -32,6 +32,9 @@ from .race_goals import (
 from .recovery import (
     EASY_RUN_RESIDUAL_LIMIT,
     EASY_VOLUME_RESIDUAL_FLOOR,
+    LONG_RUN_LOAD_FACTOR,
+    QUALITY_SESSION_LOAD_FACTOR,
+    RECOVERY_RUN_LOAD_FACTOR,
     RECOVERY_HALF_LIFE_HOURS,
     TAXING_RUN_RESIDUAL_LIMIT,
     athlete_relative_session_load,
@@ -56,10 +59,12 @@ from .web.schemas import (
 
 
 VISIBLE_HORIZON_DAYS = 7
-PLANNING_HORIZON_DAYS = 14
-WEEKLY_PLANNER_VERSION = 39
+PLANNING_HORIZON_DAYS = 21
+WEEKLY_PLANNER_VERSION = 49
 MAX_ADAPTIVE_CANDIDATES = 64
+MAX_HORIZON_COUNT_OPTIONS = 14
 MINIMUM_QUALITY_RANGE_MILES = (3.0, 3.5)
+MAXIMUM_ORDINARY_QUALITY_MILES = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,10 +153,46 @@ def derive_weekly_target(
         retained_recent_peak,
         min(recent_seven, best_sustained[2]),
     )
-    target_low = max(6.0, _half_mile(capacity_reference * 0.95))
-    target_high = max(target_low + 0.5, _half_mile(min(peak_seven, capacity_reference * 1.10)))
+    general_progression = min(
+        0.10,
+        max(
+            0.0,
+            float(
+                config.get("coaching", {}).get(
+                    "general_fitness_progression_fraction", 0.08
+                )
+            ),
+        ),
+    )
     goal = configured_race_goal(config, on_date=end)
-    goal_trajectory_detail = ""
+    if goal:
+        # Goal mode starts from demonstrated training and is subsequently
+        # raised only as much as the backward-planned race trajectory needs.
+        target_low = max(6.0, _half_mile(capacity_reference * 0.95))
+        target_high = max(
+            target_low + 0.5,
+            _half_mile(min(peak_seven, capacity_reference * 1.10)),
+        )
+        goal_trajectory_detail = ""
+    else:
+        # General fitness is a productive mode, not a request to preserve an
+        # old mileage number indefinitely. Put the center of the planning
+        # range a modest percentage above demonstrated capacity. The adaptive
+        # scheduler still chooses lower in this range when opening load is
+        # high and can underfill it when recovery does not support the work.
+        # Because projected mileage only becomes capacity after completion,
+        # missed or costly weeks do not create automatic compounding.
+        productive_midpoint = capacity_reference * (1.0 + general_progression)
+        target_low = max(6.0, _half_mile(productive_midpoint * 0.97))
+        target_high = max(
+            target_low + 0.5,
+            _half_mile(productive_midpoint * 1.03),
+        )
+        goal_trajectory_detail = (
+            " In general-fitness mode, successful training earns a modest "
+            "percentage-based build above demonstrated capacity; recovery and "
+            "actual completion determine whether that target becomes the next baseline."
+        )
     if goal:
         goal_profile, race_date, _ = goal
         build_weeks = build_weeks_before_taper(goal_profile, race_date, end)
@@ -164,7 +205,13 @@ def derive_weekly_target(
             # Goal mode can use the required trajectory up to an explicit
             # eight-percent weekly planning ceiling. It does not silently
             # promise an infeasible build or override later recovery checks.
-            planned_weekly_rate = min(0.08, required_weekly_rate)
+            # A roomy race calendar must not make training less productive
+            # than general-fitness mode. A demanding calendar can raise the
+            # rate, up to the explicit goal-mode ceiling.
+            planned_weekly_rate = max(
+                general_progression,
+                min(0.08, required_weekly_rate),
+            )
             goal_midpoint = min(
                 goal_profile.peak_weekly_miles,
                 capacity_reference * (1.0 + planned_weekly_rate),
@@ -238,9 +285,9 @@ def derive_weekly_target(
         demonstrated_run_days_per_week=demonstrated,
         capacity_reference_miles=capacity_reference,
         rationale=(
-            "Mileage uses current plus recency-decayed capacity evidence, while run count follows current 28-day cadence "
-            "with only a limited contribution from retained frequency. A short break preserves useful capacity without "
-            "forcing an outdated number of run days."
+            "Mileage uses current plus recency-decayed capacity evidence. Recent and demonstrated cadence remain descriptive "
+            "evidence, while the continuous load/recovery optimizer chooses how many useful run days carry that mileage. "
+            "A short break preserves useful capacity without forcing an outdated frequency."
             f"{goal_trajectory_detail}"
         ),
     )
@@ -421,6 +468,24 @@ def _midpoint(result: RecommendationResponse) -> float:
     return 0.0
 
 
+def _ordinary_easy_expansion_reference(state: FitnessState) -> float:
+    """Mark where another run day should compete with more easy mileage.
+
+    An ordinary easy run can be somewhat longer than the athlete's standalone
+    template. Beyond this athlete-relative reference, expansion becomes
+    progressively more expensive so another useful easy day usually wins.
+    This is deliberately not a cap: constrained schedules can still allocate
+    a longer aerobic run when that is the strongest overall plan.
+    """
+
+    easy_low, easy_high = typical_easy_distance(state)
+    easy_midpoint = (easy_low + easy_high) / 2
+    return max(
+        easy_high,
+        floor(easy_midpoint * 1.25 * 2 + 1e-9) / 2,
+    )
+
+
 def _session_load_units(
     distance_miles: float,
     easy_reference_miles: float,
@@ -431,11 +496,11 @@ def _session_load_units(
 ) -> float:
     """Express one session relative to the athlete's ordinary easy run."""
     intensity_factor = (
-        1.35
+        QUALITY_SESSION_LOAD_FACTOR
         if quality_session
-        else 1.15
+        else LONG_RUN_LOAD_FACTOR
         if long_run
-        else 0.70
+        else RECOVERY_RUN_LOAD_FACTOR
         if recovery_run
         else 1.0
     )
@@ -673,57 +738,42 @@ def _project_state(state: FitnessState, planned: list[RecommendationResponse]) -
     )
 
 
-def _sequence_role(
-    run_index: int,
-    cycle_size: int,
-    *,
-    taper_horizon: bool,
-) -> str | None:
-    """Return a small composition preference, never a calendar constraint."""
-    cycle_position = run_index % max(1, cycle_size)
-    if cycle_position == cycle_size - 1:
-        return None
-    if cycle_size >= 3 and cycle_position == 1 and not taper_horizon:
-        return "quality"
-    return "easy"
-
-
-def _quality_cadence_role(
+def _elapsed_workout_role(
     state_options: list[FitnessState],
     planned: list[RecommendationResponse],
     config: dict,
-    fallback_role: str | None,
-) -> str | None:
-    """Anchor quality preference to the last actual or planned session.
-
-    Seven-day schedule blocks are presentation windows, not training-cycle
-    boundaries. A fresh reload must therefore not move quality back to the
-    second run of a newly-created block. Before the seven-day reference the
-    arbitrary sequence preference is suppressed; once the reference is
-    reached, each suitable run keeps receiving a soft quality preference
-    until one is actually selected. Recovery and other coaching evidence can
-    still override it.
-    """
+    *,
+    taper_horizon: bool,
+) -> str:
+    """Prefer workout composition from elapsed recency, never block position."""
 
     if not state_options:
-        return fallback_role
-    projected = _project_state(state_options[0], planned)
-    days_since_quality = projected.days_since_quality_run
-    if days_since_quality is None:
-        return fallback_role
-    reference_days = float(
-        config.get("coaching", {}).get("quality_recency_reference_days", 7)
-    )
-    if days_since_quality >= reference_days:
-        # Remove a block-relative easy preference once quality is due, but do
-        # not manufacture a large score swing on the first eligible run. The
-        # recommendation model already contains recency evidence; the next
-        # cadence-designated quality slot reinforces it if long-run or
-        # recovery evidence appropriately wins first.
-        return "quality" if fallback_role == "quality" else None
-    if fallback_role == "quality":
         return "easy"
-    return fallback_role
+    projected = _project_state(state_options[0], planned)
+    settings = config.get("coaching", {})
+    long_reference = float(
+        settings.get("long_run_recency_reference_days", 7)
+    )
+    quality_reference = float(
+        settings.get("quality_recency_reference_days", 7)
+    )
+    long_ratio = (
+        projected.days_since_long_run / max(1.0, long_reference)
+        if projected.days_since_long_run is not None
+        else 1.0
+    )
+    quality_ratio = (
+        projected.days_since_quality_run / max(1.0, quality_reference)
+        if projected.days_since_quality_run is not None
+        else 1.0
+    )
+    if long_ratio >= 1.0 and (
+        taper_horizon or long_ratio >= quality_ratio
+    ):
+        return "long"
+    if not taper_horizon and quality_ratio >= 1.0:
+        return "quality"
+    return "easy"
 
 
 def _return_to_retained_capacity_due(
@@ -867,8 +917,12 @@ def _select_budgeted_timed_recommendation(
             None,
         )
         taxing_residual = 0.0
+        consecutive_taxing_dates = False
         if result.planned_for and latest_taxing and latest_taxing.planned_for:
             easy_reference = sum(typical_easy_distance(state)) / 2
+            consecutive_taxing_dates = (
+                result.planned_for.date() - latest_taxing.planned_for.date()
+            ).days <= 1
             taxing_residual = decay_recovery_load(
                 _recommendation_load_units(latest_taxing, easy_reference),
                 (result.planned_for - latest_taxing.planned_for).total_seconds()
@@ -876,10 +930,29 @@ def _select_budgeted_timed_recommendation(
             )
         elif (recovery := estimate_recovery(state)) is not None:
             taxing_residual = recovery.residual_load
+            if (
+                state.last_run_workout_type
+                in {
+                    WorkoutType.LONG,
+                    WorkoutType.INTERVALS,
+                    WorkoutType.TEMPO_THRESHOLD,
+                    WorkoutType.RACE,
+                }
+                and state.days_since_last_run is not None
+            ):
+                inferred_last_date = (
+                    state.as_of - timedelta(days=state.days_since_last_run)
+                ).date()
+                consecutive_taxing_dates = (
+                    state.as_of.date() - inferred_last_date
+                ).days <= 1
         taxing_recovery_incomplete = bool(
             candidate in {"long", "quality"}
             and result.workout_type != WorkoutType.RACE
-            and taxing_residual > TAXING_RUN_RESIDUAL_LIMIT
+            and (
+                taxing_residual > TAXING_RUN_RESIDUAL_LIMIT
+                or consecutive_taxing_dates
+            )
         )
         if taxing_recovery_incomplete:
             # Preserve the run date when it is otherwise a good fit, but make
@@ -910,11 +983,17 @@ def _select_budgeted_timed_recommendation(
             or (candidate == "long" and return_long_due)
         ):
             if taxing_spacing_substitution:
+                spacing_reason = (
+                    "A second taxing workout was replaced with aerobic running because long and quality sessions need an intervening non-taxing day."
+                    if consecutive_taxing_dates
+                    else
+                    "A second taxing workout was replaced with aerobic running because athlete-relative recovery load was still above the taxing-session reference."
+                )
                 result = result.model_copy(
                     update={
                         "reasons": [
                             *result.reasons,
-                            "A second taxing workout was replaced with aerobic running because athlete-relative recovery load was still above the taxing-session reference.",
+                            spacing_reason,
                         ]
                     }
                 )
@@ -929,52 +1008,48 @@ def _adaptive_candidate_cost(
     request: RecommendationRequest,
     config: dict,
     target_distance_range: tuple[float, float],
-    cycle_size: int,
-    seed_offsets: list[int],
     *,
     taper_horizon: bool,
-    completed_run_counts_by_block: dict[int, int] | None = None,
-    completed_miles_by_block: dict[int, float] | None = None,
+    completed_miles_by_offset: dict[int, float] | None = None,
 ) -> float:
-    """Score one run-date combination with load/recovery ahead of cadence."""
+    """Score one continuous run-date combination across the entire horizon.
+
+    Day seven is not a reset point: frequency, workout composition, recovery,
+    and mileage are evaluated across the supplied horizon before the UI takes
+    a slice.
+    """
     planned: list[RecommendationResponse] = []
-    completed_run_counts_by_block = completed_run_counts_by_block or {}
-    projected_miles_by_block = dict(completed_miles_by_block or {})
-    allocatable_headroom_by_block: dict[int, float] = {}
+    completed_miles_by_offset = completed_miles_by_offset or {}
+    completed_miles = sum(completed_miles_by_offset.values())
+    projected_miles = completed_miles
+    projected_miles_by_offset = dict(completed_miles_by_offset)
+    # Completed mileage is already represented in the opening trailing load.
+    # This map contains only proposed work so the reload boundary is not
+    # double-counted.
+    minimum_density_miles_by_offset: dict[int, float] = {}
+    allocatable_headroom_by_offset: dict[int, float] = {}
+    horizon_scale = len(daily_states) / VISIBLE_HORIZON_DAYS
+    horizon_target_low = target_distance_range[0] * horizon_scale
+    horizon_target_high = target_distance_range[1] * horizon_scale
     cost = 0.0
     for offset in offsets:
-        block = offset // VISIBLE_HORIZON_DAYS
-        block_start = block * VISIBLE_HORIZON_DAYS
-        planned_before_in_block = sum(
-            block_start <= earlier < offset for earlier in offsets
-        )
-        role = _quality_cadence_role(
+        role = _elapsed_workout_role(
             daily_state_options[offset],
             planned,
             config,
-            _sequence_role(
-                completed_run_counts_by_block.get(block, 0)
-                + planned_before_in_block,
-                cycle_size,
-                taper_horizon=taper_horizon,
-            ),
+            taper_horizon=taper_horizon,
         )
-        block_end = (block + 1) * VISIBLE_HORIZON_DAYS
-        remaining_week_runs = sum(
-            offset < later < block_end for later in offsets
-        )
-        reserve_easy_miles = typical_easy_distance(
-            daily_states[block * VISIBLE_HORIZON_DAYS]
-        )[0]
+        remaining_horizon_runs = sum(offset < later for later in offsets)
+        reserve_easy_miles = typical_easy_distance(daily_states[0])[0]
         state, result = _select_budgeted_timed_recommendation(
             daily_state_options[offset],
             planned,
             request,
             config,
             weekly_role=role,
-            projected_week_miles=projected_miles_by_block.get(block, 0.0),
-            remaining_week_runs=remaining_week_runs,
-            target_week_high=target_distance_range[1],
+            projected_week_miles=projected_miles,
+            remaining_week_runs=remaining_horizon_runs,
+            target_week_high=horizon_target_high,
             reserve_easy_miles=reserve_easy_miles,
         )
         if result.workout_type == WorkoutType.REST:
@@ -990,8 +1065,32 @@ def _adaptive_candidate_cost(
             # intentionally provoking a short guardrail workout.
             cost += 10.0
 
-        projected_miles_by_block[block] = (
-            projected_miles_by_block.get(block, 0.0) + _midpoint(result)
+        result_midpoint = _midpoint(result)
+        projected_miles += result_midpoint
+        projected_miles_by_offset[offset] = (
+            projected_miles_by_offset.get(offset, 0.0) + result_midpoint
+        )
+        if (
+            result.readiness.value != "ready"
+            or result.workout_type in {WorkoutType.RECOVERY, WorkoutType.RACE}
+            or not result.distance_range_miles
+        ):
+            minimum_density_miles = result_midpoint
+        elif result.workout_type == WorkoutType.LONG:
+            minimum_density_miles = result.distance_range_miles[0]
+        elif result.workout_type in {
+            WorkoutType.INTERVALS,
+            WorkoutType.TEMPO_THRESHOLD,
+        }:
+            minimum_density_miles = sum(MINIMUM_QUALITY_RANGE_MILES) / 2
+        else:
+            # An extra aerobic day can be a useful 2.0–2.5 mile run. Date
+            # selection must not price it as a full standalone easy template
+            # before the joint allocator has distributed the mileage.
+            minimum_density_miles = 2.25
+        minimum_density_miles_by_offset[offset] = (
+            minimum_density_miles_by_offset.get(offset, 0.0)
+            + minimum_density_miles
         )
         if (
             result.readiness.value == "ready"
@@ -1024,9 +1123,37 @@ def _adaptive_candidate_cost(
                         long_run_reference_miles(state) * 1.05,
                     ),
                 )
-            allocatable_headroom_by_block[block] = (
-                allocatable_headroom_by_block.get(block, 0.0)
-                + max(0.0, reachable - current_midpoint)
+                recovery_trace = next(
+                    (
+                        item
+                        for item in result.rule_trace
+                        if item.rule_id == "recent_recovery_load"
+                    ),
+                    None,
+                )
+                recovery_residual = (
+                    recovery_trace.facts.get("residual_load")
+                    if recovery_trace
+                    and isinstance(
+                        recovery_trace.facts.get("residual_load"),
+                        (int, float),
+                    )
+                    else None
+                )
+                if (
+                    recovery_residual is not None
+                    and recovery_residual > EASY_VOLUME_RESIDUAL_FLOOR
+                ):
+                    # The allocator will preserve the recommendation's
+                    # recovery-scaled ceiling. Frequency selection must use
+                    # the same reachable mileage or it can choose too few run
+                    # days based on headroom that later disappears.
+                    reachable = min(
+                        reachable,
+                        result.distance_range_miles[1],
+                    )
+            allocatable_headroom_by_offset[offset] = max(
+                0.0, reachable - current_midpoint
             )
         planned.append(result)
         if result.readiness.value == "not_ready":
@@ -1042,13 +1169,11 @@ def _adaptive_candidate_cost(
             ),
             daily_states[offset],
         )
-        # Keep the athlete-relative load unit stable within each planning
-        # block. Recomputing it from every future raw state lets an older run
+        # Keep the athlete-relative load unit stable across the planning
+        # horizon. Recomputing it from every future raw state lets an older run
         # rolling out of the lookback make the exact same proposed workout
         # abruptly more expensive one day later, which is not recovery decay.
-        easy_reference_miles = sum(
-            typical_easy_distance(daily_states[block_start])
-        ) / 2
+        easy_reference_miles = sum(typical_easy_distance(daily_states[0])) / 2
         residual_load = _decayed_recovery_load(
             selected_raw_state,
             planned[:-1],
@@ -1083,39 +1208,65 @@ def _adaptive_candidate_cost(
         cost += assess_training_weather(
             state.planned_weather, state.weather_exposure_baseline
         ).score * 3.0
+        candidate_load_ratio = effective_load_ratio(state.recent_load)
+        candidate_high_load = float(
+            config.get("coaching", {}).get("high_load_ratio", 1.30)
+        )
+        if candidate_load_ratio is not None:
+            # Only material overload is date evidence. Ordinary changes in a
+            # trailing window are handled by continuous recovery decay and the
+            # soft density model instead of creating a calendar cliff.
+            cost += max(
+                0.0, candidate_load_ratio - candidate_high_load
+            ) * 12.0
 
         # Date scoring above already uses residual-load × proposed-load. The
         # shared spacing function is reserved for choosing among same-day time
         # options so the same recovery evidence is not charged twice here.
 
-    block_count = (len(daily_states) + VISIBLE_HORIZON_DAYS - 1) // VISIBLE_HORIZON_DAYS
-    for block in range(block_count):
-        block_days = min(
-            VISIBLE_HORIZON_DAYS,
-            len(daily_states) - block * VISIBLE_HORIZON_DAYS,
+    reachable_miles = projected_miles + sum(
+        allocatable_headroom_by_offset.values()
+    )
+    if reachable_miles < horizon_target_low:
+        cost += (horizon_target_low - reachable_miles) * 3.0
+    elif projected_miles > horizon_target_high:
+        cost += (projected_miles - horizon_target_high) * 3.0
+
+    # Weekly mileage is a load-density guide, not a hard calendar wall. Price
+    # only meaningful overages across every rolling seven-day span in the
+    # 21-day lookahead,
+    # and make the cost grow smoothly. This can retain a justified long or
+    # quality session just above the range, but increasingly favors spreading
+    # clustered mileage instead of deleting or truncating a workout because it
+    # crossed one particular display boundary.
+    if len(daily_states) >= VISIBLE_HORIZON_DAYS:
+        soft_overage_allowance = max(
+            0.5,
+            min(1.0, target_distance_range[1] * 0.05),
         )
-        scale = block_days / VISIBLE_HORIZON_DAYS
-        projected_miles = projected_miles_by_block.get(block, 0.0)
-        reachable_miles = (
-            projected_miles
-            + allocatable_headroom_by_block.get(block, 0.0)
+        soft_density_high = (
+            target_distance_range[1] + soft_overage_allowance
         )
-        target_low = target_distance_range[0] * scale
-        target_high = target_distance_range[1] * scale
-        if reachable_miles < target_low:
-            cost += (target_low - reachable_miles) * 3.0
-        elif projected_miles > target_high:
-            cost += (projected_miles - target_high) * 3.0
-        planned_in_block = sum(
-            block * VISIBLE_HORIZON_DAYS
-            <= offset
-            < (block + 1) * VISIBLE_HORIZON_DAYS
-            for offset in offsets
+        opening_recent_miles = (
+            daily_states[0].recent_load.trailing_7d.distance_miles
         )
-        completed_in_block = completed_run_counts_by_block.get(block, 0)
-        cost += 2.0 * abs(
-            planned_in_block + completed_in_block - cycle_size
-        )
+        for end in range(len(daily_states)):
+            start = max(0, end - VISIBLE_HORIZON_DAYS + 1)
+            # The daily state has aggregate trailing mileage, not the exact
+            # age of each prior run. Decay that opening load linearly instead
+            # of pretending it vanishes at day seven; future proposed runs
+            # then fill the same continuous load window.
+            retained_opening_miles = opening_recent_miles * max(
+                0.0,
+                1.0 - end / VISIBLE_HORIZON_DAYS,
+            )
+            window_miles = sum(
+                miles
+                for offset, miles in minimum_density_miles_by_offset.items()
+                if start <= offset <= end
+            ) + retained_opening_miles
+            density_excess = max(0.0, window_miles - soft_density_high)
+            cost += density_excess**2 * 1.5
 
     typical_rest_days = int(
         config.get("coaching", {}).get("typical_rest_days_between_runs", 1)
@@ -1142,44 +1293,69 @@ def _adaptive_candidate_cost(
         for previous, current in zip(offsets, offsets[1:])
     )
 
-    # Recovery is continuous, so consecutive days stay legal. Still, when an
-    # equally productive calendar can distribute the same work without a
-    # catch-up cluster, that calendar should win. This modest cost is smaller
-    # than a readiness or high-load guardrail and can be outweighed for truly
-    # cheap short runs.
-    cost += 12.0 * sum(
+    # Consecutive dates are not categorically blocked. Their cost is mostly
+    # athlete-relative above: the prior session's decayed load is
+    # multiplied by the proposed session load. Retain only a small transition
+    # cost so an equivalent spaced plan wins, while mileage coverage can still
+    # justify a useful double. The former twelve-point charge made consecutive
+    # dates practically impossible and manufactured an every-other-day plan.
+    cost += 3.0 * sum(
         current - previous == 1
         for previous, current in zip(offsets, offsets[1:])
     )
-    if offsets and offsets[0] == 0 and planned:
-        first_result = planned[0]
+    # A second adjacent link forms a three-day cluster. Price that
+    # progressively so separate useful doubles usually win, without making a
+    # short low-load three-day block categorically illegal.
+    cost += 6.0 * sum(
+        current - two_back == 2
+        for two_back, current in zip(offsets, offsets[2:])
+    )
+    taxing_types = {
+        WorkoutType.LONG,
+        WorkoutType.INTERVALS,
+        WorkoutType.TEMPO_THRESHOLD,
+        WorkoutType.RACE,
+    }
+    for previous, current in zip(planned, planned[1:]):
+        if not previous.planned_for or not current.planned_for:
+            continue
+        gap_days = (
+            current.planned_for.date() - previous.planned_for.date()
+        ).days
+        if (
+            previous.workout_type in taxing_types
+            and current.workout_type in taxing_types
+            and gap_days < 3
+        ):
+            cost += 12.0 * (3 - gap_days)
+    # A completed run immediately before the lookahead is included by
+    # ``_decayed_recovery_load``. Apply the same small transition cost used
+    # inside the lookahead so a history/plan seam is not a free calendar reset.
+    if offsets and offsets[0] == 0 and daily_states[0].days_since_last_run is not None:
         inferred_last_date = (
-            (
-                daily_states[0].as_of
-                - timedelta(days=daily_states[0].days_since_last_run)
-            ).date()
-            if daily_states[0].days_since_last_run is not None
-            else None
-        )
-        ran_yesterday = inferred_last_date == (
-            daily_states[0].as_of.date() - timedelta(days=1)
-        )
-        low_cost_consecutive, _ = consecutive_day_evidence(
-            daily_states[0], config
-        )
-        first_is_taxing = first_result.workout_type in {
-            WorkoutType.LONG,
-            WorkoutType.INTERVALS,
-            WorkoutType.TEMPO_THRESHOLD,
-            WorkoutType.RACE,
-        }
-        if ran_yesterday and not low_cost_consecutive:
-            # This relationship sits just outside the candidate offsets, so
-            # the ordinary consecutive-pair term above cannot see it. Price it
-            # across the rolling boundary instead of treating day zero as a
-            # free reset. An easy run pays the ordinary consecutive-day cost;
-            # another taxing run pays more because the interaction compounds.
-            cost += 20.0 if first_is_taxing else 12.0
+            daily_states[0].as_of
+            - timedelta(days=daily_states[0].days_since_last_run)
+        ).date()
+        if inferred_last_date == daily_states[0].as_of.date() - timedelta(days=1):
+            cost += 3.0
+    if (
+        offsets
+        and planned
+        and planned[0].planned_for
+        and daily_states[0].days_since_last_run is not None
+        and daily_states[0].last_run_workout_type in taxing_types
+        and planned[0].workout_type in taxing_types
+    ):
+        inferred_last_date = (
+            daily_states[0].as_of
+            - timedelta(days=daily_states[0].days_since_last_run)
+        ).date()
+        boundary_gap_days = (
+            planned[0].planned_for.date() - inferred_last_date
+        ).days
+        if boundary_gap_days < 3:
+            cost += 12.0 * (3 - boundary_gap_days)
+
     if offsets:
         opening_load_ratio = effective_load_ratio(
             daily_states[0].recent_load
@@ -1198,14 +1374,60 @@ def _adaptive_candidate_cost(
             # catch-up runs is not recovery optimization. It is deferred load.
             cost += 12.0 * max(0, offsets[0] - 1)
 
-    # Frequency fixes how many runs are selected. Even spacing remains
-    # secondary to recovery, load, weather, readiness, and volume, but a
-    # one-day cadence shift must count enough that a small recovery-score
-    # change cannot erase an already-ready aerobic slot.
-    cost += 1.0 * sum(
-        abs(offset - seed)
-        for offset, seed in zip(offsets, seed_offsets)
-    )
+    # Long and quality recurrence are elapsed-time objectives, not positions
+    # in a weekly sequence. Allow recovery to move them, but make an
+    # unexplained drift beyond the ordinary 7–8 day window progressively
+    # expensive across the continuous lookahead.
+    cadence_specs = [
+        (
+            WorkoutType.LONG,
+            daily_states[0].days_since_long_run,
+            float(
+                config.get("coaching", {}).get(
+                    "long_run_recency_reference_days", 7
+                )
+            ),
+        ),
+    ]
+    if not taper_horizon:
+        cadence_specs.append(
+            (
+                {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD},
+                daily_states[0].days_since_quality_run,
+                float(
+                    config.get("coaching", {}).get(
+                        "quality_recency_reference_days", 7
+                    )
+                ),
+            )
+        )
+    for workout_types, days_since, reference in cadence_specs:
+        if days_since is None:
+            continue
+        accepted_types = (
+            workout_types
+            if isinstance(workout_types, set)
+            else {workout_types}
+        )
+        first = next(
+            (
+                item
+                for item in planned
+                if item.workout_type in accepted_types and item.planned_for
+            ),
+            None,
+        )
+        if first is None or first.planned_for is None:
+            cost += max(0.0, days_since + len(daily_states) - reference) * 8.0
+            continue
+        elapsed_days = (
+            first.planned_for - daily_states[0].as_of
+        ).total_seconds() / 86400
+        cost += max(
+            0.0,
+            days_since + elapsed_days - (reference + 1.0),
+        ) * 8.0
+
     return cost
 
 
@@ -1220,9 +1442,14 @@ def _adaptive_run_day_offsets_for_frequency(
     daily_state_options: list[list[FitnessState]] | None = None,
     forced_rest_offsets: set[int] | None = None,
     completed_run_offsets: set[int] | None = None,
-    completed_miles_by_block: dict[int, float] | None = None,
+    completed_miles_by_offset: dict[int, float] | None = None,
+    horizon_run_count: int | None = None,
 ) -> list[int]:
-    """Choose dates by comparing projected load/recovery across the horizon."""
+    """Choose dates for one candidate frequency across a continuous horizon.
+
+    The frequency is an enumeration detail used by the outer optimizer, not
+    an athlete target. No seven-day sub-window receives its own run quota.
+    """
     if request.health_status == CurrentHealthStatus.PAIN_OR_INJURY_CONCERN:
         return []
     daily_state_options = daily_state_options or [
@@ -1256,127 +1483,75 @@ def _adaptive_run_day_offsets_for_frequency(
     )
     if planning_start_offset >= len(daily_states):
         return []
-    relative_seed_offsets = automatic_run_day_offsets(
-        daily_states[planning_start_offset],
-        request.health_status,
-        config,
-        target_run_count,
-        horizon_days=len(daily_states) - planning_start_offset,
-    )
-    base_seed_offsets = [
-        planning_start_offset + offset for offset in relative_seed_offsets
-    ]
-    base_total_runs = len(base_seed_offsets)
-    if base_total_runs <= 0:
+    if horizon_run_count is None:
+        relative_seed_offsets = automatic_run_day_offsets(
+            daily_states[planning_start_offset],
+            request.health_status,
+            config,
+            target_run_count,
+            horizon_days=len(daily_states) - planning_start_offset,
+        )
+        base_seed_offsets = [
+            planning_start_offset + offset for offset in relative_seed_offsets
+        ]
+        desired_total_runs = len(base_seed_offsets)
+    else:
+        desired_total_runs = min(
+            max(0, horizon_run_count),
+            len(daily_states) - planning_start_offset,
+        )
+        if desired_total_runs <= 1:
+            base_seed_offsets = (
+                [planning_start_offset] if desired_total_runs else []
+            )
+        else:
+            usable_span = len(daily_states) - planning_start_offset - 1
+            base_seed_offsets = [
+                planning_start_offset
+                + round(position * usable_span / (desired_total_runs - 1))
+                for position in range(desired_total_runs)
+            ]
+    if desired_total_runs <= 0:
         return []
-    cycle_size = max(
-        1,
-        floor(
-            base_total_runs * VISIBLE_HORIZON_DAYS / len(daily_states) + 0.5
-        ),
-    )
-    block_count = (
-        len(daily_states) + VISIBLE_HORIZON_DAYS - 1
-    ) // VISIBLE_HORIZON_DAYS
-    block_targets: dict[int, int] = {}
     allowed_offsets = [
         offset
         for offset in range(len(daily_states))
         if offset not in forced_rest_offsets
         and offset not in completed_run_offsets
     ]
-    completed_run_counts_by_block = {
-        block: sum(
-            block * VISIBLE_HORIZON_DAYS
-            <= offset
-            < min(
-                len(daily_states),
-                (block + 1) * VISIBLE_HORIZON_DAYS,
-            )
-            for offset in completed_run_offsets
-        )
-        for block in range(block_count)
-    }
-    for block in range(block_count):
-        start = block * VISIBLE_HORIZON_DAYS
-        end = min(len(daily_states), start + VISIBLE_HORIZON_DAYS)
-        capacity = sum(start <= offset < end for offset in allowed_offsets)
-        block_targets[block] = min(
-            max(0, cycle_size - completed_run_counts_by_block[block]),
-            capacity,
-        )
-    total_runs = sum(block_targets.values())
+    total_runs = min(
+        max(0, desired_total_runs - len(completed_run_offsets)),
+        len(allowed_offsets),
+    )
     if total_runs <= 0:
         return []
-    # A forced rest day is simply unavailable input to the same whole-horizon
-    # optimizer used for every ordinary plan. Keep the normal cadence as the
-    # soft reference; do not pre-shift or locally patch the old dates.
-    seed_offsets: list[int] = []
-    for block in range(block_count):
-        start = block * VISIBLE_HORIZON_DAYS
-        end = min(len(daily_states), start + VISIBLE_HORIZON_DAYS)
-        block_seeds = [
-            offset for offset in base_seed_offsets if start <= offset < end
-        ]
-        for completed_offset in sorted(
-            offset
-            for offset in completed_run_offsets
-            if start <= offset < end
-        ):
-            if block_seeds:
-                block_seeds.remove(
-                    min(
-                        block_seeds,
-                        key=lambda value: (abs(value - completed_offset), value),
-                    )
+    # Completed runs satisfy the nearest nominal opportunity. This seed is
+    # used only to make the combinatorial prefilter efficient; the full load
+    # model below does not score adherence to it.
+    seed_offsets = list(base_seed_offsets)
+    for completed_offset in sorted(completed_run_offsets):
+        if seed_offsets:
+            seed_offsets.remove(
+                min(
+                    seed_offsets,
+                    key=lambda value: (abs(value - completed_offset), value),
                 )
-        seed_offsets.extend(block_seeds[: block_targets[block]])
+            )
+    seed_offsets = seed_offsets[:total_runs]
     best_offsets: tuple[int, ...] | None = None
     best_cost: float | None = None
-    candidate_offsets: list[tuple[int, ...]] = []
-    for offsets in combinations(allowed_offsets, total_runs):
-        # The horizon is one continuous fortnight, not two independent quota
-        # buckets. Keep each seven-day slice near demonstrated frequency, but
-        # allow one run to cross the display boundary when that prevents a bad
-        # recovery transition. The cost model below still prefers an even
-        # split when both calendars are equally productive.
-        if len(daily_states) % VISIBLE_HORIZON_DAYS == 0 and any(
-            abs(
-                sum(
-                    block_start
-                    <= offset
-                    < block_start + VISIBLE_HORIZON_DAYS
-                    for offset in offsets
-                )
-                - block_targets[block_start // VISIBLE_HORIZON_DAYS]
-            )
-            > (
-                0
-                if block_targets[block_start // VISIBLE_HORIZON_DAYS]
-                < cycle_size
-                else 1
-            )
-            for block_start in range(0, len(daily_states), VISIBLE_HORIZON_DAYS)
-        ):
-            continue
-        candidate_offsets.append(offsets)
-
-    if 0 in allowed_offsets and candidate_offsets:
-        today_fallback_role = _sequence_role(
-            completed_run_counts_by_block.get(0, 0),
-            cycle_size,
-            taper_horizon=taper_horizon,
-        )
+    today_is_materially_available = False
+    if 0 in allowed_offsets:
         _, today_result = _select_timed_recommendation(
             daily_state_options[0],
             [],
             request,
             config,
-            weekly_role=_quality_cadence_role(
+            weekly_role=_elapsed_workout_role(
                 daily_state_options[0],
                 [],
                 config,
-                today_fallback_role,
+                taper_horizon=taper_horizon,
             ),
         )
         inferred_last_run_date = (
@@ -1398,137 +1573,110 @@ def _adaptive_run_day_offsets_for_frequency(
             and today_result.readiness.value == "ready"
             and not (ran_yesterday and not low_cost_consecutive)
         )
-        if today_is_materially_available:
-            # The rolling week starts today. Preserve a genuinely available
-            # current-day slot unless yesterday carried material cost. In that
-            # case today remains legal, but rest must compete with running in
-            # the full-horizon load and recovery optimizer.
-            candidate_offsets = [
-                offsets for offsets in candidate_offsets if 0 in offsets
-            ]
+    weather_costs: dict[int, float] = {}
+    high_load_threshold = float(
+        config.get("coaching", {}).get("high_load_ratio", 1.30)
+    )
+    for offset in allowed_offsets:
+        state = daily_states[offset]
+        weather = assess_training_weather(
+            state.planned_weather,
+            state.weather_exposure_baseline,
+        )
+        load_ratio = effective_load_ratio(state.recent_load)
+        weather_costs[offset] = weather.score * 3.0 + (
+            100.0 if weather.extreme else 0.0
+        ) + (
+            max(0.0, load_ratio - high_load_threshold) * 12.0
+            if load_ratio is not None
+            else 0.0
+        )
 
+    def incremental_prefilter_cost(
+        prefix: tuple[int, ...],
+        offset: int,
+    ) -> float:
+        position = len(prefix)
+        score = weather_costs[offset]
+        if position < len(seed_offsets):
+            # The seed makes the beam search efficient; it is not a desired
+            # calendar. A full-strength penalty here turned even spacing into
+            # an accidental every-other-day prescription before the coaching
+            # model could evaluate recovery and session load.
+            score += abs(offset - seed_offsets[position]) * 0.25
+        if prefix:
+            gap = offset - prefix[-1]
+            if gap == 1:
+                # Keep doubles in the beam without letting a dense calendar
+                # crowd out every spaced alternative before full load scoring.
+                score += 3.0
+                if len(prefix) >= 2 and prefix[-1] - prefix[-2] == 1:
+                    score += 6.0
+            elif gap > 3:
+                score += 2.0 * (gap - 3)
+        return score
+
+    def prefilter_cost(
+        offsets: tuple[int, ...],
+    ) -> tuple[float, tuple[int, ...]]:
+        score = 0.0
+        prefix: tuple[int, ...] = ()
+        for offset in offsets:
+            score += incremental_prefilter_cost(prefix, offset)
+            prefix = (*prefix, offset)
+        return score, offsets
+
+    # Fourteen days was still small enough to enumerate before applying the
+    # full coaching model. At 21 days, common frequencies create hundreds of
+    # thousands or millions of combinations. Build the same kind of
+    # whole-horizon candidates incrementally and retain the strongest partial
+    # calendars at each depth. The display boundary never participates.
+    combination_count = comb(len(allowed_offsets), total_runs)
+    if combination_count <= 5_000:
+        candidate_offsets = list(combinations(allowed_offsets, total_runs))
+    else:
+        beam: list[tuple[float, tuple[int, ...], int]] = [(0.0, (), -1)]
+        for position in range(total_runs):
+            remaining = total_runs - position - 1
+            expanded: list[tuple[float, tuple[int, ...], int]] = []
+            for score, prefix, previous_index in beam:
+                first_index = previous_index + 1
+                final_index = len(allowed_offsets) - remaining
+                for allowed_index in range(first_index, final_index):
+                    offset = allowed_offsets[allowed_index]
+                    if (
+                        today_is_materially_available
+                        and position == 0
+                        and offset != 0
+                    ):
+                        continue
+                    expanded.append(
+                        (
+                            score + incremental_prefilter_cost(prefix, offset),
+                            (*prefix, offset),
+                            allowed_index,
+                        )
+                    )
+            beam = sorted(
+                expanded,
+                key=lambda item: (item[0], item[1]),
+            )[:MAX_ADAPTIVE_CANDIDATES]
+            if not beam:
+                break
+        candidate_offsets = [prefix for _, prefix, _ in beam]
+
+    if today_is_materially_available:
+        # Preserve a genuinely available current-day slot unless yesterday
+        # carried material cost. Rest otherwise competes normally in the full
+        # load/recovery model.
+        candidate_offsets = [
+            offsets for offsets in candidate_offsets if offsets and offsets[0] == 0
+        ]
     if len(candidate_offsets) > MAX_ADAPTIVE_CANDIDATES:
-        def prefilter_cost(offsets: tuple[int, ...]) -> tuple[float, tuple[int, ...]]:
-            score = float(
-                sum(
-                    abs(offset - seed)
-                    for offset, seed in zip(offsets, seed_offsets)
-                )
-            )
-            for offset in offsets:
-                state = daily_states[offset]
-                weather = assess_training_weather(
-                    state.planned_weather,
-                    state.weather_exposure_baseline,
-                )
-                score += weather.score * 3.0
-                if weather.extreme:
-                    score += 100.0
-            return score, offsets
-
-        # Score the visible-week calendars with the full projected coaching
-        # model before considering their second-week continuations. This keeps
-        # future context from deleting a strong current week and reduces the
-        # expensive full-horizon evaluation to a small beam.
-        ranked_candidates = sorted(
+        candidate_offsets = sorted(
             candidate_offsets,
             key=prefilter_cost,
-        )
-        prefixes = sorted(
-            {
-                tuple(
-                    offset
-                    for offset in offsets
-                    if offset < VISIBLE_HORIZON_DAYS
-                )
-                for offsets in candidate_offsets
-            }
-        )
-        visible_seed_offsets = [
-            offset for offset in seed_offsets if offset < VISIBLE_HORIZON_DAYS
-        ]
-        scored_prefixes = sorted(
-            (
-                _adaptive_candidate_cost(
-                    prefix,
-                    daily_states[:VISIBLE_HORIZON_DAYS],
-                    daily_state_options[:VISIBLE_HORIZON_DAYS],
-                    request,
-                    config,
-                    target_distance_range,
-                    cycle_size,
-                    visible_seed_offsets,
-                    taper_horizon=taper_horizon,
-                    completed_run_counts_by_block={
-                        0: completed_run_counts_by_block.get(0, 0)
-                    },
-                    completed_miles_by_block={
-                        0: (completed_miles_by_block or {}).get(0, 0.0)
-                    },
-                ),
-                prefix,
-            )
-            for prefix in prefixes
-        )
-        selected_prefix = scored_prefixes[0][1]
-        seed_prefix = tuple(visible_seed_offsets)
-
-        def prefix_is_fully_ready(prefix: tuple[int, ...]) -> bool:
-            planned: list[RecommendationResponse] = []
-            projected_miles = (completed_miles_by_block or {}).get(0, 0.0)
-            for position, offset in enumerate(prefix):
-                role = _quality_cadence_role(
-                    daily_state_options[offset],
-                    planned,
-                    config,
-                    _sequence_role(
-                        completed_run_counts_by_block.get(0, 0) + position,
-                        cycle_size,
-                        taper_horizon=taper_horizon,
-                    ),
-                )
-                state, result = _select_budgeted_timed_recommendation(
-                    daily_state_options[offset],
-                    planned,
-                    request,
-                    config,
-                    weekly_role=role,
-                    projected_week_miles=projected_miles,
-                    remaining_week_runs=len(prefix) - position - 1,
-                    target_week_high=target_distance_range[1],
-                    reserve_easy_miles=typical_easy_distance(
-                        daily_states[0]
-                    )[0],
-                )
-                if (
-                    result.workout_type == WorkoutType.REST
-                    or result.readiness.value != "ready"
-                ):
-                    return False
-                planned.append(result)
-                projected_miles += _midpoint(result)
-            return True
-
-        scored_by_prefix = {
-            prefix: score for score, prefix in scored_prefixes
-        }
-        if (
-            seed_prefix in scored_by_prefix
-            and prefix_is_fully_ready(seed_prefix)
-            and scored_by_prefix[seed_prefix] <= scored_prefixes[0][0] + 5.0
-        ):
-            selected_prefix = seed_prefix
-        retained_prefixes = {selected_prefix}
-        candidate_offsets = [
-            offsets
-            for offsets in ranked_candidates
-            if tuple(
-                offset
-                for offset in offsets
-                if offset < VISIBLE_HORIZON_DAYS
-            )
-            in retained_prefixes
-        ][:MAX_ADAPTIVE_CANDIDATES]
+        )[:MAX_ADAPTIVE_CANDIDATES]
 
     for offsets in candidate_offsets:
         cost = _adaptive_candidate_cost(
@@ -1538,11 +1686,8 @@ def _adaptive_run_day_offsets_for_frequency(
             request,
             config,
             target_distance_range,
-            cycle_size,
-            seed_offsets,
             taper_horizon=taper_horizon,
-            completed_run_counts_by_block=completed_run_counts_by_block,
-            completed_miles_by_block=completed_miles_by_block,
+            completed_miles_by_offset=completed_miles_by_offset,
         )
         if best_cost is None or (cost, offsets) < (best_cost, best_offsets):
             best_cost = cost
@@ -1561,186 +1706,214 @@ def adaptive_run_day_offsets(
     daily_state_options: list[list[FitnessState]] | None = None,
     forced_rest_offsets: set[int] | None = None,
     completed_run_offsets: set[int] | None = None,
-    completed_miles_by_block: dict[int, float] | None = None,
+    completed_miles_by_offset: dict[int, float] | None = None,
 ) -> list[int]:
-    """Select run count and dates together under the load model.
+    """Select both frequency and dates from one continuous-horizon model.
 
-    Historical cadence bounds a practical search neighborhood; it is not a
-    quota or an optimization penalty. Weekly mileage coverage rewards enough
-    sessions, while recovery, readiness, and interacting session load make
-    excess frequency expensive on their own.
+    ``target_run_count`` is retained for API compatibility but deliberately
+    ignored. Mileage coverage rewards enough useful sessions; recovery/load
+    interactions, minimum useful distance, and spacing reject excess ones.
     """
     if request.health_status == CurrentHealthStatus.PAIN_OR_INJURY_CONCERN:
         return []
+    del target_run_count
     daily_state_options = daily_state_options or [
         [state] for state in daily_states
     ]
     forced_rest_offsets = forced_rest_offsets or set()
     completed_run_offsets = completed_run_offsets or set()
-    completed_miles_by_block = completed_miles_by_block or {}
+    completed_miles_by_offset = completed_miles_by_offset or {}
     ordinary_easy_midpoint = sum(typical_easy_distance(daily_states[0])) / 2
-    mileage_supported_frequency = max(
+    horizon_scale = len(daily_states) / VISIBLE_HORIZON_DAYS
+    opening_load_ratio = effective_load_ratio(daily_states[0].recent_load)
+    if opening_load_ratio is None:
+        target_fraction = 0.50
+    else:
+        # Low accumulated load creates room to progress toward the upper part
+        # of the safe range, often through another useful easy run. As acute
+        # load rises, distribute only the lower/middle target.
+        load_position = min(
+            1.0,
+            max(0.0, (opening_load_ratio - 0.75) / 0.35),
+        )
+        target_fraction = 0.75 - load_position * 0.40
+    desired_weekly_miles = (
+        target_distance_range[0]
+        + (target_distance_range[1] - target_distance_range[0])
+        * target_fraction
+    )
+    desired_horizon_miles = max(
+        0.0,
+        desired_weekly_miles * horizon_scale
+        - sum(completed_miles_by_offset.values()),
+    )
+    central_horizon_count = max(
+        1,
+        round(desired_horizon_miles / max(1.0, ordinary_easy_midpoint)),
+    )
+    maximum_horizon_count = len(daily_states) - len(forced_rest_offsets)
+    if request.health_status == CurrentHealthStatus.SICK_OR_RECOVERING:
+        maximum_horizon_count = min(
+            maximum_horizon_count,
+            max(1, ceil(2 * horizon_scale)),
+        )
+    # Search useful counts directly. The old central-count-minus-three floor
+    # could exclude a lower-frequency plan even when slightly longer sessions
+    # stayed inside the allocator's established aerobic range. Derive a
+    # capacity floor from that same 1.75x useful-session ceiling, while keeping
+    # the upper side near the ordinary-distance center. This is a search bound,
+    # not a prescribed run count; the full recovery/load model still chooses.
+    maximum_useful_average = max(2.5, ordinary_easy_midpoint * 1.75)
+    capacity_supported_minimum = max(
+        1,
+        ceil(desired_horizon_miles / maximum_useful_average),
+    )
+    maximum_horizon_count = min(
+        maximum_horizon_count,
+        central_horizon_count + 3,
+    )
+    minimum_horizon_count = max(
         1,
         min(
-            7,
-            floor(
-                (sum(target_distance_range) / 2)
-                / max(1.0, ordinary_easy_midpoint)
-                + 0.999,
-            ),
+            central_horizon_count - 3,
+            capacity_supported_minimum,
+            maximum_horizon_count,
         ),
     )
-    minimum_frequency = max(1, target_run_count - 1)
-    maximum_frequency = min(
-        7,
-        max(
-            target_run_count + 1,
-            min(target_run_count + 2, mileage_supported_frequency),
-        ),
+    # The broad capacity floor adds only a bounded number of whole-horizon
+    # searches. Lower-count alternatives are retained first because they were
+    # the cases the old window omitted; the ordinary center remains inside
+    # this cap for a 21-day horizon.
+    maximum_horizon_count = min(
+        maximum_horizon_count,
+        minimum_horizon_count + MAX_HORIZON_COUNT_OPTIONS - 1,
     )
-    if request.health_status == CurrentHealthStatus.SICK_OR_RECOVERING:
-        maximum_frequency = min(maximum_frequency, 2)
     frequency_options = range(
-        min(minimum_frequency, maximum_frequency),
-        maximum_frequency + 1,
+        minimum_horizon_count,
+        maximum_horizon_count + 1,
     )
-    block_count = (
-        len(daily_states) + VISIBLE_HORIZON_DAYS - 1
-    ) // VISIBLE_HORIZON_DAYS
-    completed_run_counts_by_block = {
-        block: sum(
-            block * VISIBLE_HORIZON_DAYS
-            <= offset
-            < min(len(daily_states), (block + 1) * VISIBLE_HORIZON_DAYS)
-            for offset in completed_run_offsets
-        )
-        for block in range(block_count)
-    }
     choices: list[tuple[float, int, list[int]]] = []
-    for frequency in frequency_options:
+    for horizon_run_count in frequency_options:
         offsets = _adaptive_run_day_offsets_for_frequency(
             daily_states,
             request,
             config,
-            frequency,
+            max(1, round(horizon_run_count / horizon_scale)),
             target_distance_range,
             taper_horizon=taper_horizon,
             daily_state_options=daily_state_options,
             forced_rest_offsets=forced_rest_offsets,
             completed_run_offsets=completed_run_offsets,
-            completed_miles_by_block=completed_miles_by_block,
+            completed_miles_by_offset=completed_miles_by_offset,
+            horizon_run_count=horizon_run_count,
         )
         if not offsets:
             continue
-        planning_start_offset = next(
-            (
-                offset
-                for offset in range(len(daily_states))
-                if offset not in forced_rest_offsets
-            ),
-            len(daily_states),
-        )
-        seed_offsets = [
-            planning_start_offset + offset
-            for offset in automatic_run_day_offsets(
-                daily_states[planning_start_offset],
-                request.health_status,
-                config,
-                frequency,
-                horizon_days=len(daily_states) - planning_start_offset,
-            )
-        ]
-        cycle_size = max(
-            1,
-            floor(
-                len(seed_offsets)
-                * VISIBLE_HORIZON_DAYS
-                / len(daily_states)
-                + 0.5
-            ),
-        )
-        visible_offsets = tuple(
-            offset for offset in offsets if offset < VISIBLE_HORIZON_DAYS
-        )
-        visible_seed_offsets = automatic_run_day_offsets(
-            daily_states[0],
-            request.health_status,
-            config,
-            frequency,
-            horizon_days=VISIBLE_HORIZON_DAYS,
-        )[: len(visible_offsets)]
+        horizon_offsets = tuple(offsets)
         coaching_cost = _adaptive_candidate_cost(
-            visible_offsets,
-            daily_states[:VISIBLE_HORIZON_DAYS],
-            daily_state_options[:VISIBLE_HORIZON_DAYS],
+            horizon_offsets,
+            daily_states,
+            daily_state_options,
             request,
             config,
             target_distance_range,
-            cycle_size,
-            visible_seed_offsets,
             taper_horizon=taper_horizon,
-            completed_run_counts_by_block={
-                0: completed_run_counts_by_block.get(0, 0)
-            },
-            completed_miles_by_block={
-                0: completed_miles_by_block.get(0, 0.0)
-            },
+            completed_miles_by_offset=completed_miles_by_offset,
         )
-        planned_count = max(1, len(visible_offsets))
-        remaining_target_midpoint = max(
+        planned_count = max(1, len(horizon_offsets))
+        remaining_target_miles = max(
             0.0,
-            sum(target_distance_range) / 2
-            - completed_miles_by_block.get(0, 0.0),
+            desired_horizon_miles,
         )
-        required_average = remaining_target_midpoint / planned_count
-        # Compare the average burden of each candidate calendar, then add the
-        # convex cost of concentrating the weekly target into oversized
-        # sessions. This is what lets four short easy runs beat three large
-        # ones without awarding points merely for having four run days.
+        # Reserve realistic long and quality mileage before judging how much
+        # work the easy days must carry. Comparing the all-session average to
+        # a typical easy run falsely labels a normal mixed plan as
+        # concentrated and can reward an unnecessary extra run day.
+        cycle_count = max(1, round(horizon_scale))
+        long_slots = min(planned_count, cycle_count)
+        quality_slots = min(
+            max(0, planned_count - long_slots),
+            0 if taper_horizon else cycle_count,
+        )
+        easy_slots = max(0, planned_count - long_slots - quality_slots)
+        progression_factor = float(
+            config.get("coaching", {}).get(
+                "long_run_progression_factor", 1.10
+            )
+        )
+        long_distribution_reference = max(
+            ordinary_easy_midpoint,
+            min(
+                single_session_progression_reference_miles(daily_states[0])
+                * progression_factor,
+                desired_weekly_miles * 0.45,
+            ),
+        )
+        quality_distribution_reference = min(
+            MAXIMUM_ORDINARY_QUALITY_MILES,
+            ordinary_easy_midpoint + 1.0,
+        )
+        reserved_role_miles = (
+            long_slots * long_distribution_reference
+            + quality_slots * quality_distribution_reference
+        )
+        remaining_easy_miles = max(
+            0.0,
+            remaining_target_miles - reserved_role_miles,
+        )
+        required_easy_average = (
+            remaining_easy_miles / easy_slots
+            if easy_slots
+            else remaining_target_miles / planned_count
+        )
+        easy_expansion_reference = _ordinary_easy_expansion_reference(
+            daily_states[0]
+        )
         concentration = max(
             0.0,
-            required_average / max(1.0, ordinary_easy_midpoint) - 1.0,
+            required_easy_average / max(1.0, ordinary_easy_midpoint) - 1.0,
         )
+        # Once the normal expansion ceiling is crossed, another useful easy
+        # day should become substantially more attractive. Normalize by the
+        # available expansion band so this remains athlete-relative instead
+        # of becoming a hidden mileage or run-count threshold.
+        oversize_easy = max(
+            0.0,
+            (required_easy_average - easy_expansion_reference)
+            / max(0.5, easy_expansion_reference - ordinary_easy_midpoint),
+        )
+        required_average = remaining_target_miles / planned_count
         too_small = max(0.0, (2.0 - required_average) / 2.0)
-        distribution_cost = 50.0 * (
-            concentration * concentration + too_small * too_small
+        distribution_cost = 70.0 * (
+            concentration * concentration
+            + oversize_easy * oversize_easy
+            + too_small * too_small
         )
-        visible_gaps = [
+        horizon_gaps = [
             current - previous
             for previous, current in zip(
-                visible_offsets, visible_offsets[1:]
+                horizon_offsets, horizon_offsets[1:]
             )
         ]
         spacing_distribution_cost = (
-            12.0 * sum(gap == 1 for gap in visible_gaps)
-            + 2.0 * sum(max(0, gap - 3) for gap in visible_gaps)
-        )
-        if visible_offsets:
-            opening_load_ratio = effective_load_ratio(
-                daily_states[0].recent_load
-            )
-            high_load_threshold = float(
-                config.get("coaching", {}).get("high_load_ratio", 1.30)
-            )
-            if (
-                request.health_status == CurrentHealthStatus.NORMAL
-                and (
-                    opening_load_ratio is None
-                    or opening_load_ratio < high_load_threshold
+            3.0 * sum(gap == 1 for gap in horizon_gaps)
+            + 6.0 * sum(
+                current - two_back == 2
+                for two_back, current in zip(
+                    horizon_offsets, horizon_offsets[2:]
                 )
-            ):
-                spacing_distribution_cost += 12.0 * max(
-                    0, visible_offsets[0] - 1
-                )
+            )
+            + 2.0 * sum(max(0, gap - 3) for gap in horizon_gaps)
+        ) / max(1.0, horizon_scale / 2.0)
         comparable_cost = (
             coaching_cost / planned_count
             + distribution_cost
             + spacing_distribution_cost
         )
-        # No run-count penalty belongs here. Mileage distribution rewards
-        # useful extra easy sessions; recovery/load interactions reject
-        # gratuitous ones. Prefer the lower frequency only on a true tie.
-        choices.append((comparable_cost, frequency, offsets))
+        # No historical run-count penalty belongs here. Mileage distribution
+        # rewards useful extra easy sessions; recovery/load interactions and
+        # minimum useful distance reject gratuitous ones.
+        choices.append((comparable_cost, horizon_run_count, offsets))
     return min(choices, key=lambda item: (item[0], item[1], item[2]))[2] if choices else []
 
 
@@ -1811,7 +1984,7 @@ def _cap_visible_distance_high(
                 ),
             }
         )
-    # A continuous 14-day allocation can intentionally move one run across
+    # A continuous multi-week allocation can intentionally move one run across
     # the visible boundary. If completed mileage or rounding still leaves the
     # displayed slice above its own ceiling after optional range headroom is
     # removed, reduce ordinary aerobic mileage before touching coached long
@@ -1848,7 +2021,7 @@ def _cap_visible_distance_high(
                 "distance_range_miles": reduced_range,
                 "reasons": [
                     *result.reasons,
-                    "Aerobic mileage was reduced because the rolling 14-day allocation placed more load inside this visible seven-day slice.",
+                    "Aerobic mileage was reduced because the continuous allocation placed more load inside this seven-day window.",
                 ],
             }
         )
@@ -1870,14 +2043,16 @@ def _allocate_visible_distance_ranges(
     daily_states: list[FitnessState],
     target_range: tuple[float, float],
     config: dict,
+    *,
+    weekly_target_range: tuple[float, float] | None = None,
 ) -> list[WeeklyScheduleDay]:
     """Jointly allocate session distance and retain only meaningful roles.
 
     The solver compares a semantically distinct long-run plan with an aerobic
-    endurance alternative. It optimizes the whole week on a half-mile grid,
-    balancing target coverage, per-session load, progression limits, and role
-    meaning. Recovery/caution sessions remain fixed and are never enlarged to
-    make a weekly number work.
+    endurance alternative. It optimizes the supplied horizon on a half-mile
+    grid, balancing target coverage, local load density, per-session load,
+    progression limits, and role meaning. Recovery/caution sessions remain
+    fixed and are never enlarged to make a mileage number work.
     """
     updated = list(days)
     completed_miles = sum(
@@ -1980,6 +2155,36 @@ def _allocate_visible_distance_ranges(
                 minimum,
                 floor(recovery_ceiling * 4 + 1e-9) / 4,
             )
+            # Extra recovery may expose the safe single-session progression
+            # ceiling, but the long run must not become the default sink for
+            # every unallocated mile. At low frequency a long run can
+            # reasonably carry a large share of the week; beyond roughly 45%
+            # the surrounding aerobic and quality work is too small to form a
+            # balanced program. This scales with weekly volume rather than
+            # imposing an athlete-independent mileage cap.
+            weekly_budget_midpoint = sum(
+                weekly_target_range or target_range
+            ) / 2
+            # Low-volume weeks can legitimately devote a larger fraction to
+            # one long run because every useful session has a minimum size.
+            # As weekly volume grows, converge smoothly to the 45% ceiling.
+            maximum_long_share = max(
+                0.45,
+                0.60 - max(0.0, weekly_budget_midpoint - 12.5) * 0.015,
+            )
+            weekly_share_ceiling = (
+                floor(
+                    weekly_budget_midpoint
+                    * maximum_long_share
+                    * 4
+                    + 1e-9
+                )
+                / 4
+            )
+            maximum = max(
+                minimum,
+                min(maximum, weekly_share_ceiling),
+            )
             preferred = minimum
             weight = 1.20
         elif role == "quality":
@@ -1989,15 +2194,19 @@ def _allocate_visible_distance_ranges(
             # warm-up and cool-down. The scaling pass below reduces reps or
             # sustained work rather than merely relabeling a shorter run.
             minimum = MINIMUM_QUALITY_RANGE_MILES[1]
+            # Quality distance is set by the workout's warm-up, work dose,
+            # recoveries, and cool-down—not by whatever weekly mileage remains.
+            # It may scale down below the original range when load requires,
+            # but ordinary budget allocation never enlarges the session.
+            original_midpoint = (lower + upper) / 2
+            quality_center = floor(
+                (original_midpoint + 0.25) * 2 + 1e-9
+            ) / 2
             preferred = min(
-                max(upper + 1.0, easy_reference[1] + 1.0),
-                ceil(((lower + upper) / 2) * 2 - 1e-9) / 2,
+                quality_center,
+                MAXIMUM_ORDINARY_QUALITY_MILES,
             )
-            # Quality structure scales through easy warm-up/cool-down volume;
-            # the work itself is not enlarged. This prevents a fixed 4-mile
-            # template from pushing all volume onto one easy run for a
-            # higher-mileage athlete.
-            maximum = max(upper + 1.0, easy_reference[1] + 1.0)
+            maximum = preferred
             weight = 1.05
         else:
             # Ordinary easy distance is a default, not a floor. When weekly
@@ -2080,18 +2289,6 @@ def _allocate_visible_distance_ranges(
         (record for record in records if record["role"] == "long"),
         None,
     )
-    baseline_projection = completed_miles + fixed_midpoint + sum(
-        record["preferred"] for record in records
-    )
-    budget_supported_long_target = (
-        min(
-            primary_long["maximum"],
-            primary_long["minimum"]
-            + max(0.0, target_range[0] - baseline_projection),
-        )
-        if primary_long is not None
-        else 0.0
-    )
     ordinary_easy_midpoint = sum(typical_easy_distance(daily_states[0])) / 2
     long_margin = max(
         0.5,
@@ -2127,7 +2324,7 @@ def _allocate_visible_distance_ranges(
                 option
                 for option in primary_long["options"]
                 if option + 1e-9
-                >= max(minimum_meaningful, budget_supported_long_target)
+                >= minimum_meaningful
             ]
             if not long_options:
                 return None
@@ -2248,13 +2445,70 @@ def _allocate_visible_distance_ranges(
                     and day.recommendation.distance_range_miles
                 )
                 projected_mid = (projected_low + projected_high) / 2
-                shortfall = max(0.0, target_range[0] - projected_high)
-                excess = max(0.0, projected_low - target_range[1])
+                total_shortfall = max(0.0, target_range[0] - projected_high)
+                total_excess = max(0.0, projected_low - target_range[1])
+                density_score = 0.0
+                if (
+                    weekly_target_range is not None
+                    and len(updated) >= VISIBLE_HORIZON_DAYS
+                ):
+                    allowance = max(
+                        0.5,
+                        min(1.0, weekly_target_range[1] * 0.05),
+                    )
+                    soft_low = max(0.0, weekly_target_range[0] - allowance)
+                    soft_high = weekly_target_range[1] + allowance
+                    opening_recent_miles = (
+                        daily_states[0]
+                        .recent_load.trailing_7d.distance_miles
+                    )
+                    for end in range(len(updated)):
+                        start = max(
+                            0,
+                            end - VISIBLE_HORIZON_DAYS + 1,
+                        )
+                        retained_opening_miles = opening_recent_miles * max(
+                            0.0,
+                            1.0 - end / VISIBLE_HORIZON_DAYS,
+                        )
+                        cumulative_low = retained_opening_miles
+                        cumulative_high = retained_opening_miles
+                        for index in range(start, end + 1):
+                            day = updated[index]
+                            result = day.recommendation
+                            if (
+                                not result
+                                or result.workout_type == WorkoutType.REST
+                                or not result.distance_range_miles
+                            ):
+                                continue
+                            lower, upper = allocated_ranges.get(
+                                index, result.distance_range_miles
+                            )
+                            cumulative_low += lower
+                            cumulative_high += upper
+                        cumulative_midpoint = (
+                            cumulative_low + cumulative_high
+                        ) / 2
+                        window_excess = max(
+                            0.0, cumulative_midpoint - soft_high
+                        )
+                        window_shortfall = (
+                            max(0.0, soft_low - cumulative_midpoint)
+                            if end >= VISIBLE_HORIZON_DAYS - 1
+                            else 0.0
+                        )
+                        # Overload is the stronger concern. Underload remains
+                        # a lighter preference because recovery, weather, or
+                        # forced rest may justify a locally quieter span.
+                        density_score += window_excess**2 * 4.0
+                        density_score += window_shortfall**2 * 0.75
                 score = (
                     balance_cost
                     + (projected_mid - target_midpoint) ** 2
-                    + shortfall**2 * 30.0
-                    + excess**2 * 40.0
+                    + total_shortfall**2 * 30.0
+                    + total_excess**2 * 40.0
+                    + density_score
                     - (0.25 if retain_long else 0.0)
                 )
                 if best is None or score < best[0]:
@@ -2341,16 +2595,16 @@ def _allocate_visible_distance_ranges(
             allowed_units = max(0.0, 2.0 + base_overflow - residual)
             if allocated_units > allowed_units + 0.05:
                 intensity_factor = (
-                    1.35
+                    QUALITY_SESSION_LOAD_FACTOR
                     if provisional_type
                     in {
                         WorkoutType.INTERVALS,
                         WorkoutType.TEMPO_THRESHOLD,
                         WorkoutType.RACE,
                     }
-                    else 1.15
+                    else LONG_RUN_LOAD_FACTOR
                     if provisional_type == WorkoutType.LONG
-                    else 0.70
+                    else RECOVERY_RUN_LOAD_FACTOR
                     if provisional_type == WorkoutType.RECOVERY
                     else 1.0
                 )
@@ -2554,20 +2808,12 @@ def build_weekly_schedule(
         for offset, items in completed_activities_by_offset.items()
         if items and 0 <= offset < planning_horizon_days
     }
-    completed_miles_by_block: dict[int, float] = {}
+    completed_miles_by_offset: dict[int, float] = {}
     for offset, items in completed_activities_by_offset.items():
         if not items or not 0 <= offset < planning_horizon_days:
             continue
-        block = offset // VISIBLE_HORIZON_DAYS
-        completed_miles_by_block[block] = (
-            completed_miles_by_block.get(block, 0.0)
-            + sum(item.distance_miles for item in items)
-        )
-    remaining_target = (
-        max(0, int(target_run_count) - completed_run_count)
-        if target_run_count is not None
-        else None
-    )
+        completed_miles = sum(item.distance_miles for item in items)
+        completed_miles_by_offset[offset] = completed_miles
     if target_distance_range is None:
         capacity = max(
             daily_states[0].recent_load.trailing_28d.distance_miles / 4.0,
@@ -2591,32 +2837,22 @@ def build_weekly_schedule(
             daily_states,
             request,
             config,
-            int(target_run_count),
+            int(target_run_count or 0),
             target_distance_range,
             taper_horizon=taper_horizon,
             daily_state_options=daily_state_options,
             forced_rest_offsets=forced_rest_offsets,
             completed_run_offsets=completed_run_offsets,
-            completed_miles_by_block=completed_miles_by_block,
+            completed_miles_by_offset=completed_miles_by_offset,
         )
-        if (
-            planning_horizon_days > VISIBLE_HORIZON_DAYS
-            and target_run_count is not None
-            and (remaining_target is None or remaining_target > 0)
-        )
+        if planning_horizon_days > VISIBLE_HORIZON_DAYS
         else automatic_run_day_offsets(
             offset_state,
             request.health_status,
             config,
-            (
-                target_run_count
-                if planning_horizon_days > VISIBLE_HORIZON_DAYS
-                else remaining_target
-            ),
+            target_run_count,
             horizon_days=planning_horizon_days,
         )
-        if remaining_target is None or remaining_target > 0
-        else []
     )
     offsets = [
         offset
@@ -2640,42 +2876,12 @@ def build_weekly_schedule(
             # day immediately before a race merely to preserve run count.
             if race_offset - 1 in offsets:
                 offsets.remove(race_offset - 1)
-    # Coordinate each weekly-sized cycle across the rolling horizon. The last
-    # run in each cycle remains unassigned so long/easy wins on evidence; it is
-    # never made long merely because it is near the display boundary.
-    role_preferences: dict[int, str] = {}
-    if planning_horizon_days == VISIBLE_HORIZON_DAYS:
-        role_preferences = {offset: "easy" for offset in offsets[:-1]}
-        if len(offsets) >= 3 and not taper_horizon:
-            role_preferences[offsets[1]] = "quality"
-    else:
-        cycle_size = len(
-            automatic_run_day_offsets(
-                offset_state,
-                request.health_status,
-                config,
-                target_run_count,
-                horizon_days=VISIBLE_HORIZON_DAYS,
-            )
-        )
-        for offset in offsets:
-            block = offset // VISIBLE_HORIZON_DAYS
-            block_start = block * VISIBLE_HORIZON_DAYS
-            planned_before_in_block = sum(
-                block_start <= earlier < offset for earlier in offsets
-            )
-            role = _sequence_role(
-                completed_run_count + planned_before_in_block
-                if block == 0
-                else planned_before_in_block,
-                max(1, cycle_size),
-                taper_horizon=taper_horizon,
-            )
-            if role:
-                role_preferences[offset] = role
     planned: list[RecommendationResponse] = []
     days: list[WeeklyScheduleDay] = []
-    projected_miles_by_block: dict[int, float] = {}
+    projected_horizon_miles = sum(completed_miles_by_offset.values())
+    horizon_target_high = target_distance_range[1] * (
+        planning_horizon_days / VISIBLE_HORIZON_DAYS
+    )
     stable_easy_distance = typical_easy_distance(daily_states[0])
     low_cost_consecutive, consecutive_facts = consecutive_day_evidence(
         daily_states[0], config
@@ -2683,11 +2889,6 @@ def build_weekly_schedule(
     for offset, raw_state in enumerate(daily_states):
         completed = completed_activities_by_offset.get(offset, [])
         if completed:
-            block = offset // VISIBLE_HORIZON_DAYS
-            projected_miles_by_block[block] = (
-                projected_miles_by_block.get(block, 0.0)
-                + sum(item.distance_miles for item in completed)
-            )
             workout_types = {item.workout_type for item in completed}
             role = (
                 "completed_quality_run"
@@ -2734,25 +2935,21 @@ def build_weekly_schedule(
                 )
             )
             continue
-        block = offset // VISIBLE_HORIZON_DAYS
-        block_end = (block + 1) * VISIBLE_HORIZON_DAYS
-        remaining_week_runs = sum(
-            offset < later < block_end for later in offsets
-        )
+        remaining_horizon_runs = sum(offset < later for later in offsets)
         state, result = _select_budgeted_timed_recommendation(
             daily_state_options[offset],
             planned,
             request,
             config,
-            weekly_role=_quality_cadence_role(
+            weekly_role=_elapsed_workout_role(
                 daily_state_options[offset],
                 planned,
                 config,
-                role_preferences.get(offset),
+                taper_horizon=taper_horizon,
             ),
-            projected_week_miles=projected_miles_by_block.get(block, 0.0),
-            remaining_week_runs=remaining_week_runs,
-            target_week_high=target_distance_range[1],
+            projected_week_miles=projected_horizon_miles,
+            remaining_week_runs=remaining_horizon_runs,
+            target_week_high=horizon_target_high,
             reserve_easy_miles=stable_easy_distance[0],
         )
         timing_adjusted_for_recovery = (
@@ -2769,9 +2966,7 @@ def build_weekly_schedule(
             )
         if result.workout_type != WorkoutType.REST:
             planned.append(result)
-            projected_miles_by_block[block] = (
-                projected_miles_by_block.get(block, 0.0) + _midpoint(result)
-            )
+            projected_horizon_miles += _midpoint(result)
         role = {
             WorkoutType.RECOVERY: "recovery_run",
             WorkoutType.EASY: "easy_run",
@@ -2791,7 +2986,7 @@ def build_weekly_schedule(
                 recommendation=result,
                 day_role=role,
                 rationale=(
-                    "Selected from the 14-day horizon using projected recovery, weekly mileage, and balanced spacing; cadence yields only to material readiness, load, or weather evidence. "
+                    "Selected from the continuous rolling 21-day plan using projected recovery, rolling mileage, and balanced spacing. "
                     + (
                         "A back-to-back run is reasonable because the previous run was short and easy enough."
                         if offset == 0 and low_cost_consecutive
@@ -2824,6 +3019,7 @@ def build_weekly_schedule(
                 target_distance_range[1] * horizon_scale,
             ),
             config,
+            weekly_target_range=target_distance_range,
         )
         visible_days = allocated_horizon[:VISIBLE_HORIZON_DAYS]
     else:
@@ -2833,33 +3029,12 @@ def build_weekly_schedule(
             target_distance_range,
             config,
         )
-    visible_days = _cap_visible_distance_high(
-        visible_days,
-        target_distance_range[1],
-    )
-    run_results = [day.recommendation for day in visible_days if day.recommendation and day.recommendation.workout_type != WorkoutType.REST]
-    if target_run_count is not None:
-        response_target_run_count = len(
-            automatic_run_day_offsets(
-                offset_state,
-                request.health_status,
-                config,
-                target_run_count,
-                horizon_days=VISIBLE_HORIZON_DAYS,
-            )
+        visible_days = _cap_visible_distance_high(
+            visible_days,
+            target_distance_range[1],
         )
-    else:
-        response_target_run_count = len(run_results) + completed_run_count
-    visible_selected = len(run_results)
-    frequency_adjustment_count = max(
-        0,
-        response_target_run_count - completed_run_count - visible_selected,
-    )
-    outside_view_count = (
-        sum(offset >= planning_horizon_days for offset in offsets)
-        if planning_horizon_days == VISIBLE_HORIZON_DAYS
-        else 0
-    )
+    run_results = [day.recommendation for day in visible_days if day.recommendation and day.recommendation.workout_type != WorkoutType.REST]
+    response_target_run_count = len(run_results) + completed_run_count
     completed_visible_miles = sum(
         activity.distance_miles
         for day in visible_days
@@ -2888,21 +3063,13 @@ def build_weekly_schedule(
     )
     forced_rest_count = sum(day.forced_rest for day in visible_days)
     projected_range = (round(distance_low, 1), round(distance_high, 1))
-    if outside_view_count:
-        horizon_explanation = (
-            f"{outside_view_count} more run"
-            f"{'s' if outside_view_count != 1 else ''} "
-            f"{'fall' if outside_view_count != 1 else 'falls'} after this view so the week is not crowded."
-        )
-    elif frequency_adjustment_count and forced_rest_count:
-        horizon_explanation = f"{frequency_adjustment_count} fewer planned run{'s' if frequency_adjustment_count != 1 else ''} fit because of your selected rest-day constraints."
-    elif frequency_adjustment_count:
-        horizon_explanation = (
-            f"The load and recovery model selected {frequency_adjustment_count} fewer run"
-            f"{'s' if frequency_adjustment_count != 1 else ''} than recent cadence suggests; run count is not forced."
-        )
-    elif guardrail_rest_count:
+    if guardrail_rest_count:
         horizon_explanation = f"{guardrail_rest_count} planned day{'s were' if guardrail_rest_count != 1 else ' was'} changed to rest based on recovery, health, load, or weather."
+    elif forced_rest_count:
+        horizon_explanation = (
+            "The continuous 21-day plan was recalculated around your selected "
+            "rest-day constraints."
+        )
     else:
         horizon_explanation = summarize_distance_alignment(
             projected_range,

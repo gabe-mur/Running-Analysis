@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from run_analysis.recovery import (
     EASY_RUN_RESIDUAL_LIMIT,
+    QUALITY_SESSION_LOAD_FACTOR,
     TAXING_RUN_RESIDUAL_LIMIT,
     athlete_relative_session_load,
     estimate_recovery,
@@ -20,6 +21,19 @@ def test_session_load_scales_with_athlete_relative_work() -> None:
 
     assert long > ordinary
     assert long / ordinary > 1.5
+
+
+def test_completed_quality_session_preserves_planned_role_multiplier() -> None:
+    state = _state()
+    ordinary, ordinary_evidence = athlete_relative_session_load(
+        _difficulty(miles=5), state.recent_load.trailing_28d
+    )
+    quality, quality_evidence = athlete_relative_session_load(
+        _difficulty(miles=5, quality=True), state.recent_load.trailing_28d
+    )
+    assert quality == ordinary * QUALITY_SESSION_LOAD_FACTOR
+    assert ordinary_evidence["session_type_factor"] == 1.0
+    assert quality_evidence["session_type_factor"] == QUALITY_SESSION_LOAD_FACTOR
 
 
 def test_recovery_decays_smoothly_across_old_hour_boundary() -> None:

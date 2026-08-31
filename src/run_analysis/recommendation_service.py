@@ -17,6 +17,7 @@ from .forecast import (
     planned_forecast_options,
 )
 from .recommendation import recommend_next_run
+from .prescription_matching import archive_weekly_prescriptions
 from .run_feedback import list_runs
 from .weekly_schedule import (
     WEEKLY_PLANNER_VERSION,
@@ -345,6 +346,7 @@ def generate_weekly_schedule(
             )
         )
     result = result.model_copy(update={"trailing_days": trailing_days})
+    archive_weekly_prescriptions(connection, result)
     connection.execute(
         """
         INSERT INTO app_state(key,value_json,updated_at_utc) VALUES ('weekly_schedule',?,?)
@@ -432,11 +434,9 @@ def _today_plan_time_is_stale(
 
 
 def _weekly_plan_shape_is_stale(schedule: WeeklyScheduleResponse) -> bool:
-    """Reject saved plans produced before visible-week volume coordination."""
+    """Reject saved plans produced before continuous-horizon coordination."""
     return (
         getattr(schedule, "planner_version", 1) < WEEKLY_PLANNER_VERSION
-        or schedule.projected_distance_range_miles[1]
-        > schedule.target_distance_range_miles[1]
         or len(schedule.trailing_days) != 7
         or schedule.trailing_days[-1].date
         != schedule.start_date - timedelta(days=1)

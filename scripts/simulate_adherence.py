@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from run_analysis.adherence_projection import runs_from_summaries, simulate_adherence
 from run_analysis.config import load_config, resolve_project_path
-from run_analysis.db import connect
+from run_analysis.db import connect, initialize
 from run_analysis.recommendation_service import current_fitness_state
 from run_analysis.run_feedback import list_runs
 
@@ -25,6 +25,7 @@ def main() -> None:
     zone = ZoneInfo(str(config["timezone_default"]))
     start_at = datetime.now(zone)
     with connect(database) as connection:
+        initialize(connection)
         state = current_fitness_state(connection, config)
         runs = runs_from_summaries(list_runs(connection, limit=5000))
     weeks = simulate_adherence(

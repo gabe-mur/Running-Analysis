@@ -149,7 +149,7 @@ def _eligibility(
     segments: list[Segment],
     moving_diagnostics: dict,
     config: dict,
-    override: sqlite3.Row | None,
+    override: sqlite3.Row | dict[str, object] | None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     thresholds = config["model"]
@@ -214,6 +214,9 @@ def _eligibility(
         if override["workout_type"] and str(override["workout_type"]).casefold() in {
             "interval",
             "intervals",
+            "tempo",
+            "threshold",
+            "tempo_threshold",
             "race",
             "walk",
             "walk/jog",
@@ -296,9 +299,26 @@ def process_activities(
         override = connection.execute(
             "SELECT * FROM run_overrides WHERE activity_id = ?", (row["activity_id"],)
         ).fetchone()
-        override_values = dict(override) if override else None
+        prescription = connection.execute(
+            """
+            SELECT ph.workout_type
+            FROM activity_plan_matches ap
+            JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
+            WHERE ap.activity_id=?
+            """,
+            (row["id"],),
+        ).fetchone()
+        override_values = dict(override) if override else {}
+        if (
+            prescription is not None
+            and not override_values.get("workout_type")
+        ):
+            override_values["workout_type"] = prescription["workout_type"]
+        effective_override = (
+            override_values if override_values else None
+        )
         activity_fingerprint = hashlib.sha256(
-            f"{fingerprint}|{json.dumps(override_values, sort_keys=True)}".encode()
+            f"{fingerprint}|{json.dumps(effective_override, sort_keys=True)}".encode()
         ).hexdigest()
         current = connection.execute(
             "SELECT processing_fingerprint FROM activity_metrics WHERE activity_id = ?", (row["id"],)
@@ -328,7 +348,14 @@ def process_activities(
             config["segmentation"],
             config["elevation"],
         )
-        eligible, reasons = _eligibility(row, points, segments, movement.diagnostics, config, override)
+        eligible, reasons = _eligibility(
+            row,
+            points,
+            segments,
+            movement.diagnostics,
+            config,
+            effective_override,
+        )
         distance = row["total_distance_m"]
         elapsed = row["total_elapsed_time_s"]
         device_timer = row["lap_recorded_time_s"]

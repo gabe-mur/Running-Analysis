@@ -400,6 +400,22 @@ class HistoricalWorkoutComparison(ApiModel):
     metrics: list[WorkoutAnalysisMetric] = Field(default_factory=list)
 
 
+class PrescriptionMatchAnalysis(ApiModel):
+    matched: bool = True
+    confidence: ConfidenceLevel
+    title: str
+    planned_for: datetime
+    quality_session_type: QualitySessionType | None = None
+    target_distance_range_miles: tuple[float, float] | None = None
+    timing_delta_hours: float = Field(ge=0)
+    distance_delta_miles: float = Field(ge=0)
+    execution_status: str
+    summary: str
+    target_work_minutes: float | None = Field(default=None, ge=0)
+    detected_work_minutes: float | None = Field(default=None, ge=0)
+    detection_source: str
+
+
 class WorkoutAnalysis(ApiModel):
     workout_type: WorkoutType
     definition: str
@@ -409,6 +425,7 @@ class WorkoutAnalysis(ApiModel):
     recovery: WorkoutAnalysisDimension
     interval_analysis: IntervalAnalysis | None = None
     historical_comparison: HistoricalWorkoutComparison | None = None
+    prescription_match: PrescriptionMatchAnalysis | None = None
     progression_recommendation: str | None = None
 
 
@@ -660,6 +677,7 @@ class FitnessState(ApiModel):
     quality_sessions_14d: int = Field(default=0, ge=0)
     completed_quality_session_count: int = Field(default=0, ge=0)
     running_days_28d: int = Field(default=0, ge=0)
+    typical_easy_run_miles: float | None = Field(default=None, gt=0)
     easy_fraction_14d: float | None = Field(default=None, ge=0, le=1)
     moderate_fraction_14d: float | None = Field(default=None, ge=0, le=1)
     moderate_evidence_runs_14d: int = Field(default=0, ge=0)
@@ -887,6 +905,7 @@ class CoachingSettings(ApiModel):
     training_goal: str = Field(pattern="^(general_fitness|5k|10k|half_marathon|marathon)$")
     goal_date: date | None = None
     goal_pace_min_mile: float | None = Field(default=None, ge=4, le=20)
+    general_fitness_progression_fraction: float = Field(default=0.08, ge=0, le=0.10)
     long_run_progression_factor: float = Field(ge=1, le=1.5)
     long_run_target_progression_fraction: float = Field(ge=0, le=0.10)
     high_load_ratio: float = Field(gt=1, le=3)

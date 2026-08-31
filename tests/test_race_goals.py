@@ -123,7 +123,7 @@ def test_marathon_goal_rejects_date_that_cannot_reach_long_run_target(tmp_path) 
             )
 
 
-def test_marathon_goal_raises_weekly_trajectory_without_overriding_general_mode() -> None:
+def test_marathon_goal_never_reduces_productive_general_trajectory() -> None:
     as_of = datetime(2026, 8, 7, 12, tzinfo=timezone.utc)
     activities = [
         PlanningActivity(
@@ -146,7 +146,7 @@ def test_marathon_goal_raises_weekly_trajectory_without_overriding_general_mode(
         activities, as_of, marathon
     )
 
-    assert sum(marathon_target) > sum(general_target)
+    assert sum(marathon_target) >= sum(general_target)
     assert "backward-planned trajectory" in evidence.rationale
 
 
