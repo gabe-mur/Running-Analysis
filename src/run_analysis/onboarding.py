@@ -298,7 +298,10 @@ def setup_state(connection, config: dict) -> SetupState:
             detail=(
                 f"{runs} running activities imported."
                 if runs
-                else "No runs yet. Drop TCX or FIT files anywhere on the page."
+                else (
+                    "No runs yet. Import recent TCX or FIT files, or complete the scheduled "
+                    "10–30-minute conversational Zone 2 run or run/walk."
+                )
             ),
             blocking=True,
         ),

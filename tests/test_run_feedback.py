@@ -14,6 +14,7 @@ from run_analysis.movement import MovementInterval
 from run_analysis.run_feedback import (
     _feedback_text,
     _fitness_observation,
+    _infer_workout_type,
     assess_cardiac_drift,
     build_mile_splits,
 )
@@ -113,7 +114,12 @@ def test_drift_rejects_a_material_finishing_surge() -> None:
     assert "not a steady-state" in result.reason
 
 
-def test_run_feedback_reports_the_same_reduced_tempo_weight_as_progress() -> None:
+def test_unlabeled_long_run_classification_is_athlete_relative() -> None:
+    assert _infer_workout_type(None, 7.0, 70, {}, 9.0) == WorkoutType.EASY
+    assert _infer_workout_type(None, 9.5, 95, {}, 9.0) == WorkoutType.LONG
+
+
+def test_run_feedback_keeps_quality_out_of_the_steady_aerobic_trend() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     result = {
@@ -137,9 +143,9 @@ def test_run_feedback_reports_the_same_reduced_tempo_weight_as_progress() -> Non
     )
 
     assert observation is not None
-    assert observation.included_in_trend is True
-    assert observation.trend_weight == pytest.approx(0.65 * 0.59)
-    assert "38% influence" in observation.exclusion_reasons[0]
+    assert observation.included_in_trend is False
+    assert observation.trend_weight == 0
+    assert "0% influence" in observation.exclusion_reasons[0]
 
 
 def test_assessment_is_a_run_specific_single_sentence() -> None:

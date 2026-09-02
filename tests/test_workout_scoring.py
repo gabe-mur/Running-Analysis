@@ -175,6 +175,99 @@ def test_prescribed_threshold_uses_recorded_work_lap_not_total_zone_bucket() -> 
     assert analysis.confidence == ConfidenceLevel.HIGH
 
 
+def test_structured_interval_prescription_has_a_machine_readable_work_dose() -> None:
+    connection = _laps_connection()
+    planned_for = datetime(2026, 9, 1, 7, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.INTERVALS,
+        quality_session_type=QualitySessionType.SHORT_INTERVALS,
+        title="Short controlled pickups",
+        distance_range_miles=(4.0, 4.5),
+        structure=[
+            WorkoutStep(
+                instruction="8 x 1 minute",
+                repetitions=8,
+                work_duration_minutes=1,
+                recovery_duration_minutes=1.5,
+                target_zones=["Z4 effort"],
+            )
+        ],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.2,
+        moving_minutes=42,
+        elapsed_minutes=42,
+        stopped_minutes=0,
+        zone_load=100,
+        zone_breakdown=ZoneBreakdown(
+            easy_minutes=30,
+            moderate_minutes=3,
+            hard_minutes=5,
+        ),
+        is_quality_session=True,
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [151, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=0.5,
+        distance_delta_miles=0,
+        match_confidence="high",
+    )
+
+    assert analysis.target_work_minutes == 8
+    assert analysis.detected_work_minutes == 8
+    assert analysis.execution_status == "Completed as prescribed"
+
+
+def test_unstructured_quality_text_cannot_pass_from_distance_alone() -> None:
+    connection = _laps_connection()
+    planned_for = datetime(2026, 9, 1, 7, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.INTERVALS,
+        quality_session_type=QualitySessionType.SHORT_INTERVALS,
+        title="Legacy prose-only intervals",
+        distance_range_miles=(4.0, 4.5),
+        structure=[WorkoutStep(instruction="Run some intervals", target_zones=["Z4"])],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.2,
+        moving_minutes=42,
+        elapsed_minutes=42,
+        stopped_minutes=0,
+        zone_load=100,
+        zone_breakdown=ZoneBreakdown(easy_minutes=42),
+        is_quality_session=True,
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [151, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=0.5,
+        distance_delta_miles=0,
+        match_confidence="high",
+    )
+
+    assert analysis.target_work_minutes is None
+    assert analysis.execution_status == "Prescription attempted"
+
+
 def test_threshold_analysis_detects_sustained_manual_lap_without_saved_plan() -> None:
     connection = _laps_connection()
     for lap, (seconds, hr) in enumerate(((660, 144), (1081, 168), (896, 152))):

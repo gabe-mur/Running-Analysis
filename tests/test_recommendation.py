@@ -39,7 +39,6 @@ CONFIG = {
         "long_run_progression_factor": 1.10,
         "high_load_ratio": 1.30,
         "moderate_intensity_leakage_fraction": 0.17,
-        "minimum_days_between_quality_sessions": 4,
         "minimum_running_days_28d_for_quality": 8,
         "long_run_recency_reference_days": 7,
         "reduced_volume_factor": 0.70,
@@ -303,17 +302,25 @@ def test_official_dangerous_warning_blocks_only_its_outdoor_window() -> None:
     assert trace.facts["emergency_alerts"] == "Tornado Warning"
 
 
-def test_quality_is_prioritized_weekly_not_every_four_days() -> None:
-    result = _recommend(
-        _state(
-            days_since_quality_run=5,
-            quality_sessions_14d=1,
-            days_since_long_run=3,
-        )
+def test_quality_cadence_is_recovery_and_dose_driven_not_a_calendar_gate() -> None:
+    state = _state(
+        days_since_quality_run=5,
+        quality_sessions_14d=1,
+        days_since_long_run=3,
     )
-    assert result.workout_type != WorkoutType.INTERVALS
+    ordinary = _recommend(state)
+    result = recommend_next_run(
+        state,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="quality",
+    )
+    assert ordinary.workout_type == WorkoutType.INTERVALS
+    assert result.workout_type == WorkoutType.INTERVALS
     quality = next(item for item in result.rule_trace if item.rule_id == "quality_eligible")
     assert quality.facts["quality_recency_reference_days"] == 7
+    assert quality.facts["recent_quality_saturation"] < 1
+    assert quality.facts["quality_need"] > 0
 
 
 def test_long_run_recovery_load_suppresses_quality_without_forcing_rest() -> None:
@@ -481,6 +488,9 @@ def test_ready_next_day_easy_distance_recovers_continuously_after_long_run() -> 
     assert next_day.readiness.value == "ready"
     assert recovery_trace.facts["easy_recovery_pressure"] == 0
     assert recovery_trace.facts["easy_volume_recovery_pressure"] > 0
+    # The latest run is removed from its own comparison baseline. Recovery is
+    # then driven by its actual distance, duration, and HR load—not by the
+    # long-run label—so the next-day adjustment remains continuous.
     assert next_day.distance_range_miles == (3.0, 3.5)
     assert recovered.distance_range_miles == (4.0, 5.0)
     assert any("remaining recovery load reduces" in reason for reason in next_day.reasons)
@@ -503,6 +513,43 @@ def test_high_acute_load_avoids_added_volume_orquality() -> None:
     result = _recommend(state)
     assert result.workout_type == WorkoutType.EASY
     assert any(item.rule_id == "high_recent_load" and item.fired for item in result.rule_trace)
+
+
+def test_continuous_fatigue_replaces_boxcar_overload_when_available() -> None:
+    load = _state().recent_load.model_copy(
+        update={
+            "acute_distance_to_capacity_ratio": 1.45,
+            "continuous_fatigue_miles": 16.0,
+            "continuous_fatigue_to_capacity_ratio": 1.0,
+            "capacity_reference_miles": 16.0,
+        }
+    )
+
+    result = _recommend(_state(recent_load=load))
+    high_load = next(
+        item for item in result.rule_trace if item.rule_id == "high_recent_load"
+    )
+
+    assert high_load.fired is False
+    assert high_load.facts["effective_load_ratio"] == 1.0
+
+
+def test_short_term_distance_density_can_add_proportional_load_caution() -> None:
+    load = _state().recent_load.model_copy(
+        update={
+            "acute_distance_to_capacity_ratio": 1.45,
+            "continuous_fatigue_to_capacity_ratio": 1.0,
+            "continuous_short_term_distance_miles": 20.0,
+            "capacity_reference_miles": 16.0,
+        }
+    )
+
+    result = _recommend(_state(recent_load=load))
+    high_load = next(
+        item for item in result.rule_trace if item.rule_id == "high_recent_load"
+    )
+
+    assert high_load.facts["effective_load_ratio"] == 1.25
 
 
 def test_high_confidence_hr_load_disagreement_adds_caution_to_mileage_capacity() -> None:
@@ -573,8 +620,8 @@ def test_long_run_uses_rough_110_percent_reference_with_practical_rounding() -> 
     assert "rounded" in result.warnings[0]
 
 
-def test_long_run_progression_cap_outranks_the_conventional_five_mile_floor() -> None:
-    """A three-mile base must never be prescribed a five-mile long run."""
+def test_small_single_run_base_is_not_forced_into_a_long_run_label() -> None:
+    """No global distance convention may manufacture a long-run role."""
     load = _state().recent_load.model_copy(
         update={
             "trailing_28d": _window(28, 40, 500),
@@ -582,10 +629,14 @@ def test_long_run_progression_cap_outranks_the_conventional_five_mile_floor() ->
         }
     )
     result = _recommend(_state(days_since_long_run=12, longest_run_30d_miles=3, recent_load=load))
-    assert result.workout_type == WorkoutType.LONG
-    # The five-mile convention cannot override the recent-session evidence.
-    assert result.distance_range_miles == (3.0, 3.5)
-    assert any("progression limit" in warning for warning in result.warnings)
+    assert result.workout_type != WorkoutType.LONG
+    long_trace = next(
+        item for item in result.rule_trace if item.rule_id == "long_run_eligible"
+    )
+    assert long_trace.fired is False
+    assert long_trace.facts["progression_ceiling_miles"] < (
+        long_trace.facts["meaningful_long_threshold_miles"]
+    )
 
 
 def test_historical_long_capacity_accelerates_return_without_replacing_guardrail() -> None:
@@ -742,8 +793,8 @@ def test_shortened_quality_scales_work_dose_instead_of_deleting_quality() -> Non
 
     assert shortened.workout_type == WorkoutType.TEMPO_THRESHOLD
     assert shortened.quality_session_type == "threshold"
-    assert shortened.structure[1].duration_minutes == 13
-    assert "Run 13 minutes continuously" in shortened.structure[1].instruction
+    assert shortened.structure[1].duration_minutes == 12
+    assert "Run 12 minutes continuously" in shortened.structure[1].instruction
     assert any("instead of deleting" in reason for reason in shortened.reasons)
 
 

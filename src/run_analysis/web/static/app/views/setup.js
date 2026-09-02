@@ -71,7 +71,7 @@ export async function renderSetup() {
         <p class="eyebrow">Setup</p>
         <h1>${blocked ? "Add your runs first" : state.complete ? "You are set up" : "Two numbers decide everything else"}</h1>
         <p>${blocked
-          ? "These settings are chosen from your own running, so the answers get better once there is something to read. Fill them in now if you like, and come back after your first upload."
+          ? "The app will not invent a beginner mileage target. Import existing history if you have it; otherwise complete the scheduled 10–30-minute conversational Zone 2 run or run/walk and upload it."
           : state.complete
           ? "Every setting below has been confirmed rather than defaulted. Change any of them any time."
           : "Your heart-rate zones decide what counts as easy, and your comparison heart rate is where every pace figure is measured. Until you confirm them, the app is using defaults that may not describe you."}</p>
@@ -79,9 +79,10 @@ export async function renderSetup() {
 
       ${blocked ? `<article class="wide-card setup-blocked">
         <p class="eyebrow">First</p>
-        <h2>No runs yet</h2>
-        <p>Drop <b>.tcx</b> or <b>.fit</b> files anywhere on this page, or use <b>Upload Runs</b> at the top right. Garmin Connect and Strava both export them.</p>
-        <p class="chart-note">Your comparison heart rate in Step 3 is chosen from where your own easy running actually has evidence, so it has nothing to recommend from until some runs are in.</p>
+        <h2>Measure a baseline instead of guessing one</h2>
+        <p>If you have recent history, drop <b>.tcx</b> or <b>.fit</b> files anywhere on this page, or use <b>Upload Runs</b> at the top right. Garmin Connect and Strava both export them.</p>
+        <p>If you have no history, complete the scheduled 10–30-minute conversational Zone 2 run or run/walk without chasing a prescribed distance. Stop for pain, fatigue, and/or elevated heart rate and end the run at a maximum of 30 minutes.</p>
+        <p class="chart-note">Long, hard, race, and health-affected runs are not reused as baseline sessions. Your comparison heart rate also waits for actual easy-running evidence.</p>
       </article>` : ""}
 
       <article class="wide-card" id="setup-checklist">${checklistMarkup(state)}</article>

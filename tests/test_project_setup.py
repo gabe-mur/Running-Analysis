@@ -171,3 +171,61 @@ def test_initialize_refuses_a_database_migrated_by_a_newer_build(tmp_path) -> No
                 "SELECT value FROM schema_metadata WHERE key='schema_version'"
             ).fetchone()[0]
         ) == SCHEMA_VERSION + 1
+
+
+def test_failed_migration_does_not_advance_version_or_commit_schema(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+    import run_analysis.db as database_module
+
+    database = tmp_path / "migration.sqlite"
+    with database_module.connect(database) as connection:
+        database_module.initialize(connection)
+        connection.execute("DROP TABLE activity_plan_matches")
+        connection.execute("DROP TABLE planned_workout_history")
+        connection.execute(
+            "UPDATE schema_metadata SET value='13' WHERE key='schema_version'"
+        )
+        connection.commit()
+        original = database_module._migrate_v14
+
+        def fail_after_schema_change(target):
+            original(target)
+            raise RuntimeError("simulated migration failure")
+
+        monkeypatch.setattr(database_module, "_migrate_v14", fail_after_schema_change)
+        with pytest.raises(RuntimeError, match="simulated migration failure"):
+            database_module.initialize(connection)
+
+        stored = connection.execute(
+            "SELECT value FROM schema_metadata WHERE key='schema_version'"
+        ).fetchone()[0]
+        plan_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='planned_workout_history'"
+        ).fetchone()
+
+    assert stored == "13"
+    assert plan_table is None
+
+
+def test_duration_prescription_migration_adds_time_matching_columns(tmp_path) -> None:
+    from run_analysis.db import connect, initialize
+
+    with connect(tmp_path / "duration-migration.sqlite") as connection:
+        initialize(connection)
+        plan_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(planned_workout_history)"
+            )
+        }
+        match_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(activity_plan_matches)"
+            )
+        }
+
+    assert {"duration_low_minutes", "duration_high_minutes"} <= plan_columns
+    assert "duration_delta_minutes" in match_columns

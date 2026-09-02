@@ -321,6 +321,8 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .chart-legend .point-key { width: .45rem; height: .45rem; border: 1px solid var(--accent); border-radius: 50%; background: transparent; }
 .chart-legend .estimated-key { width: .45rem; height: .45rem; border: 2px dotted #8da9d8; border-radius: 50%; background: transparent; }
 .chart-legend .reduced-key { width: .45rem; height: .45rem; border: 1px dashed var(--warning); border-radius: 50%; background: transparent; }
+.chart-legend .context-key { width: .45rem; height: .45rem; border: 2px dotted var(--warning); border-radius: 50%; background: transparent; }
+.fitness-chart .context-only { fill: transparent; stroke: var(--warning); stroke-width: 2; stroke-dasharray: 2 2; }
 .chart-legend .raw-key { width: .45rem; height: .45rem; background: var(--warning); }
 .chart-note { margin: 0; color: var(--muted); font-size: .8rem; }
 .progress-metrics article strong { font-size: 1.15rem; }

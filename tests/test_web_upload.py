@@ -272,6 +272,21 @@ def test_saved_plan_that_includes_today_in_recent_history_is_stale() -> None:
 
 def test_rest_day_constraint_persists_replans_and_can_be_removed(tmp_path: Path) -> None:
     _write_config(tmp_path)
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=2)
+    end = start + timedelta(seconds=20)
+    run_upload_pipeline(
+        tmp_path,
+        "config.yaml",
+        [
+            UploadPayload(
+                "baseline.tcx",
+                _tcx_bytes(
+                    start=start.isoformat().replace("+00:00", "Z"),
+                    end=end.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+        ],
+    )
     client = TestClient(create_app(tmp_path))
     original = client.get("/api/weekly-schedule/latest")
     assert original.status_code == 200

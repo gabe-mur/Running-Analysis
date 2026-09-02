@@ -79,7 +79,7 @@ model:
   ridge_alpha: 1
   minimum_cv_improvement_seconds_per_mile: 2
   run_effect_max_effective_segments: 4
-  minimum_run_miles: 1.5
+  minimum_run_minutes: 10
   maximum_stop_fraction: 0.35
   minimum_hr_coverage: 0.8
   minimum_gps_coverage: 0.8
@@ -200,7 +200,7 @@ def test_new_user_can_enable_historical_weather_without_a_profile(tmp_path: Path
     assert response.json()["historical_weather_enabled"] is True
 
 
-def test_race_goal_settings_require_ten_usable_runs_before_save(tmp_path: Path) -> None:
+def test_race_goal_settings_require_usable_duration_evidence_before_save(tmp_path: Path) -> None:
     _write_config(tmp_path)
     database = tmp_path / "data" / "test.sqlite"
     with connect(database) as connection:
@@ -218,7 +218,7 @@ def test_race_goal_settings_require_ten_usable_runs_before_save(tmp_path: Path) 
     response = client.patch("/api/settings", json={"coaching": coaching})
 
     assert response.status_code == 422
-    assert "requires 10 usable" in response.json()["detail"]
+    assert "at least one normal-health run" in response.json()["detail"]
     assert not (tmp_path / "config.local.yaml").exists()
 
 

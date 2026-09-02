@@ -322,6 +322,183 @@ def _insert_activity(connection: sqlite3.Connection, activity: Activity) -> int:
     return activity_row_id
 
 
+def _activity_quality_key(activity: Activity) -> tuple[int, float, int, int]:
+    """Rank duplicate recordings by usable sensor evidence, not import order."""
+
+    points = activity.trackpoints
+    if not points:
+        return (0, 0.0, 0, len(activity.laps))
+    signals = (
+        [point.gps_valid for point in points],
+        [point.heart_rate_bpm is not None for point in points],
+        [point.altitude_m is not None for point in points],
+        [point.cadence is not None or point.run_cadence is not None for point in points],
+        [point.speed_mps is not None for point in points],
+        [point.pause_after_s is not None for point in points],
+    )
+    available_kinds = sum(any(values) for values in signals)
+    coverage = sum(sum(values) / len(points) for values in signals)
+    return (available_kinds, coverage, len(points), len(activity.laps))
+
+
+def _stored_activity_quality_key(
+    connection: sqlite3.Connection, activity_id: int
+) -> tuple[int, float, int, int]:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS point_count,
+               SUM(gps_valid) AS gps_count,
+               SUM(heart_rate_bpm IS NOT NULL) AS hr_count,
+               SUM(altitude_m IS NOT NULL) AS altitude_count,
+               SUM(cadence IS NOT NULL OR run_cadence IS NOT NULL) AS cadence_count,
+               SUM(speed_mps IS NOT NULL) AS speed_count,
+               SUM(pause_after_s IS NOT NULL) AS pause_count
+        FROM trackpoints WHERE activity_id=?
+        """,
+        (activity_id,),
+    ).fetchone()
+    point_count = int(row["point_count"] or 0)
+    lap_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM laps WHERE activity_id=?", (activity_id,)
+        ).fetchone()[0]
+    )
+    counts = [
+        int(row[name] or 0)
+        for name in (
+            "gps_count",
+            "hr_count",
+            "altitude_count",
+            "cadence_count",
+            "speed_count",
+            "pause_count",
+        )
+    ]
+    return (
+        sum(count > 0 for count in counts),
+        sum(count / point_count for count in counts) if point_count else 0.0,
+        point_count,
+        lap_count,
+    )
+
+
+def _replace_activity_data(
+    connection: sqlite3.Connection, activity_row_id: int, activity: Activity
+) -> None:
+    """Upgrade a canonical duplicate in place so metadata links survive."""
+
+    current = connection.execute(
+        "SELECT activity_id,created_at_utc FROM activities WHERE id=?",
+        (activity_row_id,),
+    ).fetchone()
+    now = _utc_now()
+    data_quality = {
+        "gps": activity.gps_quality,
+        "heart_rate": activity.hr_quality,
+        "elevation": activity.elevation_quality,
+        "cadence": activity.cadence_quality,
+        "distance_source": activity.distance_source,
+        "parse_warnings": activity.parse_warnings,
+    }
+    connection.execute(
+        """
+        UPDATE activities SET
+            activity_id=?,sport=?,start_time_utc=?,start_time_utc_epoch=?,
+            start_time_local=?,timezone_name=?,timezone_source=?,
+            total_elapsed_time_s=?,lap_recorded_time_s=?,total_distance_m=?,
+            calories=?,average_hr_bpm=?,maximum_hr_bpm=?,notes=?,creator=?,
+            lap_count=?,trackpoint_count=?,gps_quality=?,hr_quality=?,
+            elevation_quality=?,cadence_quality=?,distance_source=?,
+            namespaces_json=?,data_quality_json=?,updated_at_utc=?
+        WHERE id=?
+        """,
+        (
+            current["activity_id"] or activity.activity_id,
+            activity.sport,
+            _iso(activity.start_time_utc),
+            activity.start_time_utc.timestamp() if activity.start_time_utc else None,
+            _iso(activity.start_time_local),
+            activity.timezone_name,
+            activity.timezone_source,
+            activity.total_elapsed_time_s,
+            activity.lap_recorded_time_s,
+            activity.total_distance_m,
+            activity.calories,
+            activity.average_hr_bpm,
+            activity.maximum_hr_bpm,
+            activity.notes,
+            activity.creator,
+            len(activity.laps),
+            len(activity.trackpoints),
+            activity.gps_quality,
+            activity.hr_quality,
+            activity.elevation_quality,
+            activity.cadence_quality,
+            activity.distance_source,
+            json.dumps(activity.namespaces),
+            json.dumps(data_quality),
+            now,
+            activity_row_id,
+        ),
+    )
+    for table in (
+        "laps",
+        "trackpoints",
+        "segments",
+        "activity_metrics",
+        "model_runs",
+        "activity_weather",
+    ):
+        connection.execute(f"DELETE FROM {table} WHERE activity_id=?", (activity_row_id,))
+    connection.executemany(
+        """
+        INSERT INTO laps(
+            activity_id,lap_index,start_time_utc,total_time_s,distance_m,
+            calories,average_hr_bpm,maximum_hr_bpm,maximum_speed_mps,
+            intensity,trigger_method
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                activity_row_id, lap.lap_index, _iso(lap.start_time_utc),
+                lap.total_time_s, lap.distance_m, lap.calories,
+                lap.average_hr_bpm, lap.maximum_hr_bpm, lap.maximum_speed_mps,
+                lap.intensity, lap.trigger_method,
+            )
+            for lap in activity.laps
+        ],
+    )
+    connection.executemany(
+        """
+        INSERT INTO trackpoints(
+            activity_id,lap_index,track_index,point_index,timestamp_utc,
+            latitude,longitude,gps_valid,altitude_m,distance_m,
+            heart_rate_bpm,cadence,run_cadence,cadence_source,speed_mps,
+            pause_after_s,parse_flags_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        [
+            (
+                activity_row_id, point.lap_index, point.track_index,
+                point.point_index, _iso(point.timestamp_utc), point.latitude,
+                point.longitude, int(point.gps_valid), point.altitude_m,
+                point.distance_m, point.heart_rate_bpm, point.cadence,
+                point.run_cadence, point.cadence_source, point.speed_mps,
+                point.pause_after_s, json.dumps(point.parse_flags),
+            )
+            for point in activity.trackpoints
+        ],
+    )
+    connection.execute(
+        """
+        UPDATE activity_sources SET is_primary=0,
+            duplicate_reason=COALESCE(duplicate_reason,'superseded_by_richer_source')
+        WHERE activity_id=?
+        """,
+        (activity_row_id,),
+    )
+
+
 def import_files(
     connection: sqlite3.Connection,
     project_root: str | Path,
@@ -349,20 +526,22 @@ def import_files(
         try:
             parsed = parse(path, default_timezone=default_timezone)
         except Exception as error:
-            with transaction(connection):
-                if existing:
-                    _delete_previous_source(connection, int(existing["id"]))
-                _insert_source(
-                    connection,
-                    path,
-                    str(path.relative_to(root)) if path.is_relative_to(root) else path.name,
-                    digest,
-                    "failed",
-                    None,
-                    [],
-                    str(error),
-                    0,
-                )
+            # A temporarily truncated or corrupt replacement must not erase a
+            # previously successful import. Keep the last-known-good source
+            # and canonical activity until a new version parses completely.
+            if not existing:
+                with transaction(connection):
+                    _insert_source(
+                        connection,
+                        path,
+                        str(path.relative_to(root)) if path.is_relative_to(root) else path.name,
+                        digest,
+                        "failed",
+                        None,
+                        [],
+                        str(error),
+                        0,
+                    )
             summary.failed_files += 1
             continue
 
@@ -386,7 +565,14 @@ def import_files(
                 if duplicate:
                     activity_row_id, reason = duplicate
                     summary.duplicate_activities += 1
-                    is_primary = 0
+                    if _activity_quality_key(activity) > _stored_activity_quality_key(
+                        connection, activity_row_id
+                    ):
+                        _replace_activity_data(connection, activity_row_id, activity)
+                        reason = "richer_duplicate_replaced_canonical"
+                        is_primary = 1
+                    else:
+                        is_primary = 0
                 else:
                     activity_row_id = _insert_activity(connection, activity)
                     reason = None
@@ -405,4 +591,3 @@ def import_files(
         if parsed.warnings:
             summary.warning_files += 1
     return summary
-

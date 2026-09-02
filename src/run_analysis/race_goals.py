@@ -99,11 +99,14 @@ def _recent_training_paces(connection: sqlite3.Connection) -> list[tuple[float, 
         FROM activities a
         JOIN activity_metrics am ON am.activity_id=a.id
         LEFT JOIN run_overrides ro ON ro.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
         WHERE a.sport='Running'
           AND am.moving_pace_min_mile BETWEEN 3 AND 25
-          AND am.analysis_distance_m >= 2414.016
+          AND am.analysis_distance_m > 0
+          AND am.calculated_moving_time_s >= 600
           AND COALESCE(ro.include_in_model, 1) != 0
-          AND COALESCE(ro.workout_type, 'easy') NOT IN ('hike', 'bike', 'run_walk')
+          AND COALESCE(ro.workout_type, ph.workout_type, 'easy') NOT IN ('hike', 'bike', 'run_walk')
           AND COALESCE(ro.health_tag, 'normal') = 'normal'
         ORDER BY a.start_time_utc_epoch DESC
         LIMIT 10
@@ -133,20 +136,23 @@ def assess_race_goal(
             f"{profile.label} goal pace must be between {profile.absolute_fastest_pace:.2f} and 20.00 min/mi"
         )
     if connection is None:
-        raise ValueError("Import and process at least 10 usable runs before setting a race goal")
+        raise ValueError("Import and process at least one usable run before setting a race goal")
     performances = _recent_training_paces(connection)
-    if len(performances) < 10:
+    if not performances:
         raise ValueError(
-            f"A race goal requires 10 usable normal-health runs; {len(performances)} are currently available"
+            "A race goal needs at least one normal-health run with ten minutes of usable pace data"
         )
-    fast_training_pace = median(sorted(pace for pace, _ in performances)[:3])
+    comparison_count = min(3, len(performances))
+    fast_training_pace = median(
+        sorted(pace for pace, _ in performances)[:comparison_count]
+    )
     equivalent_paces = []
     for pace, distance in performances:
         source_time_minutes = pace * distance
         target_time_minutes = source_time_minutes * (profile.distance_miles / distance) ** 1.06
         target_time_minutes += profile.prediction_penalty_minutes
         equivalent_paces.append(target_time_minutes / profile.distance_miles)
-    supported = median(sorted(equivalent_paces)[:3])
+    supported = median(sorted(equivalent_paces)[:comparison_count])
     weeks = days_remaining / 7.0
     ambitious = goal_pace < supported * 0.99
     minimum_weeks = profile.development_weeks if ambitious else profile.ready_minimum_weeks
@@ -160,7 +166,8 @@ def assess_race_goal(
     # the athlete to be race-ready before training begins. This is a disclosed
     # planning guardrail, not a promised adaptation rate: one quarter-percent
     # per available week, capped at eight percent.
-    improvement_allowance = min(0.08, weeks * 0.0025)
+    evidence_strength = min(1.0, len(performances) / 10.0)
+    improvement_allowance = min(0.08, weeks * 0.0025) * evidence_strength
     fastest_allowed = supported * (1.0 - improvement_allowance)
     if goal_pace < fastest_allowed:
         required_improvement = 1.0 - goal_pace / supported
@@ -175,14 +182,10 @@ def assess_race_goal(
         else:
             timing = "; a later date is not enough until newer runs support a faster baseline"
         raise ValueError(
-            f"The latest 10 runs support roughly {supported:.2f} min/mi for this goal; "
+            f"The latest {len(performances)} usable run{'s' if len(performances) != 1 else ''} support roughly {supported:.2f} min/mi for this goal; "
             f"for this date choose {format_pace(fastest_allowed)} or slower{timing}"
         )
     longest = max(distance for _, distance in performances)
-    if profile.label == "Marathon" and longest < 6 and weeks < 26:
-        raise ValueError(
-            "A marathon inside 26 weeks requires at least one recent 6-mile run; build durability before setting this date"
-        )
     build_weeks = build_weeks_before_taper(profile, race_date, today)
     required_long_rate = required_compound_progression(
         longest,
@@ -215,7 +218,8 @@ def assess_race_goal(
         weeks_remaining=weeks,
         minimum_weeks=minimum_weeks,
         rationale=(
-            f"Validated from Riegel-equivalent performances across the latest 10 usable runs; "
+            f"Validated from Riegel-equivalent performances across {len(performances)} usable run{'s' if len(performances) != 1 else ''}; "
+            f"limited-history confidence is {evidence_strength:.0%}. "
             f"{profile.label} planning works backward toward about {profile.peak_weekly_miles:.0f} "
             f"peak weekly miles and a {profile.peak_long_run_miles:.0f}-mile long run before taper, "
             "without overriding load or health guardrails."

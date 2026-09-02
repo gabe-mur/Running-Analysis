@@ -15,7 +15,7 @@ from .segmentation import METERS_PER_MILE, Segment, build_segments
 from .workload import update_workloads
 from .training_load import calculate_session_load
 
-PROCESSOR_VERSION = "phase3-v7-canonical-cadence-spm"
+PROCESSOR_VERSION = "phase3-v8-duration-eligibility"
 
 
 @dataclass(slots=True)
@@ -31,7 +31,7 @@ class ProcessingSummary:
 
 def _fingerprint(config: dict) -> str:
     eligibility_keys = (
-        "minimum_run_miles",
+        "minimum_run_minutes",
         "maximum_stop_fraction",
         "minimum_hr_coverage",
         "minimum_gps_coverage",
@@ -43,7 +43,17 @@ def _fingerprint(config: dict) -> str:
         "segmentation": config["segmentation"],
         "segment_distance_miles": config["segment_distance_miles"],
         "zones": config["zones"],
-        "eligibility": {key: config["model"][key] for key in eligibility_keys},
+        "eligibility": {
+            key: (
+                config["model"].get(
+                    "minimum_run_minutes",
+                    config["model"].get("steady_benchmark_minimum_minutes", 10),
+                )
+                if key == "minimum_run_minutes"
+                else config["model"][key]
+            )
+            for key in eligibility_keys
+        },
         "activity_classification": config["activity_classification"],
     }
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
@@ -178,7 +188,13 @@ def _eligibility(
         reasons.append("inadequate_gps")
     if hr_coverage < float(thresholds["minimum_hr_coverage"]):
         reasons.append("inadequate_hr")
-    if distance_miles < float(thresholds["minimum_run_miles"]):
+    moving_minutes = float(moving_diagnostics.get("moving_time_s", 0)) / 60.0
+    if moving_minutes < float(
+        thresholds.get(
+            "minimum_run_minutes",
+            thresholds.get("steady_benchmark_minimum_minutes", 10),
+        )
+    ):
         reasons.append("run_too_short")
     if stop_fraction > float(thresholds["maximum_stop_fraction"]):
         reasons.append("excessive_stop_fraction")
@@ -212,12 +228,6 @@ def _eligibility(
         if override["include_in_model"] == 0:
             reasons.append("manual_exclusion")
         if override["workout_type"] and str(override["workout_type"]).casefold() in {
-            "interval",
-            "intervals",
-            "tempo",
-            "threshold",
-            "tempo_threshold",
-            "race",
             "walk",
             "walk/jog",
             "hike",

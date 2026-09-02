@@ -120,6 +120,19 @@ def test_acute_load_far_above_capacity_is_strained() -> None:
     assert "145%" in summary.detail
 
 
+def test_continuous_fatigue_prevents_a_boxcar_boundary_strain_label() -> None:
+    load = _load(acute_ratio=1.45).model_copy(
+        update={
+            "continuous_fatigue_miles": 20.0,
+            "continuous_fatigue_to_capacity_ratio": 1.0,
+        }
+    )
+
+    summary = build_training_status(_state(recent_load=load))
+
+    assert summary.status != TrainingStatus.STRAINED
+
+
 def test_an_unusually_costly_response_is_strained_even_at_normal_volume() -> None:
     summary = build_training_status(_state(recent_performance_anomaly="unusually_costly"))
     assert summary.status == TrainingStatus.STRAINED
@@ -137,7 +150,23 @@ def test_below_capacity_but_climbing_is_rebuilding_not_a_deficiency() -> None:
         _state(recent_load=_load(weekly_28d=12.0, capacity=20.0, acute_ratio=0.90))
     )
     assert summary.status == TrainingStatus.REBUILDING
-    assert "climbing back" in summary.detail
+    assert "continuously decayed training load" in summary.detail
+
+
+def test_rebuilding_does_not_claim_recent_mileage_is_below_capacity() -> None:
+    load = _load(weekly_28d=10.0, capacity=16.0, acute_ratio=0.90).model_copy(
+        update={
+            "trailing_7d": _window(7, 19.2, 4),
+            "continuous_fatigue_miles": 14.4,
+            "continuous_fatigue_to_capacity_ratio": 0.90,
+        }
+    )
+
+    summary = build_training_status(_state(recent_load=load))
+
+    assert summary.status == TrainingStatus.REBUILDING
+    assert "already run 19.2 miles" in summary.detail
+    assert "not building up to a 16-mile ceiling" in summary.detail
 
 
 def test_below_capacity_and_flat_is_underloaded() -> None:

@@ -59,7 +59,7 @@ STATUS_RULES: tuple[StatusRule, ...] = (
     StatusRule("status_insufficient_evidence", "Too few recent runs or no demonstrated capacity to classify training."),
     StatusRule("status_recovering", "Current health status, or a health-tagged run not yet followed by normal running, indicates recovery."),
     StatusRule("status_strained", "Acute load is high relative to demonstrated capacity, or the latest comparable effort was unusually costly."),
-    StatusRule("status_rebuilding", "Running is below retained capacity after a gap, but the most recent week is climbing back toward it."),
+    StatusRule("status_rebuilding", "Sustained running is below retained capacity after a gap, while continuously decayed training load is rebuilding."),
     StatusRule("status_underloaded", "Sustained running has been materially below retained capacity long enough to matter."),
     StatusRule("status_building", "Load sits near demonstrated capacity with quality exposure and no recovery or strain flags."),
     StatusRule("status_maintaining", "Load and performance are steady, with no strong signal in either direction."),
@@ -105,11 +105,15 @@ def _trace(rule_id: str, fired: bool, **facts: Any) -> RuleTrace:
 
 
 def _ratios(state: FitnessState) -> tuple[float | None, float | None, float | None]:
-    """Acute, sustained, and capacity figures, all weekly miles."""
+    """Continuous fatigue, sustained volume, and retained capacity."""
     capacity = state.recent_load.capacity_reference_miles
     if not capacity:
         return None, None, None
-    acute = state.recent_load.acute_distance_to_capacity_ratio
+    acute = (
+        state.recent_load.continuous_fatigue_to_capacity_ratio
+        if state.recent_load.continuous_fatigue_to_capacity_ratio is not None
+        else state.recent_load.acute_distance_to_capacity_ratio
+    )
     sustained_weekly = state.recent_load.trailing_28d.distance_miles / 4.0
     return acute, sustained_weekly / capacity, capacity
 
@@ -187,7 +191,9 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
         _trace(
             "status_strained",
             strained,
-            acute_to_capacity_ratio=round(acute_ratio, 2) if acute_ratio is not None else None,
+            continuous_fatigue_to_capacity_ratio=(
+                round(acute_ratio, 2) if acute_ratio is not None else None
+            ),
             high_load_ratio=high_load_ratio,
             recent_performance_anomaly=state.recent_performance_anomaly,
             last_run_drift_percent=state.last_run_drift_percent,
@@ -197,7 +203,7 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
         reasons = []
         if acute_ratio is not None and acute_ratio >= high_load_ratio:
             reasons.append(
-                f"the last 7 days are {acute_ratio * 100:.0f}% of the {capacity:.1f} mi/week you have demonstrated"
+                f"continuously decayed training fatigue is {acute_ratio * 100:.0f}% of the {capacity:.1f} mi/week you have demonstrated"
             )
         if costly:
             reasons.append("your latest comparable run cost more effort than usual")
@@ -228,12 +234,23 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
         )
     )
     if rebuilding:
+        recent_seven = state.recent_load.trailing_7d.distance_miles
+        if recent_seven > capacity:
+            detail = (
+                f"Your last four weeks average {sustained_ratio * 100:.0f}% of your demonstrated "
+                f"{capacity:.1f} mi/week. You have already run {recent_seven:.1f} miles in the "
+                "last seven days; ‘rebuilding’ refers to restoring sustained consistency after "
+                "the earlier low-load period, not building up to a 16-mile ceiling."
+            )
+        else:
+            detail = (
+                f"Your last four weeks average {sustained_ratio * 100:.0f}% of your demonstrated "
+                f"{capacity:.1f} mi/week, while continuously decayed training load has risen to "
+                f"{acute_ratio * 100:.0f}% of that capacity."
+            )
         return _summary(
             TrainingStatus.REBUILDING,
-            (
-                f"Your last four weeks average {sustained_ratio * 100:.0f}% of your demonstrated "
-                f"{capacity:.1f} mi/week, and the most recent week is climbing back toward it."
-            ),
+            detail,
             ConfidenceLevel.MODERATE,
             trace,
             state,

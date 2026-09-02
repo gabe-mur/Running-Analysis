@@ -80,7 +80,9 @@ model:
   steady_benchmark_maximum_hr_range_bpm: 15
   steady_benchmark_maximum_speed_change_fraction: 0.15
   steady_benchmark_maximum_stopped_seconds: 5
-  minimum_run_miles: 1.5
+  # Duration, not distance, decides whether a short beginner run contains
+  # enough exposure for modeling.
+  minimum_run_minutes: 10
   maximum_stop_fraction: 0.35
   minimum_hr_coverage: 0.8
   minimum_gps_coverage: 0.8
@@ -119,11 +121,11 @@ coaching:
   long_run_target_progression_fraction: 0.05
   high_load_ratio: 1.30
   moderate_intensity_leakage_fraction: 0.17
-  minimum_days_between_quality_sessions: 4
   quality_recency_reference_days: 7
   typical_rest_days_between_runs: 1
   capacity_retention_half_life_days: 84
   capacity_retention_grace_days: 28
+  continuous_fatigue_half_life_days: 7
   # Single-run durability fades smoothly instead of vanishing after 30 days.
   long_run_retention_half_life_days: 180
   long_run_retention_grace_days: 90

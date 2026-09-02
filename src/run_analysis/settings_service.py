@@ -54,6 +54,11 @@ def validate_config(config: dict[str, Any]) -> None:
 def settings_response(config: dict[str, Any], stages: list[UploadStage] | None = None) -> SettingsResponse:
     reference = config["reference_conditions"]
     weather = config["weather"]
+    configured_coaching = {
+        key: value
+        for key, value in config.get("coaching", {}).items()
+        if key != "minimum_days_between_quality_sessions"
+    }
     coaching = {
         "training_goal": "general_fitness",
         "goal_date": None,
@@ -63,7 +68,6 @@ def settings_response(config: dict[str, Any], stages: list[UploadStage] | None =
         "long_run_target_progression_fraction": 0.05,
         "high_load_ratio": 1.30,
         "moderate_intensity_leakage_fraction": 0.17,
-        "minimum_days_between_quality_sessions": 4,
         "quality_recency_reference_days": 7,
         "typical_rest_days_between_runs": 1,
         "capacity_retention_half_life_days": 84,
@@ -81,7 +85,7 @@ def settings_response(config: dict[str, Any], stages: list[UploadStage] | None =
             "progression": True,
             "hill_repeats": False,
         },
-        **config.get("coaching", {}),
+        **configured_coaching,
     }
     return SettingsResponse(
         max_hr=config["max_hr"],
@@ -223,6 +227,21 @@ def recalculate_for_settings(connection, config: dict[str, Any], project_root: P
                     detail="Historical weather retrieval is disabled; cached local weather was retained.",
                 )
             )
+    planner_inputs = analytical | changed & {
+        "coaching",
+        "forecast_weather_enabled",
+        "weather_privacy_radius_km",
+    }
+    if planner_inputs:
+        connection.execute("DELETE FROM app_state WHERE key='weekly_schedule'")
+        connection.commit()
+        stages.append(
+            UploadStage(
+                name="schedule",
+                status="deferred",
+                detail="The saved schedule was invalidated and will be regenerated from the new settings.",
+            )
+        )
     return stages
 
 #: Overlay sections that are model machinery rather than facts about the

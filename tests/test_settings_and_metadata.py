@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 
 from run_analysis.db import connect, initialize
+from run_analysis.config import load_config
 from run_analysis.metadata_service import update_run_metadata
-from run_analysis.settings_service import save_settings_overlay, settings_response
+from run_analysis.settings_service import (
+    recalculate_for_settings,
+    save_settings_overlay,
+    settings_response,
+)
 from run_analysis.web.schemas import (
     ActivityHealthTag,
     RunMetadataPatch,
@@ -54,6 +59,32 @@ def test_invalid_physiology_or_overlapping_zones_are_rejected(tmp_path: Path) ->
         save_settings_overlay(tmp_path / "config.yaml", SettingsPatch(zones=zones))
 
 
+def test_planner_setting_change_invalidates_saved_schedule(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    with connect(tmp_path / "schedule-settings.sqlite") as connection:
+        initialize(connection)
+        connection.execute(
+            """
+            INSERT INTO app_state(key,value_json,updated_at_utc)
+            VALUES ('weekly_schedule','{}','now')
+            """
+        )
+        connection.commit()
+
+        stages = recalculate_for_settings(
+            connection,
+            load_config(tmp_path / "config.yaml"),
+            tmp_path,
+            SettingsPatch(forecast_weather_enabled=True),
+        )
+        saved = connection.execute(
+            "SELECT 1 FROM app_state WHERE key='weekly_schedule'"
+        ).fetchone()
+
+    assert saved is None
+    assert any(stage.name == "schedule" for stage in stages)
+
+
 def test_metadata_round_trips_through_database_and_override_csv(tmp_path: Path) -> None:
     database = tmp_path / "test.sqlite"
     overrides = tmp_path / "run_overrides.csv"
@@ -98,7 +129,6 @@ def test_at_least_one_quality_session_type_must_remain_enabled() -> None:
             long_run_target_progression_fraction=0.05,
             high_load_ratio=1.3,
             moderate_intensity_leakage_fraction=0.17,
-            minimum_days_between_quality_sessions=4,
             quality_recency_reference_days=7,
             typical_rest_days_between_runs=1,
             capacity_retention_half_life_days=42,

@@ -8,12 +8,17 @@ import { escapeHtml, dateLabel, number, pace } from "./format.js";
 // already carry -- it just drew a confident line through two weeks of noise.
 export function fitnessChart(series, metric, trend28 = [], domainEnd = null, domainDays = null) {
   const field = metric === "raw" ? "raw_pace_min_mile" : "standardized_pace_min_mile";
-  const points = series.filter((item) => Number.isFinite(item[field]));
+  const plottedPace = (item) => Number.isFinite(item[field])
+    ? item[field]
+    : item.trend_weight === 0 && Number.isFinite(item.context_pace_min_mile)
+      ? item.context_pace_min_mile
+      : null;
+  const points = series.filter((item) => Number.isFinite(plottedPace(item)));
   if (!points.length) return '<div class="empty-state">No comparable fitness points are available.</div>';
   const timestamps = points.map((item) => new Date(item.start_time).getTime());
   const values = metric === "both"
-    ? points.flatMap((item) => [item.standardized_pace_min_mile, item.raw_pace_min_mile]).filter(Number.isFinite)
-    : points.map((item) => item[field]);
+    ? points.flatMap((item) => [plottedPace(item), item.raw_pace_min_mile]).filter(Number.isFinite)
+    : points.map(plottedPace);
   const requestedEnd = domainEnd ? new Date(domainEnd).getTime() : null;
   const minX = Number.isFinite(requestedEnd) && Number.isFinite(domainDays) ? requestedEnd - domainDays * 86400000 : Math.min(...timestamps);
   const maxX = Number.isFinite(requestedEnd) && Number.isFinite(domainDays) ? requestedEnd : Math.max(...timestamps);
@@ -27,23 +32,27 @@ export function fitnessChart(series, metric, trend28 = [], domainEnd = null, dom
     return `${command}${x(current).toFixed(1)},${y(item.pace_min_mile).toFixed(1)}`;
   }).join(" ");
   const marks = points.map((item, index) => {
-    const cx = x(timestamps[index]); const cy = y(item[field]);
-    const uncertainty = metric === "standardized" ? item.uncertainty_95_min_mile : 0;
+    const pointPace = plottedPace(item);
+    const cx = x(timestamps[index]); const cy = y(pointPace);
+    const uncertainty = metric === "standardized" && Number.isFinite(item.standardized_pace_min_mile) ? item.uncertainty_95_min_mile : 0;
     const trendWeight = Number.isFinite(item.trend_weight) ? item.trend_weight : 1;
     const estimated = ["device_distance_fallback", "partial_gps_device_distance"].includes(item.measurement_quality) || item.benchmark_quality === "estimated_fixed_time";
-    const pointClass = [trendWeight < 1 ? "reduced-evidence" : "", estimated ? "estimated-measurement" : ""].filter(Boolean).join(" ");
-    const qualityText = estimated ? " · pace estimated from available distance data" : "";
-    return `${uncertainty ? `<line x1="${cx}" y1="${y(item[field] - uncertainty)}" x2="${cx}" y2="${y(item[field] + uncertainty)}" class="uncertainty-mark"/>` : ""}<a href="#run/${item.activity_id}"><circle cx="${cx}" cy="${cy}" r="4" class="${pointClass}"><title>${dateLabel(item.start_time)} · ${pace(item[field])} · ${number(item.distance_miles)} mi · ${Math.round(trendWeight * 100)}% influence on the trend${qualityText}</title></circle></a>`;
+    const pointClass = [trendWeight === 0 ? "context-only" : trendWeight < 1 ? "reduced-evidence" : "", estimated ? "estimated-measurement" : ""].filter(Boolean).join(" ");
+    const contextUsesRawPace = !Number.isFinite(item[field]) && Number.isFinite(item.context_pace_min_mile);
+    const qualityText = contextUsesRawPace ? " · unadjusted full-run pace shown for context" : estimated ? " · pace estimated from available distance data" : "";
+    const influenceText = trendWeight === 0 ? "workout context only · 0% influence on the aerobic trend" : `${Math.round(trendWeight * 100)}% influence on the trend`;
+    return `${uncertainty ? `<line x1="${cx}" y1="${y(pointPace - uncertainty)}" x2="${cx}" y2="${y(pointPace + uncertainty)}" class="uncertainty-mark"/>` : ""}<a href="#run/${item.activity_id}"><circle cx="${cx}" cy="${cy}" r="4" class="${pointClass}"><title>${dateLabel(item.start_time)} · ${pace(pointPace)} · ${number(item.distance_miles)} mi · ${influenceText}${qualityText}</title></circle></a>`;
   }).join("");
-  const rawMarks = metric === "both" ? points.filter((item) => Number.isFinite(item.raw_pace_min_mile)).map((item) => {
+  const rawMarks = metric === "both" ? points.filter((item) => Number.isFinite(item.standardized_pace_min_mile) && Number.isFinite(item.raw_pace_min_mile)).map((item) => {
     const cx = x(new Date(item.start_time).getTime()); const cy = y(item.raw_pace_min_mile);
     return `<a href="#run/${item.activity_id}"><rect x="${cx - 3}" y="${cy - 3}" width="6" height="6" class="raw-point"><title>${dateLabel(item.start_time)} · raw ${pace(item.raw_pace_min_mile)}</title></rect></a>`;
   }).join("") : "";
   const dateTick = (value) => new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(value));
   const labels = [minY, (minY + maxY) / 2, maxY].map((value) => `<text x="48" y="${y(value) + 4}" text-anchor="end">${pace(value).replace("/mi", "")}</text><line x1="55" y1="${y(value)}" x2="865" y2="${y(value)}" class="grid-line"/>`).join("") + `<text x="55" y="303" text-anchor="start">${dateTick(minX)}</text><text x="865" y="303" text-anchor="end">${dateTick(maxX)}</text>`;
-  const reducedLegend = points.some((item) => Number.isFinite(item.trend_weight) && item.trend_weight < 1) ? '<span><i class="reduced-key"></i>less comparable</span>' : "";
+  const reducedLegend = points.some((item) => Number.isFinite(item.trend_weight) && item.trend_weight > 0 && item.trend_weight < 1) ? '<span><i class="reduced-key"></i>less comparable</span>' : "";
+  const contextLegend = points.some((item) => item.trend_weight === 0) ? '<span><i class="context-key"></i>workout context only</span>' : "";
   const estimatedLegend = points.some((item) => ["device_distance_fallback", "partial_gps_device_distance"].includes(item.measurement_quality) || item.benchmark_quality === "estimated_fixed_time") ? '<span><i class="estimated-key"></i>estimated pace</span>' : "";
-  const legend = trend28.length ? `<div class="chart-legend"><span><i class="trend28-key"></i>28-day average</span><span><i class="point-key"></i>adjusted run</span>${reducedLegend}${estimatedLegend}${metric === "both" ? '<span><i class="raw-key"></i>unadjusted run</span>' : ""}</div>` : `<div class="chart-legend"><span><i class="point-key"></i>run</span>${reducedLegend}${estimatedLegend}</div>`;
+  const legend = trend28.length ? `<div class="chart-legend"><span><i class="trend28-key"></i>28-day average</span><span><i class="point-key"></i>adjusted run</span>${contextLegend}${reducedLegend}${estimatedLegend}${metric === "both" ? '<span><i class="raw-key"></i>unadjusted run</span>' : ""}</div>` : `<div class="chart-legend"><span><i class="point-key"></i>run</span>${contextLegend}${reducedLegend}${estimatedLegend}</div>`;
   return `<div class="chart-wrap"><span class="faster-label">Faster ↑</span>${legend}<svg class="fitness-chart" viewBox="0 0 900 310" role="img" aria-label="Fitness pace over time">${labels}<path d="${trendPath(trend28, 70)}" class="chart-line trend-28"/>${marks}${rawMarks}</svg></div>`;
 }
 

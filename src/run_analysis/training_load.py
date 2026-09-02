@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from math import log, sqrt
 from typing import Iterable
 
 
@@ -49,6 +50,7 @@ class RollingLoad:
     zone_load: float | None
     hard_minutes: float
     activity_count: int
+    zone_load_activity_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +61,15 @@ class DistanceCapacity:
     retained_sustained_miles: float
     reference_miles: float
     acute_to_capacity_ratio: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuousFatigue:
+    """Exponentially decayed, athlete-relative weekly load equivalent."""
+
+    equivalent_weekly_miles: float
+    half_life_days: float
+    session_count: int
 
 
 def calculate_session_load(zone_seconds: dict[str, float], moving_time_s: float) -> SessionLoad:
@@ -97,7 +108,118 @@ def rolling_load(
         zone_load=sum(known_zone_loads) if known_zone_loads else None,
         hard_minutes=sum(session.hard_minutes for session in selected),
         activity_count=len(selected),
+        zone_load_activity_count=len(known_zone_loads),
     )
+
+
+def continuous_fatigue_load(
+    sessions: Iterable[TrainingSession],
+    as_of: datetime,
+    *,
+    half_life_days: float = 7.0,
+    baseline_days: int = 28,
+) -> ContinuousFatigue:
+    """Return a boundary-free distance/duration/intensity load equivalent.
+
+    Each session is measured against the athlete's ordinary recent session
+    using distance, duration, and HR-derived zone load. Its contribution then
+    halves smoothly every ``half_life_days``. Multiplication by ``ln(2)``
+    normalizes a steady weekly training rate back to that familiar weekly-mile
+    unit, so the result can be compared directly with demonstrated capacity.
+    """
+
+    records = [session for session in sessions if session.start_time <= as_of]
+    half_life = max(0.1, float(half_life_days))
+    baseline = rolling_load(records, as_of, max(1, int(baseline_days)))
+    if baseline.activity_count <= 0 or baseline.distance_miles <= 0:
+        return ContinuousFatigue(0.0, half_life, 0)
+    typical_distance = baseline.distance_miles / baseline.activity_count
+    typical_minutes = (
+        baseline.moving_minutes / baseline.activity_count
+        if baseline.moving_minutes > 0
+        else None
+    )
+    known_load_count = (
+        baseline.zone_load_activity_count or baseline.activity_count
+    )
+    typical_zone_load = (
+        baseline.zone_load / known_load_count
+        if baseline.zone_load is not None
+        and baseline.zone_load > 0
+        and known_load_count > 0
+        else None
+    )
+
+    equivalent = 0.0
+    for session in records:
+        evidence: list[tuple[float, float]] = []
+        if typical_distance > 0:
+            evidence.append((session.distance_miles / typical_distance, 0.45))
+        if typical_minutes and session.moving_minutes > 0:
+            evidence.append((session.moving_minutes / typical_minutes, 0.30))
+        if typical_zone_load and session.zone_load is not None:
+            evidence.append((session.zone_load / typical_zone_load, 0.25))
+        if not evidence:
+            continue
+        relative_load = sum(value * weight for value, weight in evidence) / sum(
+            weight for _, weight in evidence
+        )
+        age_days = max(
+            0.0,
+            (as_of - session.start_time).total_seconds() / 86400.0,
+        )
+        equivalent += (
+            log(2.0)
+            * typical_distance
+            * relative_load
+            * 0.5 ** (age_days / half_life)
+        )
+    return ContinuousFatigue(equivalent, half_life, len(records))
+
+
+def continuous_distance_rate(
+    sessions: Iterable[TrainingSession],
+    as_of: datetime,
+    *,
+    half_life_days: float = 7.0,
+) -> float:
+    """Return boundary-free completed mileage as an equivalent weekly rate.
+
+    Unlike ``continuous_fatigue_load``, this is deliberately distance-only.
+    It seeds the mileage allocator with work already completed before a fresh
+    21-day regeneration, preventing each new calendar origin from creating a
+    new mileage budget.
+    """
+
+    half_life = max(0.1, float(half_life_days))
+    normalization = log(2.0) * 7.0 / half_life
+    return sum(
+        normalization
+        * max(0.0, session.distance_miles)
+        * 0.5
+        ** (
+            max(0.0, (as_of - session.start_time).total_seconds() / 86400.0)
+            / half_life
+        )
+        for session in sessions
+        if session.start_time <= as_of
+    )
+
+
+def short_term_density_half_life_days(
+    load_half_life_days: float,
+    *,
+    recovery_half_life_hours: float = 12.0,
+) -> float:
+    """Bridge immediate recovery and the slower continuous load signal.
+
+    The geometric midpoint supplies a distinct short-term density timescale
+    without introducing another independently tuned window. With the shipped
+    12-hour recovery and seven-day load half-lives this is about 1.9 days.
+    """
+
+    recovery_days = max(0.1, recovery_half_life_hours / 24.0)
+    return sqrt(recovery_days * max(0.1, load_half_life_days))
 
 
 def acute_to_prior_weekly_ratio(sessions: Iterable[TrainingSession], as_of: datetime) -> float | None:
@@ -136,9 +258,11 @@ def distance_capacity(
     """Compare current mileage with retained, demonstrated four-week capacity.
 
     The immediate preceding four weeks remain visible, but a short illness,
-    trip, or other disruption cannot instantly redefine normal capacity.  The
+    trip, or other disruption cannot instantly redefine normal capacity. The
     best completed 28-day block before the acute week is retained in full for
-    a grace period and then decays gradually.
+    a grace period and then decays gradually. A more recent strong seven-day
+    exposure can re-confirm that retained capacity, but is capped at the
+    sustained 28-day evidence so one spike cannot invent a higher baseline.
     """
 
     records = [item for item in sessions if item.start_time <= as_of]
@@ -182,6 +306,23 @@ def distance_capacity(
         ),
         default=0.0,
     )
-    reference = max(prior, retained)
+    recent_confirmation = 0.0
+    candidate = history_start
+    while candidate <= end:
+        seven_start = candidate - timedelta(days=6)
+        seven = sum(
+            miles
+            for day, miles in daily.items()
+            if seven_start <= day <= candidate
+        )
+        confirmation = min(seven, best_value)
+        age_days = max(0, (end - candidate).days)
+        confirmation *= 0.5 ** (
+            max(0, age_days - retention_grace_days)
+            / max(1.0, retention_half_life_days)
+        )
+        recent_confirmation = max(recent_confirmation, confirmation)
+        candidate += timedelta(days=1)
+    reference = max(prior, retained, recent_confirmation)
     ratio = recent / reference if reference > 0 else None
     return DistanceCapacity(recent, prior, best_value, retained, reference, ratio)

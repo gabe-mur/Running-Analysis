@@ -9,6 +9,7 @@ import sqlite3
 from zoneinfo import ZoneInfo
 
 from .fitness_state import build_fitness_state
+from .progress import PreparedProgressData, prepare_progress_data
 from .forecast import (
     NWS_ALERT_CACHE_SECONDS,
     _active_nws_alerts,
@@ -17,9 +18,12 @@ from .forecast import (
     planned_forecast_options,
 )
 from .recommendation import recommend_next_run
+from .recovery import decay_recovery_load
+from .training_load import short_term_density_half_life_days
 from .prescription_matching import archive_weekly_prescriptions
-from .run_feedback import list_runs
+from .run_feedback import get_run_feedback, list_runs
 from .weekly_schedule import (
+    BASELINE_MINIMUM_AEROBIC_MINUTES,
     WEEKLY_PLANNER_VERSION,
     PLANNING_HORIZON_DAYS,
     PlanningActivity,
@@ -32,6 +36,7 @@ from .web.schemas import (
     RecommendationResponse,
     WeeklyScheduleRequest,
     WeeklyScheduleResponse,
+    WeeklyScheduleDay,
     TrailingCalendarDay,
     TrailingDayActivity,
     WorkoutType,
@@ -42,12 +47,19 @@ def current_fitness_state(
     connection: sqlite3.Connection,
     config: dict,
     request: RecommendationRequest | None = None,
+    *,
+    prepared_progress: PreparedProgressData | None = None,
+    preloaded_runs=None,
+    preloaded_latest_feedback=None,
 ) -> FitnessState:
     return build_fitness_state(
         connection,
         config,
         health_status=request.health_status if request else "normal",
         as_of=request.planned_at if request and request.planned_at else None,
+        prepared_progress=prepared_progress,
+        preloaded_runs=preloaded_runs,
+        preloaded_latest_feedback=preloaded_latest_feedback,
     )
 
 
@@ -146,6 +158,18 @@ def generate_weekly_schedule(
     project_root: str | Path,
 ) -> WeeklyScheduleResponse:
     """Create and persist an automatic seven-day schedule starting today."""
+    prior_schedule = load_latest_weekly_schedule(connection)
+    if (
+        prior_schedule is not None
+        and prior_schedule.planner_version != WEEKLY_PLANNER_VERSION
+    ):
+        prior_schedule = None
+    elif prior_schedule is not None:
+        prior_schedule = prior_schedule.model_copy(
+            update={
+                "planning_days": load_latest_weekly_planning_days(connection)
+            }
+        )
     local_zone = ZoneInfo(str(config.get("timezone_default", "UTC")))
     local_now = datetime.now(timezone.utc).astimezone(local_zone)
     start_date = local_now.date()
@@ -158,8 +182,45 @@ def generate_weekly_schedule(
         if 0 <= (value - start_date).days < PLANNING_HORIZON_DAYS
     }
     run_history = list_runs(connection, limit=5000)
+    prepared_progress = prepare_progress_data(connection)
+    latest_feedback = (
+        get_run_feedback(connection, config, run_history[0].activity_id)
+        if run_history
+        else None
+    )
     history = [
-        PlanningActivity(run.start_time, run.distance_miles)
+        PlanningActivity(
+            run.start_time,
+            run.distance_miles,
+            moving_minutes=run.moving_minutes,
+            easy_minutes=(
+                run.session_difficulty.zone_breakdown.easy_minutes
+                if run.session_difficulty
+                else None
+            ),
+            baseline_eligible=(
+                run.health_tag.value == "normal"
+                and run.workout_type
+                in {
+                    WorkoutType.EASY,
+                    WorkoutType.RECOVERY,
+                    WorkoutType.RUN_WALK,
+                    WorkoutType.UNKNOWN,
+                }
+                and run.moving_minutes is not None
+                and run.moving_minutes >= BASELINE_MINIMUM_AEROBIC_MINUTES
+                and run.session_difficulty is not None
+                and run.session_difficulty.zone_breakdown.easy_minutes
+                >= BASELINE_MINIMUM_AEROBIC_MINUTES
+                and not (
+                    run.session_difficulty
+                    and (
+                        run.session_difficulty.is_long_run
+                        or run.session_difficulty.is_quality_session
+                    )
+                )
+            ),
+        )
         for run in run_history
         if run.start_time
         and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
@@ -212,7 +273,12 @@ def generate_weekly_schedule(
             planned_at=base_planned_at,
         )
         base_state = current_fitness_state(
-            connection, config, base_request
+            connection,
+            config,
+            base_request,
+            prepared_progress=prepared_progress,
+            preloaded_runs=run_history,
+            preloaded_latest_feedback=latest_feedback,
         )
         for planned_at, forecast in options:
             delta_days = (
@@ -234,6 +300,14 @@ def generate_weekly_schedule(
                         ),
                         "days_since_long_run": shifted(
                             base_state.days_since_long_run
+                        ),
+                        "recovery_residual_load": (
+                            decay_recovery_load(
+                                base_state.recovery_residual_load,
+                                max(0.0, delta_days * 24.0),
+                            )
+                            if base_state.recovery_residual_load is not None
+                            else None
                         ),
                         "planned_weather": forecast,
                         # Weekly mileage and daily load checks must use the
@@ -264,6 +338,97 @@ def generate_weekly_schedule(
                                         or 0.0,
                                         target_evidence.capacity_reference_miles,
                                     ) > 0
+                                    else None
+                                ),
+                                "continuous_fatigue_miles": (
+                                    base_state.recent_load.continuous_fatigue_miles
+                                    * 0.5
+                                    ** (
+                                        max(0.0, delta_days)
+                                        / max(
+                                            0.1,
+                                            float(
+                                                config.get("coaching", {}).get(
+                                                    "continuous_fatigue_half_life_days",
+                                                    7,
+                                                )
+                                            ),
+                                        )
+                                    )
+                                    if base_state.recent_load.continuous_fatigue_miles
+                                    is not None
+                                    else None
+                                ),
+                                "continuous_fatigue_to_capacity_ratio": (
+                                    (
+                                        base_state.recent_load.continuous_fatigue_miles
+                                        * 0.5
+                                        ** (
+                                            max(0.0, delta_days)
+                                            / max(
+                                                0.1,
+                                                float(
+                                                    config.get("coaching", {}).get(
+                                                        "continuous_fatigue_half_life_days",
+                                                        7,
+                                                    )
+                                                ),
+                                            )
+                                        )
+                                    )
+                                    / max(
+                                        base_state.recent_load.capacity_reference_miles
+                                        or 0.0,
+                                        target_evidence.capacity_reference_miles,
+                                    )
+                                    if base_state.recent_load.continuous_fatigue_miles
+                                    is not None
+                                    and max(
+                                        base_state.recent_load.capacity_reference_miles
+                                        or 0.0,
+                                        target_evidence.capacity_reference_miles,
+                                    )
+                                    > 0
+                                    else None
+                                ),
+                                "continuous_distance_miles": (
+                                    base_state.recent_load.continuous_distance_miles
+                                    * 0.5
+                                    ** (
+                                        max(0.0, delta_days)
+                                        / max(
+                                            0.1,
+                                            float(
+                                                config.get("coaching", {}).get(
+                                                    "continuous_fatigue_half_life_days",
+                                                    7,
+                                                )
+                                            ),
+                                        )
+                                    )
+                                    if base_state.recent_load.continuous_distance_miles
+                                    is not None
+                                    else None
+                                ),
+                                "continuous_short_term_distance_miles": (
+                                    base_state.recent_load.continuous_short_term_distance_miles
+                                    * 0.5
+                                    ** (
+                                        max(0.0, delta_days)
+                                        / max(
+                                            0.1,
+                                            short_term_density_half_life_days(
+                                                float(
+                                                    config.get("coaching", {}).get(
+                                                        "continuous_fatigue_half_life_days",
+                                                        7,
+                                                    )
+                                                )
+                                            ),
+                                        )
+                                    )
+                                    if base_state.recent_load.continuous_short_term_distance_miles
+                                    is not None
                                     else None
                                 ),
                             }
@@ -301,6 +466,7 @@ def generate_weekly_schedule(
         completed_activities_by_offset=({0: completed_today} if completed_today else None),
         daily_state_options=daily_state_options,
         forced_rest_offsets=forced_rest_offsets,
+        prior_schedule=prior_schedule,
     )
     # Recent training is a completed-calendar-day lookback.  Including today
     # before it is over makes "no activity yet" look like a completed rest day
@@ -354,6 +520,28 @@ def generate_weekly_schedule(
         """,
         (result.model_dump_json(), datetime.now(timezone.utc).isoformat()),
     )
+    connection.execute(
+        """
+        INSERT INTO app_state(key,value_json,updated_at_utc)
+        VALUES ('weekly_schedule_internal',?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value_json=excluded.value_json,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        (
+            json.dumps(
+                {
+                    "planner_version": result.planner_version,
+                    "start_date": result.start_date.isoformat(),
+                    "days": [
+                        day.model_dump(mode="json")
+                        for day in result.planning_days
+                    ],
+                }
+            ),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
     current = RecommendationRequest(
         health_status=request.health_status,
         planned_at=None,
@@ -384,6 +572,25 @@ def load_latest_weekly_schedule(connection: sqlite3.Connection) -> WeeklySchedul
     # sessions, or readiness substitutions in addition to mileage alignment.
     # Preserve that context when the saved plan is reloaded.
     return result
+
+
+def load_latest_weekly_planning_days(
+    connection: sqlite3.Connection,
+) -> list[WeeklyScheduleDay]:
+    """Load the prior full horizon used only for soft plan continuity."""
+
+    row = connection.execute(
+        "SELECT value_json FROM app_state WHERE key='weekly_schedule_internal'"
+    ).fetchone()
+    if not row:
+        return []
+    payload = json.loads(row[0])
+    if payload.get("planner_version") != WEEKLY_PLANNER_VERSION:
+        return []
+    return [
+        WeeklyScheduleDay.model_validate(day)
+        for day in payload.get("days", [])
+    ]
 
 
 def _today_plan_time_is_stale(

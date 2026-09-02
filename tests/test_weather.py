@@ -80,6 +80,23 @@ def test_planned_forecast_is_a_separate_opt_in(tmp_path: Path) -> None:
     assert called is False
 
 
+def test_out_of_range_forecast_keeps_the_planned_calendar_date() -> None:
+    now = datetime.now(timezone.utc)
+    planned_day = (now + timedelta(days=17)).date()
+    candidates = [
+        datetime.combine(planned_day, datetime.min.time(), timezone.utc)
+        + timedelta(hours=hour)
+        for hour in (7, 12, 19)
+    ]
+
+    options = _forecast_options_from_response(candidates, None)
+
+    assert len(options) == 1
+    assert options[0][0] == candidates[1]
+    assert options[0][0].date() == planned_day
+    assert options[0][1] is None
+
+
 def test_forecast_carries_extreme_weather_detection_fields() -> None:
     moment = datetime(2026, 12, 10, 12, tzinfo=timezone.utc)
     values = _forecast_values(

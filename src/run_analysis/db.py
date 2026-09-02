@@ -10,7 +10,7 @@ import sqlite3
 from .privacy import private_directory, private_file
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -207,28 +207,36 @@ def initialize(connection: sqlite3.Connection) -> None:
         """
     )
     _reject_newer_database(connection)
-    connection.execute(
-        "INSERT INTO schema_metadata(key, value) VALUES('schema_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(SCHEMA_VERSION),),
-    )
-    # Renames run before the additive migrations so that an ``ADD COLUMN``
-    # further down does not create an empty twin of a column being renamed.
-    _rename_legacy_columns(connection)
-    _migrate_v2(connection)
-    _migrate_v3(connection)
-    _migrate_v4(connection)
-    _migrate_v5(connection)
-    _migrate_v6(connection)
-    _migrate_v7(connection)
-    _migrate_v8(connection)
-    _migrate_v9(connection)
-    _migrate_v10(connection)
-    _migrate_v11(connection)
-    _migrate_v12(connection)
-    _migrate_v13(connection)
-    _migrate_v14(connection)
-    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # Renames run before the additive migrations so that an ``ADD COLUMN``
+        # further down does not create an empty twin of a column being renamed.
+        _rename_legacy_columns(connection)
+        _migrate_v2(connection)
+        _migrate_v3(connection)
+        _migrate_v4(connection)
+        _migrate_v5(connection)
+        _migrate_v6(connection)
+        _migrate_v7(connection)
+        _migrate_v8(connection)
+        _migrate_v9(connection)
+        _migrate_v10(connection)
+        _migrate_v11(connection)
+        _migrate_v12(connection)
+        _migrate_v13(connection)
+        _migrate_v14(connection)
+        _migrate_v15(connection)
+        # The marker describes a completed migration, never an attempted one.
+        connection.execute(
+            "INSERT INTO schema_metadata(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
 
 
 class DatabaseTooNewError(RuntimeError):
@@ -435,22 +443,21 @@ def _migrate_v6(connection: sqlite3.Connection) -> None:
         ],
     )
     _add_columns(connection, "run_overrides", ["health_tag TEXT"])
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS app_state (
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS app_state (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL,
             updated_at_utc TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS recommendation_history (
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS recommendation_history (
             id INTEGER PRIMARY KEY,
             generated_at_utc TEXT NOT NULL,
             fitness_state_json TEXT NOT NULL,
             request_json TEXT NOT NULL,
             result_json TEXT NOT NULL
-        );
-        """
+        )"""
     )
 
 
@@ -466,9 +473,8 @@ def _migrate_v7(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_v8(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS activity_location_overrides (
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS activity_location_overrides (
             activity_id INTEGER PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
             postal_code TEXT NOT NULL,
             latitude REAL NOT NULL,
@@ -478,8 +484,7 @@ def _migrate_v8(connection: sqlite3.Connection) -> None:
             country_code TEXT NOT NULL DEFAULT 'US',
             source TEXT NOT NULL DEFAULT 'open_meteo_geocoding',
             updated_at_utc TEXT NOT NULL
-        );
-        """
+        )"""
     )
 
 
@@ -574,9 +579,8 @@ def _migrate_v13(connection: sqlite3.Connection) -> None:
 def _migrate_v14(connection: sqlite3.Connection) -> None:
     """Retain prescriptions so delayed uploads can reconcile against them."""
 
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS planned_workout_history (
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS planned_workout_history (
             id INTEGER PRIMARY KEY,
             schedule_generated_at TEXT NOT NULL,
             plan_date TEXT NOT NULL,
@@ -588,12 +592,14 @@ def _migrate_v14(connection: sqlite3.Connection) -> None:
             distance_high_miles REAL,
             recommendation_json TEXT NOT NULL,
             UNIQUE(schedule_generated_at, plan_date, planned_for)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_planned_workout_time
-            ON planned_workout_history(planned_for);
-
-        CREATE TABLE IF NOT EXISTS activity_plan_matches (
+        )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_planned_workout_time
+            ON planned_workout_history(planned_for)"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS activity_plan_matches (
             activity_id INTEGER PRIMARY KEY
                 REFERENCES activities(id) ON DELETE CASCADE,
             planned_workout_id INTEGER NOT NULL
@@ -602,6 +608,23 @@ def _migrate_v14(connection: sqlite3.Connection) -> None:
             distance_delta_miles REAL NOT NULL,
             match_confidence TEXT NOT NULL,
             matched_at_utc TEXT NOT NULL
-        );
-        """
+        )"""
+    )
+
+
+def _migrate_v15(connection: sqlite3.Connection) -> None:
+    """Measure adherence to time-based prescriptions as time, not mileage."""
+
+    _add_columns(
+        connection,
+        "planned_workout_history",
+        [
+            "duration_low_minutes REAL",
+            "duration_high_minutes REAL",
+        ],
+    )
+    _add_columns(
+        connection,
+        "activity_plan_matches",
+        ["duration_delta_minutes REAL NOT NULL DEFAULT 0"],
     )

@@ -134,11 +134,14 @@ def _load_runs(connection: sqlite3.Connection) -> list[dict]:
                m.raw_aerobic_efficiency_min_mile,m.environmental_adjustment_min_mile,
                m.selected_model_name,m.previous_7d_miles,m.previous_28d_miles,
                aw.temperature_f,aw.dewpoint_f,aw.relative_humidity_percent,aw.wind_speed_mph,
-               o.workout_type,o.illness,o.notes AS override_notes,mr.result_json
+               COALESCE(o.workout_type,ph.workout_type) AS workout_type,
+               o.illness,o.notes AS override_notes,mr.result_json
         FROM activities a
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN activity_weather aw ON aw.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
         LEFT JOIN model_runs mr ON mr.activity_id=a.id AND mr.model_name='standardized_pace_at_target_hr'
         ORDER BY a.start_time_utc_epoch
         """

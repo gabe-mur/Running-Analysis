@@ -55,13 +55,15 @@ def _candidate_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         """
         SELECT a.id,a.activity_id,a.start_time_utc,a.total_distance_m,a.gps_quality,
                m.model_eligible,m.calculated_moving_time_s,m.device_timer_time_s,
-               COALESCE(o.workout_type,'unknown') AS workout_type,
+               COALESCE(o.workout_type,ph.workout_type,'unknown') AS workout_type,
                COALESCE(o.health_tag,'normal') AS health_tag
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
         WHERE a.start_time_utc >= '2026-04-01' AND a.gps_quality != 'missing'
           AND a.total_distance_m >= 2414.016 AND m.model_eligible=1
-          AND COALESCE(o.workout_type,'unknown') NOT IN ('hike','bike')
+          AND COALESCE(o.workout_type,ph.workout_type,'unknown') NOT IN ('hike','bike')
         ORDER BY a.start_time_utc
         """
     ).fetchall()

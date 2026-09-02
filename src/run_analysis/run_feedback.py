@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 import json
 import sqlite3
@@ -20,6 +21,8 @@ from .training_load import (
     TrainingSession,
     acute_to_prior_weekly_ratio,
     calculate_session_load,
+    continuous_fatigue_load,
+    continuous_distance_rate,
     distance_capacity,
     rolling_load,
 )
@@ -88,11 +91,12 @@ def _infer_workout_type(
     distance_miles: float,
     moving_minutes: float,
     zone_seconds: dict[str, float],
+    long_threshold_miles: float = 7.0,
 ) -> WorkoutType:
     selected = _enum_workout(explicit)
     if selected != WorkoutType.UNKNOWN:
         return selected
-    if distance_miles >= 7:
+    if distance_miles >= long_threshold_miles:
         return WorkoutType.LONG
     if moving_minutes > 0:
         return WorkoutType.EASY
@@ -390,7 +394,7 @@ def _difficulty(row: sqlite3.Row, workout: WorkoutType, zone_seconds: dict[str, 
     flags: list[str] = []
     if load.zone_load is None:
         flags.append("intensity_load_unavailable_low_hr_coverage")
-    if workout in {WorkoutType.LONG} or distance_miles >= 7:
+    if workout == WorkoutType.LONG:
         flags.append("long_duration_fatigue_possible")
     if load.hard_minutes >= 8:
         flags.append("high_intensity_response")
@@ -425,6 +429,7 @@ def _load_window(value) -> LoadWindow:
         zone_load=value.zone_load,
         hard_minutes=value.hard_minutes,
         activity_count=value.activity_count,
+        zone_load_activity_count=value.zone_load_activity_count,
     )
 
 
@@ -433,9 +438,11 @@ def _prior_load_context(connection: sqlite3.Connection, as_of: datetime) -> Load
         """
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.calculated_moving_time_s,
                m.device_timer_time_s,m.session_zone_load,m.hard_minutes,m.hr_zone_seconds_json,
-               m.exclusion_reason,o.workout_type
+               m.exclusion_reason,COALESCE(o.workout_type,ph.workout_type) AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
         WHERE a.start_time_utc_epoch < ? ORDER BY a.start_time_utc_epoch
         """,
         (as_of.timestamp(),),
@@ -468,12 +475,21 @@ def _prior_load_context(connection: sqlite3.Connection, as_of: datetime) -> Load
         )
     values = [rolling_load(sessions, as_of, days) for days in (7, 14, 28)]
     capacity = distance_capacity(sessions, as_of)
+    continuous_fatigue = continuous_fatigue_load(sessions, as_of)
     return LoadContext(
         trailing_7d=_load_window(values[0]),
         trailing_14d=_load_window(values[1]),
         trailing_28d=_load_window(values[2]),
         acute_to_prior_ratio=acute_to_prior_weekly_ratio(sessions, as_of),
         acute_distance_to_capacity_ratio=capacity.acute_to_capacity_ratio,
+        continuous_fatigue_miles=continuous_fatigue.equivalent_weekly_miles,
+        continuous_fatigue_to_capacity_ratio=(
+            continuous_fatigue.equivalent_weekly_miles
+            / capacity.reference_miles
+            if capacity.reference_miles > 0
+            else None
+        ),
+        continuous_distance_miles=continuous_distance_rate(sessions, as_of),
         prior_28d_weekly_miles=capacity.prior_28d_weekly_miles,
         sustained_capacity_miles=capacity.sustained_weekly_miles,
         capacity_reference_miles=capacity.reference_miles,
@@ -569,6 +585,7 @@ RUN_SELECT = """
            ph.recommendation_json AS prescribed_recommendation_json,
            ap.timing_delta_hours AS prescription_timing_delta_hours,
            ap.distance_delta_miles AS prescription_distance_delta_miles,
+           ap.duration_delta_minutes AS prescription_duration_delta_minutes,
            ap.match_confidence AS prescription_match_confidence,
            lo.postal_code,lo.locality AS location_locality,lo.region AS location_region,
            w.temperature_f,w.dewpoint_f,w.apparent_temperature_f,w.relative_humidity_percent,
@@ -588,13 +605,62 @@ RUN_SELECT = """
 """
 
 
-def _row_summary(row: sqlite3.Row) -> RunSummary:
+def _long_run_threshold(rows) -> float:
+    """Infer a long-run boundary from ordinary history, with a sparse fallback."""
+
+    ordinary: list[float] = []
+    for row in rows:
+        workout = _enum_workout(row["workout_type"])
+        if workout not in {
+            WorkoutType.UNKNOWN,
+            WorkoutType.EASY,
+            WorkoutType.RECOVERY,
+            WorkoutType.OTHER,
+        }:
+            continue
+        distance = float(row["total_distance_m"] or 0) / METERS_PER_MILE
+        if distance > 0:
+            ordinary.append(distance)
+    if len(ordinary) < 4:
+        return 7.0
+    ordinary.sort()
+    # Exclude the upper quartile before estimating an ordinary session so
+    # unlabeled historical long runs cannot inflate their own boundary.
+    core = ordinary[: max(3, int(len(ordinary) * 0.75))]
+    return max(6.0, median(core) * 1.40)
+
+
+def _long_run_threshold_from_connection(connection: sqlite3.Connection) -> float:
+    rows = connection.execute(
+        """
+        SELECT a.total_distance_m,
+               COALESCE(o.workout_type,ph.workout_type) AS workout_type
+        FROM activities a
+        LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
+        WHERE a.sport='Running' AND a.total_distance_m>0
+        ORDER BY a.start_time_utc_epoch DESC
+        LIMIT 500
+        """
+    ).fetchall()
+    return _long_run_threshold(rows)
+
+
+def _row_summary(row: sqlite3.Row, long_threshold_miles: float = 7.0) -> RunSummary:
     zones = json.loads(row["hr_zone_seconds_json"] or "{}")
     moving_s = float(row["calculated_moving_time_s"] or row["device_timer_time_s"] or 0)
     load = calculate_session_load(zones, moving_s)
     miles = float(row["total_distance_m"] or row["analysis_distance_m"] or 0) / METERS_PER_MILE
-    workout = _infer_workout_type(row["workout_type"], miles, moving_s / 60, zones)
+    workout = _infer_workout_type(
+        row["workout_type"],
+        miles,
+        moving_s / 60,
+        zones,
+        long_threshold_miles,
+    )
     health = _health_tag(row)
+    prescription = prescribed_recommendation_from_row(row)
     if workout == WorkoutType.HIKE:
         assessment_label = "Hike / time on feet"
     elif workout == WorkoutType.BIKE:
@@ -623,6 +689,12 @@ def _row_summary(row: sqlite3.Row) -> RunSummary:
         data_quality=_data_quality(row, load.hr_coverage),
         fitness_observation=_fitness_observation(row, workout, health),
         session_difficulty=_difficulty(row, workout, zones),
+        prescribed_planning_role=(
+            prescription.planning_role if prescription else None
+        ),
+        prescribed_distance_range_miles=(
+            prescription.distance_range_miles if prescription else None
+        ),
     )
 
 
@@ -631,14 +703,15 @@ def list_runs(connection: sqlite3.Connection, limit: int = 100, offset: int = 0)
         RUN_SELECT + " ORDER BY a.start_time_utc_epoch DESC,a.id DESC LIMIT ? OFFSET ?",
         (limit, offset),
     ).fetchall()
-    return [_row_summary(row) for row in rows]
+    threshold = _long_run_threshold_from_connection(connection)
+    return [_row_summary(row, threshold) for row in rows]
 
 
 def get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], activity_id: int) -> RunFeedback | None:
     row = connection.execute(RUN_SELECT + " WHERE a.id=?", (activity_id,)).fetchone()
     if row is None:
         return None
-    summary = _row_summary(row)
+    summary = _row_summary(row, _long_run_threshold_from_connection(connection))
     metadata = RunMetadata(
         workout_type=summary.workout_type,
         health_tag=summary.health_tag,
@@ -690,6 +763,9 @@ def get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], act
         ),
         prescription_distance_delta_miles=float(
             row["prescription_distance_delta_miles"] or 0
+        ),
+        prescription_duration_delta_minutes=float(
+            row["prescription_duration_delta_minutes"] or 0
         ),
         prescription_match_confidence=str(
             row["prescription_match_confidence"] or "moderate"

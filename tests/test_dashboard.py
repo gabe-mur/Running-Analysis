@@ -24,7 +24,15 @@ def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -
     assert payload["progress"]["fitness_trend"] == "insufficient_data"
     assert payload["recommendation"]["workout_type"] == "easy"
     assert payload["recommendation"]["rule_trace"]
-    assert "starter plan" in payload["weekly_schedule"]["summary"].casefold()
+    assert payload["weekly_schedule"]["run_count"] == 1
+    assert payload["weekly_schedule"]["target_evidence"]["planning_mode"] == "baseline_required"
+    baseline = next(
+        day["recommendation"]
+        for day in payload["weekly_schedule"]["days"]
+        if day["recommendation"] is not None
+    )
+    assert baseline["duration_range_minutes"] == [10.0, 30.0]
+    assert "10–30-minute" in payload["weekly_schedule"]["summary"]
     assert [item["label"] for item in payload["fitness_interpretation"]["signals"]] == [
         "Aerobic efficiency",
         "Durability",

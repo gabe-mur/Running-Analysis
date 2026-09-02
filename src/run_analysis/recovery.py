@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import log2
+from typing import Iterable
 
 from .web.schemas import FitnessState, LoadWindow, SessionDifficulty
 
@@ -16,9 +17,6 @@ from .web.schemas import FitnessState, LoadWindow, SessionDifficulty
 RECOVERY_HALF_LIFE_HOURS = 12.0
 EASY_RUN_RESIDUAL_LIMIT = 0.55
 TAXING_RUN_RESIDUAL_LIMIT = 0.25
-QUALITY_SESSION_LOAD_FACTOR = 1.35
-LONG_RUN_LOAD_FACTOR = 1.15
-RECOVERY_RUN_LOAD_FACTOR = 0.70
 # Below this residue, the effect on an ordinary easy-run distance would be
 # smaller than the prescription's half-mile display precision.
 EASY_VOLUME_RESIDUAL_FLOOR = 0.10
@@ -71,9 +69,12 @@ def athlete_relative_session_load(
         if typical.activity_count and typical.moving_minutes > 0
         else None
     )
+    known_zone_load_count = (
+        typical.zone_load_activity_count or typical.activity_count
+    )
     typical_zone_load = (
-        typical.zone_load / typical.activity_count
-        if typical.activity_count
+        typical.zone_load / known_zone_load_count
+        if known_zone_load_count
         and typical.zone_load is not None
         and typical.zone_load > 0
         else None
@@ -105,10 +106,10 @@ def athlete_relative_session_load(
         + session.zone_breakdown.hard_minutes
     )
     # Zone load prices the observed intensity response. Fractions are only the
-    # fallback when HR-derived load could not be calculated. Workout role is
-    # accounted for separately below so completing a prescribed quality run
-    # does not make its projected recovery cost disappear on upload. Long-run
-    # recovery retains its separately calibrated distance-led behavior.
+    # fallback when HR-derived load could not be calculated. Workout labels do
+    # not change recovery: a run recorded as easy that becomes unusually hard
+    # must cost more, while merely calling the same work "long" or "quality"
+    # must not create a categorical recovery cliff.
     zone_factor = 1.0
     if zone_load_ratio is None and known_zone_minutes > 0:
         moderate_fraction = (
@@ -116,12 +117,6 @@ def athlete_relative_session_load(
         )
         hard_fraction = session.zone_breakdown.hard_minutes / known_zone_minutes
         zone_factor += 0.15 * moderate_fraction + 0.50 * hard_fraction
-    session_type_factor = (
-        QUALITY_SESSION_LOAD_FACTOR
-        if session.is_quality_session
-        else 1.0
-    )
-
     rpe_factor = (
         1.0
         + 0.07 * max(0, session.perceived_exertion - 6)
@@ -149,7 +144,6 @@ def athlete_relative_session_load(
     load = (
         relative_work
         * zone_factor
-        * session_type_factor
         * rpe_factor
         * mechanical_factor
         * response_factor
@@ -158,7 +152,6 @@ def athlete_relative_session_load(
         "distance_ratio": distance_ratio,
         "duration_ratio": duration_ratio,
         "zone_load_ratio": zone_load_ratio,
-        "session_type_factor": session_type_factor,
         "rpe_factor": rpe_factor,
         "mechanical_factor": mechanical_factor,
         "response_factor": response_factor,
@@ -175,6 +168,66 @@ def decay_recovery_load(
 
     return max(0.0, initial_load) * 0.5 ** (
         max(0.0, elapsed_hours) / half_life_hours
+    )
+
+
+def cumulative_recovery_load(
+    session_loads: Iterable[tuple[float, float]],
+    *,
+    half_life_hours: float = RECOVERY_HALF_LIFE_HOURS,
+) -> float:
+    """Sum independently decayed residue from completed sessions.
+
+    Each pair is ``(initial_load, elapsed_hours)``. Keeping this arithmetic in
+    one pure function lets persisted fitness state and projected planning use
+    the same recovery accounting across reloads.
+    """
+
+    return sum(
+        decay_recovery_load(
+            initial_load,
+            elapsed_hours,
+            half_life_hours=half_life_hours,
+        )
+        for initial_load, elapsed_hours in session_loads
+    )
+
+
+def prior_typical_load(state: FitnessState) -> LoadWindow:
+    """Return the 28-day baseline immediately before the latest session.
+
+    The rolling window stored on ``FitnessState`` includes the run whose
+    recovery cost is being evaluated. Leaving it in both numerator and
+    denominator makes an unusually large or hard session look more ordinary
+    than it was.
+    """
+
+    window = state.recent_load.trailing_28d
+    session = state.last_run
+    if (
+        session is None
+        or state.days_since_last_run is None
+        or state.days_since_last_run > window.days
+        or window.activity_count <= 1
+    ):
+        return window
+    zone_load = window.zone_load
+    if zone_load is not None and session.zone_load is not None:
+        zone_load = max(0.0, zone_load - session.zone_load)
+    known_zone_load_count = window.zone_load_activity_count
+    if known_zone_load_count and session.zone_load is not None:
+        known_zone_load_count -= 1
+    return LoadWindow(
+        days=window.days,
+        distance_miles=max(0.0, window.distance_miles - session.distance_miles),
+        moving_minutes=max(0.0, window.moving_minutes - session.moving_minutes),
+        zone_load=zone_load,
+        hard_minutes=max(
+            0.0,
+            window.hard_minutes - session.zone_breakdown.hard_minutes,
+        ),
+        activity_count=window.activity_count - 1,
+        zone_load_activity_count=known_zone_load_count,
     )
 
 
@@ -195,12 +248,16 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
         return None
     initial, evidence = athlete_relative_session_load(
         state.last_run,
-        state.recent_load.trailing_28d,
+        prior_typical_load(state),
         performance_anomaly=state.recent_performance_anomaly,
         drift_percent=state.last_run_drift_percent,
     )
     elapsed_hours = max(0.0, state.days_since_last_run * 24.0)
-    residual = decay_recovery_load(initial, elapsed_hours)
+    residual = (
+        state.recovery_residual_load
+        if state.recovery_residual_load is not None
+        else decay_recovery_load(initial, elapsed_hours)
+    )
     return RecoveryEstimate(
         initial_load=initial,
         residual_load=residual,

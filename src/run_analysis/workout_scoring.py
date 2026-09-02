@@ -425,8 +425,11 @@ def _historical_interval_comparison(
     candidates = connection.execute(
         """
         SELECT a.id,a.start_time_utc
-        FROM activities a JOIN run_overrides o ON o.activity_id=a.activity_id
-        WHERE o.workout_type='intervals'
+        FROM activities a
+        LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+        LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
+        LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
+        WHERE COALESCE(o.workout_type,ph.workout_type)='intervals'
           AND COALESCE(o.health_tag,'normal')='normal'
           AND a.id<>? AND a.start_time_utc<?
         ORDER BY a.start_time_utc DESC LIMIT 12
@@ -547,24 +550,36 @@ def _prescription_analysis(
     *,
     timing_delta_hours: float,
     distance_delta_miles: float,
+    duration_delta_minutes: float = 0.0,
     match_confidence: str,
+    interval_analysis: IntervalAnalysis | None = None,
 ) -> PrescriptionMatchAnalysis:
     quality_steps = [
         step
         for step in prescription.structure
-        if step.duration_minutes is not None
+        if (step.duration_minutes is not None or step.repetitions is not None)
         and any(
             marker in zone.casefold()
             for zone in step.target_zones
             for marker in ("z3", "z4", "z5", "strong", "threshold")
         )
     ]
-    target_work = sum(
-        float(step.duration_minutes or 0) for step in quality_steps
-    ) or None
+    target_work = 0.0
+    for step in quality_steps:
+        if step.repetitions and step.work_duration_minutes:
+            target_work += step.repetitions * step.work_duration_minutes
+        elif step.repetitions and step.work_duration_range_minutes:
+            low, high = step.work_duration_range_minutes
+            target_work += step.repetitions * ((low + high) / 2)
+        else:
+            target_work += float(step.duration_minutes or 0)
+    target_work = target_work or None
     detected_work: float | None = None
     source = "heart_rate_zone_exposure"
-    if (
+    if interval_analysis is not None and interval_analysis.available:
+        detected_work = interval_analysis.work_minutes
+        source = interval_analysis.source
+    elif (
         prescription.workout_type == WorkoutType.TEMPO_THRESHOLD
         and target_work is not None
     ):
@@ -600,25 +615,33 @@ def _prescription_analysis(
             difficulty.zone_breakdown.moderate_minutes
             + difficulty.zone_breakdown.hard_minutes
         )
+    requires_work_detection = prescription.workout_type in {
+        WorkoutType.INTERVALS,
+        WorkoutType.TEMPO_THRESHOLD,
+        WorkoutType.RACE,
+    }
     work_close = bool(
-        target_work is None
+        (not requires_work_detection and target_work is None)
         or (
+            target_work is not None
+            and
             detected_work is not None
             and abs(detected_work - target_work)
             <= max(2.0, target_work * 0.15)
         )
     )
     distance_close = distance_delta_miles <= 0.25
-    if work_close and distance_close:
+    duration_close = duration_delta_minutes <= 1e-9
+    if work_close and distance_close and duration_close:
         status = "Completed as prescribed"
         summary = (
-            "Recorded timing, distance, and work dose match the saved "
+            "Recorded timing, distance or duration, and work dose match the saved "
             "prescription closely."
         )
     elif work_close:
         status = "Structure completed"
         summary = (
-            "The prescribed work dose was detected, with total distance "
+            "The prescribed work dose was detected, with total distance or duration "
             "outside the planned range."
         )
     else:
@@ -638,8 +661,10 @@ def _prescription_analysis(
         planned_for=prescription.planned_for,
         quality_session_type=prescription.quality_session_type,
         target_distance_range_miles=prescription.distance_range_miles,
+        target_duration_range_minutes=prescription.duration_range_minutes,
         timing_delta_hours=timing_delta_hours,
         distance_delta_miles=distance_delta_miles,
+        duration_delta_minutes=duration_delta_minutes,
         execution_status=status,
         summary=summary,
         target_work_minutes=target_work,
@@ -676,8 +701,10 @@ def analyze_workout(
     prescription: RecommendationResponse | None = None,
     prescription_timing_delta_hours: float = 0.0,
     prescription_distance_delta_miles: float = 0.0,
+    prescription_duration_delta_minutes: float = 0.0,
     prescription_match_confidence: str = "moderate",
 ) -> WorkoutAnalysis:
+    interval_analysis: IntervalAnalysis | None = None
     if workout not in {WorkoutType.INTERVALS, WorkoutType.RUN_WALK}:
         analysis = _generic_analysis(workout, difficulty, drift, splits)
         if workout == WorkoutType.TEMPO_THRESHOLD:
@@ -748,7 +775,9 @@ def analyze_workout(
         prescription,
         timing_delta_hours=prescription_timing_delta_hours,
         distance_delta_miles=prescription_distance_delta_miles,
+        duration_delta_minutes=prescription_duration_delta_minutes,
         match_confidence=prescription_match_confidence,
+        interval_analysis=interval_analysis,
     )
     execution = analysis.execution.model_copy(
         update={

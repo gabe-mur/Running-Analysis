@@ -199,6 +199,7 @@ class LoadWindow(ApiModel):
     zone_load: float | None = Field(default=None, ge=0)
     hard_minutes: float = Field(default=0, ge=0)
     activity_count: int = Field(ge=0)
+    zone_load_activity_count: int = Field(default=0, ge=0)
 
 
 class LoadContext(ApiModel):
@@ -214,6 +215,37 @@ class LoadContext(ApiModel):
         default=None,
         ge=0,
         description="Trailing 7-day distance divided by retained demonstrated weekly capacity.",
+    )
+    continuous_fatigue_miles: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Exponentially decayed distance/duration/intensity load expressed "
+            "as an equivalent weekly mileage rate."
+        ),
+    )
+    continuous_fatigue_to_capacity_ratio: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Continuous fatigue equivalent divided by retained demonstrated capacity."
+        ),
+    )
+    continuous_distance_miles: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Exponentially decayed completed distance expressed as an "
+            "equivalent weekly mileage rate for boundary-free planning."
+        ),
+    )
+    continuous_short_term_distance_miles: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Faster exponentially decayed distance rate used to detect a "
+            "recent training-density surge without a calendar window."
+        ),
     )
     prior_28d_weekly_miles: float | None = Field(default=None, ge=0)
     sustained_capacity_miles: float | None = Field(default=None, ge=0)
@@ -274,6 +306,8 @@ class RunSummary(ApiModel):
     data_quality: DataQuality
     fitness_observation: FitnessObservation | None = None
     session_difficulty: SessionDifficulty | None = None
+    prescribed_planning_role: str | None = None
+    prescribed_distance_range_miles: tuple[float, float] | None = None
 
 
 class Split(ApiModel):
@@ -408,8 +442,10 @@ class PrescriptionMatchAnalysis(ApiModel):
     planned_for: datetime
     quality_session_type: QualitySessionType | None = None
     target_distance_range_miles: tuple[float, float] | None = None
+    target_duration_range_minutes: tuple[float, float] | None = None
     timing_delta_hours: float = Field(ge=0)
     distance_delta_miles: float = Field(ge=0)
+    duration_delta_minutes: float = Field(default=0, ge=0)
     execution_status: str
     summary: str
     target_work_minutes: float | None = Field(default=None, ge=0)
@@ -469,7 +505,8 @@ class FitnessPoint(ApiModel):
     activity_id: int
     start_time: datetime
     raw_pace_min_mile: float | None = Field(default=None, gt=0)
-    standardized_pace_min_mile: float = Field(gt=0)
+    standardized_pace_min_mile: float | None = Field(default=None, gt=0)
+    context_pace_min_mile: float | None = Field(default=None, gt=0)
     uncertainty_95_min_mile: float = Field(ge=0)
     distance_miles: float = Field(ge=0)
     zone_load: float | None = Field(default=None, ge=0)
@@ -688,6 +725,14 @@ class FitnessState(ApiModel):
     last_run: SessionDifficulty | None = None
     last_run_workout_type: WorkoutType | None = None
     last_run_drift_percent: float | None = None
+    recovery_residual_load: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Cumulative transient recovery load from all recent sessions, "
+            "already decayed to as_of."
+        ),
+    )
     longest_run_30d_miles: float = Field(default=0, ge=0)
     retained_long_run_capacity_miles: float = Field(default=0, ge=0)
     quality_sessions_14d: int = Field(default=0, ge=0)
@@ -756,6 +801,19 @@ class WorkoutStep(ApiModel):
     duration_minutes: float | None = Field(default=None, gt=0)
     distance_miles: float | None = Field(default=None, gt=0)
     target_zones: list[str] = Field(default_factory=list)
+    phase: str | None = None
+    repetitions: int | None = Field(default=None, gt=0)
+    work_duration_minutes: float | None = Field(default=None, gt=0)
+    work_duration_range_minutes: tuple[float, float] | None = None
+    recovery_duration_minutes: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_work_duration_range(self) -> "WorkoutStep":
+        if self.work_duration_range_minutes is not None:
+            low, high = self.work_duration_range_minutes
+            if low <= 0 or high < low:
+                raise ValueError("work duration range must be positive and ordered")
+        return self
 
 
 class RuleTrace(ApiModel):
@@ -772,6 +830,7 @@ class RecommendationResponse(ApiModel):
     planned_weather: PlannedWeather | None = None
     workout_type: WorkoutType
     quality_session_type: QualitySessionType | None = None
+    planning_role: str | None = None
     title: str
     distance_range_miles: tuple[float, float] | None = None
     duration_range_minutes: tuple[float, float] | None = None
@@ -833,14 +892,28 @@ class TrailingCalendarDay(ApiModel):
     activities: list[TrailingDayActivity] = Field(default_factory=list)
 
 
+class WeeklyPlanningMode(StrEnum):
+    ESTABLISHED = "established"
+    BASELINE_BUILDING = "baseline_building"
+    BASELINE_REQUIRED = "baseline_required"
+
+
 class WeeklyTargetEvidence(ApiModel):
     recent_7d_miles: float = Field(ge=0)
+    recent_14d_weekly_miles: float = Field(default=0, ge=0)
+    recent_21d_weekly_miles: float = Field(default=0, ge=0)
     chronic_42d_weekly_miles: float = Field(ge=0)
     best_sustained_28d_weekly_miles: float = Field(ge=0)
     peak_7d_miles: float = Field(ge=0)
     current_run_days_per_week: float | None = Field(default=None, ge=0, le=7)
     demonstrated_run_days_per_week: float = Field(ge=0, le=7)
     capacity_reference_miles: float = Field(ge=0)
+    progression_continuity: float = Field(default=0, ge=0, le=1)
+    earned_progression_fraction: float = Field(default=0, ge=0, le=0.10)
+    planning_mode: WeeklyPlanningMode = WeeklyPlanningMode.ESTABLISHED
+    history_run_count: int = Field(default=0, ge=0)
+    baseline_session_miles: float | None = Field(default=None, gt=0)
+    baseline_session_minutes: float | None = Field(default=None, gt=0)
     rationale: str
 
 
@@ -859,6 +932,12 @@ class WeeklyScheduleResponse(ApiModel):
     projected_distance_range_miles: tuple[float, float]
     summary: str
     days: list[WeeklyScheduleDay]
+    planning_days: list[WeeklyScheduleDay] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+        description="Internal full-horizon plan; excluded from API serialization.",
+    )
 
 
 class UploadStage(ApiModel):
@@ -926,9 +1005,9 @@ class CoachingSettings(ApiModel):
     long_run_target_progression_fraction: float = Field(ge=0, le=0.10)
     high_load_ratio: float = Field(gt=1, le=3)
     moderate_intensity_leakage_fraction: float = Field(ge=0, le=1)
-    minimum_days_between_quality_sessions: float = Field(ge=1, le=14)
     quality_recency_reference_days: float = Field(ge=4, le=21)
     typical_rest_days_between_runs: int = Field(ge=0, le=3)
+    continuous_fatigue_half_life_days: float = Field(default=7, ge=1, le=42)
     capacity_retention_half_life_days: float = Field(ge=14, le=120)
     capacity_retention_grace_days: int = Field(ge=0, le=90)
     long_run_retention_half_life_days: float = Field(ge=30, le=365)

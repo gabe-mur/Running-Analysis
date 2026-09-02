@@ -345,6 +345,81 @@ failure does not prevent local rules from running.
 Environmental thresholds are inspectable coaching guardrails, not claims of
 individualized medical safety.
 
+## Baseline acquisition and established planning
+
+Baseline acquisition is a separate planning path, not a low end of the normal
+weekly optimizer. With no usable running history, it prescribes one
+conversational Z2/run-walk outing: at least 10 minutes for useful evidence,
+continuing only while heart rate and legs remain comfortable, and stopping for
+pain, fatigue, elevated heart rate, or at 30 minutes. Sparse history repeats the
+observed baseline session until weekly capacity is measurable. It does not
+invent a weekly mileage target, long run, or quality workout.
+
+Once capacity is established, that calibration minimum is unavailable to the
+weekly allocator. Ordinary easy-session options are anchored to the athlete's
+historical easy range or to a shorter standalone prescription already justified
+by recovery. Recovery trimming, frequency selection, and long-run preservation
+use those established references; they cannot turn normal run opportunities
+into ten-minute filler sessions to make a mileage total fit.
+
+The ordinary-easy reference is a continuous-time recency-weighted median of
+normal-health easy running, using the same configurable retention half-life as
+capacity evidence rather than a hard 28-day cutoff. An easy run intentionally
+shortened by the allocator is archived with a `support_easy` planning role. Its
+completed distance, duration, intensity, and recovery cost remain fully counted,
+but it does not teach the planner that the athlete's ordinary aerobic run has
+become that short. Unmatched easy running and completed `ordinary_easy` sessions
+continue to update the baseline normally.
+
+The established planner evaluates a continuous 21-day calendar before showing
+the first seven days. Dates, workout roles, and distance ranges are compared
+together. Final allocated roles—not provisional labels—must preserve long and
+quality cadence. Once elapsed recency selects a role, the generic single-run
+score cannot silently replace it with easy mileage; exact cumulative recovery
+may still make that substitution, and the allocator can shorten a quality dose.
+The finite day-21 edge is not a mileage deadline. A boundary-free load corridor
+governs when mileage can be placed, the full-horizon rate governs how much is
+funded, and a recency-decayed prior-plan preference prevents normal adherence
+from pulling the next workout forward merely because the horizon moved one day.
+The full lookahead still evaluates recovery, workout sequence, and overload,
+but a 4/4/3-run horizon cannot create terminal "mileage debt" that manufactures
+a fifth short run in the visible segment. Frequency candidates are compared
+after their actual long, quality, and easy distances have been allocated;
+target mileage divided by a guessed number of easy slots is not used as a proxy
+for program quality. Provisional load-caution easy ranges later in the horizon
+may be resized by the finalized joint model, while the first run's recorded-
+recovery cap remains protected. This prevents a calendar of many small caution
+runs from becoming the only numerical way to fund the target. Easy mileage
+beyond the ordinary range is labeled medium-long only when it forms a
+purposeful secondary endurance exposure.
+
+The supplied weekly run-count estimate is not an optimizer target, and no
+seven-day reporting slice is rewarded for containing three, four, or any other
+count. A user-selected typical rest preference becomes a soft elapsed-hour
+cadence reference across the continuous calendar. Time beyond that reference
+is priced proportionally, while exact recovery and accumulated density can
+justify either a shorter or longer gap. This prevents two complete rest days
+from being silently free when the athlete selected a one-rest-day rhythm,
+without demanding consecutive dates or imposing a weekly quota.
+
+The adherence simulator uses the same receding horizon and defaults to
+regenerating it every simulated day. Seven-day `ProjectionWeek` rows are report
+buckets only: streaks and rolling load are calculated from the continuous dated
+run history across row boundaries. A seven-day commit interval exists solely as
+an explicitly requested fast-test mode and is not production-fidelity evidence
+about schedule spacing. Its prescribed-distance column sums the recommendations
+actually committed between replans. If a run is missed and the next daily plan
+offers a replacement, both are reported as separate attempts; they were never
+simultaneous mileage in one live plan.
+
+Its perfect mode commits every prescription at the distance midpoint. The
+seeded human mode perturbs only completed behavior: modest skipped, short,
+long, or intensity-drifted runs; occasional easy/quality substitutions and
+unscheduled easy running; two or three short surprise trips; and zero or one
+seven-day vacation. These absences are not disclosed to the planner in advance,
+so each daily regeneration must respond to the activity history it would
+actually receive. Scenario probabilities are test inputs, not coaching rules.
+
 ## Training load and coaching interpretation
 
 Session difficulty is deliberately not folded into standardized pace. The app
@@ -363,20 +438,22 @@ the Garmin-RUNSAFE cohort's observed increase in overuse-injury rates above a
 association is used as a guardrail, not as a command to increase by 10% or as a
 guarantee of safety below it.
 
-That factor still outranks the conventional five-mile long-run distance. Where
-an athlete's longest run in the past 30 days was three miles, the prescription
-is roughly 3.0-3.5 miles with a warning naming the limit, never five miles
-because a convention outvoted the evidence. Practical quarter-mile range
-rounding remains the only thing permitted to exceed the ceiling, and the
-prescription says so.
+There is no conventional five-mile minimum. A long run is labeled as such only
+when the athlete-relative progression ceiling can produce a session meaningfully
+longer than ordinary easy running. Otherwise the optimizer uses an easy or
+quality session rather than manufacturing a long-run role from a global mileage
+convention. The progression ceiling governs the prescribed midpoint; the small
+published range around that midpoint is route and GPS flexibility.
 
 Long-run targeting is separate from that ceiling. The working target progresses
 by a configurable proportion of maintained recent single-run distance (5% by
 default); it does not automatically spend the 10% guardrail. Quarter-mile
 prescription rounding keeps that proportional target from becoming either a
-fixed half-mile build or zero midpoint progress. Current weekly capacity and
-demonstrated run frequency limit how much of the week can sit in one session. A
-recency-decayed six-month durability reference preserves
+fixed half-mile build or zero midpoint progress. There is no fixed
+percentage-of-week ceiling on this session: the joint allocator first preserves
+the recovery-compatible, single-session progression target, then allocates
+quality and aerobic support around it. A recency-decayed six-month durability
+reference preserves
 evidence from older long runs without allowing an old peak to override the
 current 30-day single-session guardrail. Completed runs refresh the reference,
 so adherence can build the target upward rather than following decay downward.
@@ -384,7 +461,10 @@ When the maintained recent distance is below that retained capacity, a general
 return-to-capacity rule can use more of the progression headroom, up to the 10%
 ceiling. The rate fades back toward the ordinary 5% target as the retained level
 is regained; historical progression speed is not learned as a personal safety
-claim.
+claim. The preferred-to-maximum gap is priced as one normalized program-fit
+tradeoff, so spare weekly mileage does not make the maximum automatic. It stays
+available when recovery, unavailable days, and target shortfall collectively
+justify spending that headroom.
 Once recovery and workout scoring select a safe, meaningful long run, the
 weekly allocator reserves that target before quality structure and easy-mile
 distribution; it does not erase the role merely to make all run distances more
@@ -418,26 +498,65 @@ and an unusually costly or strong response make smaller graded adjustments.
 Missing HR load does not become zero load; distance and duration retain their
 weight and zone fractions provide a limited intensity fallback.
 
+Prospective sessions use the same three-part shape: prescribed distance,
+duration estimated at the athlete's recent pace, and the moderate/hard minutes
+encoded in the workout structure. Workout names carry no recovery multiplier.
+At equal distance, duration, and intensity, an easy run and a labeled long run
+therefore have equal recovery cost; after upload, actual duration and HR-zone
+load replace the estimates. This also means an easy run that becomes harder
+than prescribed cannot remain artificially cheap merely because its label did
+not change.
+
 The resulting load decays exponentially by exact elapsed time with a 12-hour
 half-life. This half-life is a transparent planning assumption, not a direct
 measurement of muscle repair or a claim to reproduce a watch algorithm. The
 athlete's own data determine the starting magnitude, so a short easy run clears
 much sooner than a long, high-load, high-RPE, or mechanically costly one.
+The application does not currently ingest sleep duration or quality. It
+therefore does not pretend that a local nighttime interval proves sleep or
+assign an unsupported universal conversion between sleeping and waking hours.
+Measured sleep can become a separate modifier of this exact-time signal; until
+then, athlete-facing guidance continues to disclose sleep as unavailable.
 
 Easy and taxing workouts use different residual-load references. This allows
 an easy run while the model would still steer away from another long or quality
-session. Candidate timing, workout scoring, weekly spacing, and mileage
+session. Candidate timing, workout scoring, continuous spacing, and mileage
 allocation all consume this same decaying signal. Calendar spacing remains a
 soft cadence preference only; crossing a named number of hours or days never
 causes recovery load to disappear.
 
+The whole-program comparison also carries short- and longer-timescale mileage
+density forward through the conditional plan. A discretely scheduled run
+necessarily creates a pulse above a smooth mileage-rate target, so each curve
+allows the exact pulse contributed by one athlete-typical easy run. Only load
+that stacks beyond that dynamic session corridor is charged as excess density.
+This prevents an ordinary isolated run from being mistaken for overtraining
+while still making several individually tolerable runs costly when their
+residual loads overlap.
+
+Quality recurrence likewise has no minimum-days prohibition. Its priority
+rebuilds continuously as the most recent quality session ages, while recent
+14-day dose supplies a fading satisfaction signal. A taxing session can move
+earlier when recovery load is genuinely clear; a low recent count cannot by
+itself manufacture another hard session immediately after the last one.
+
+The final calendar comparison expresses target shortfall, collapsed aerobic
+support, and surplus medium-long structure in one athlete-relative program-fit
+unit. Recovery-envelope breaches use that same unit. This prevents independent
+point multipliers for mileage, support, and schedule shape from silently
+changing their relative importance. Continuous recovery overlap, weather,
+cadence, and plan-continuity terms remain graded tradeoffs rather than
+physiological thresholds.
+
 ## Race-goal guardrails
 
 The optional 5K, 10K, half-marathon, and marathon goals are inspectable planner
-inputs, not promises of a finish time. A goal is accepted only after 10 usable,
-normal-health running performances exist. Each is projected to the selected
-distance with the Riegel 1.06 relationship; the median of the fastest three
-projections supplies a robust current-performance guardrail. Marathon
+inputs, not promises of a finish time. At least one ten-minute, normal-health
+running performance is required. Up to the latest 10 are projected to the
+selected distance with the Riegel 1.06 relationship; the median of the fastest
+three available projections supplies the current-performance guardrail.
+Limited history proportionally reduces the allowed improvement margin instead
+of creating a ten-run eligibility cliff. Marathon
 projections receive a conservative 10-minute penalty because recreational
 marathon predictions commonly overstate performance even when shorter-distance
 predictions are well calibrated. This is deliberately a goal-validation rule,
@@ -450,8 +569,10 @@ pace, a shorter race-specific minimum is allowed. Dates more than a year away,
 dates too soon, implausible absolute paces, and paces too aggressive for the
 evidence and available time are rejected with an earliest date or supported
 pace. The allowed improvement margin is a deliberately conservative planning
-guardrail of 0.25% per available week, capped at 8%; it is not a promised
-adaptation rate. A marathon inside 26 weeks also requires a recent six-mile run.
+guardrail of 0.25% per available week, capped at 8% and scaled by the available
+evidence; it is not a promised adaptation rate. Marathon feasibility is checked
+with the compound long-run progression needed to reach the preparation target,
+not a separate six-mile pass/fail gate.
 
 An accepted goal modifies the transparent workout scores and quality-session
 rotation. It never overrides pain, illness, acute-load, recent-workout, weather,

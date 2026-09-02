@@ -126,8 +126,8 @@ def test_randomized_weekly_plans_preserve_core_invariants() -> None:
             assert len(running) <= 2
             assert all(item.workout_type == WorkoutType.RECOVERY for item in running)
 
-        quality_dates = [
-            item.planned_for
+        quality_sessions = [
+            item
             for item in running
             if item.workout_type in {
                 WorkoutType.INTERVALS,
@@ -135,10 +135,16 @@ def test_randomized_weekly_plans_preserve_core_invariants() -> None:
                 WorkoutType.RACE,
             }
         ]
-        assert all(
-            (later - earlier).total_seconds() >= CONFIG["coaching"]["minimum_days_between_quality_sessions"] * 86400
-            for earlier, later in zip(quality_dates, quality_dates[1:])
-        )
+        for item in quality_sessions:
+            recovery_trace = next(
+                trace
+                for trace in item.rule_trace
+                if trace.rule_id == "recent_recovery_load"
+            )
+            # Recovery is a continuous cost, not another hard spacing rule.
+            # A taxing session may be selected with a small residual penalty,
+            # but never while the model says even easy running is premature.
+            assert recovery_trace.facts["easy_recovery_pressure"] == 0.0
 
 
 def test_extreme_overload_does_not_prescribe_quality_or_long_run() -> None:

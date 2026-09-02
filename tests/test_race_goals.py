@@ -86,15 +86,17 @@ def test_goal_uses_exactly_ten_recent_performances(tmp_path) -> None:
     assert result.fastest_allowed_goal_pace == pytest.approx(expected * 0.97)
 
 
-def test_goal_rejects_too_few_runs_unreasonable_pace_and_short_timeline(tmp_path) -> None:
+def test_goal_scales_limited_evidence_and_rejects_bad_pace_or_timeline(tmp_path) -> None:
     today = date(2026, 8, 7)
     with connect(tmp_path / "runs.sqlite") as connection:
         initialize(connection)
         _insert_runs(connection, 9)
-        with pytest.raises(ValueError, match="requires 10 usable"):
-            assess_race_goal(
-                connection, _config("5k", today + timedelta(weeks=12), 8.0), as_of=today
-            )
+        limited = assess_race_goal(
+            connection,
+            _config("5k", today + timedelta(weeks=12), 9.5),
+            as_of=today,
+        )
+        assert limited.evidence_runs == 9
         _insert_runs(connection, 1)
         with pytest.raises(ValueError, match="choose .* or slower"):
             assess_race_goal(

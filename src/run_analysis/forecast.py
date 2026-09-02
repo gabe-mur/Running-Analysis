@@ -475,8 +475,13 @@ def _forecast_options_from_response(
         )
     ]
     if not valid:
-        fallback = now + timedelta(minutes=15)
-        return [(fallback, None)]
+        # Forecast availability must never rewrite the training calendar. The
+        # 21-day planner intentionally extends beyond the provider's 16-day
+        # horizon, so retain a representative configured time on that actual
+        # day and mark only the weather as unavailable.
+        if candidates:
+            return [(candidates[len(candidates) // 2], None)]
+        return [(now + timedelta(minutes=15), None)]
     options = []
     for candidate in valid:
         weather = _planned_weather(

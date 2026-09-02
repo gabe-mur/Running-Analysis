@@ -7,8 +7,9 @@ import json
 import pytest
 
 from run_analysis.db import connect, initialize
+from run_analysis.fitness_state import _performance_anomaly
 from run_analysis.progress import _trend_evidence_weight, build_progress
-from run_analysis.web.schemas import WorkoutType
+from run_analysis.web.schemas import FitnessPoint, WorkoutType
 
 
 def _insert_run(connection, index: int, start: datetime, miles: float, minutes: float, zone_load: float) -> int:
@@ -43,7 +44,7 @@ def test_illness_recovery_runs_have_65_percent_fitness_trend_weight() -> None:
     assert _trend_evidence_weight("illness", WorkoutType.EASY) == pytest.approx(0.25)
 
 
-def test_quality_runs_receive_evidence_based_influence_instead_of_a_hard_zero() -> None:
+def test_quality_runs_do_not_influence_the_steady_aerobic_trend() -> None:
     strict = {
         "effective_window_count": 6,
         "reference_time_support": "interpolation",
@@ -61,20 +62,14 @@ def test_quality_runs_receive_evidence_based_influence_instead_of_a_hard_zero() 
         },
     }
 
-    strict_tempo = _trend_evidence_weight("normal", WorkoutType.TEMPO_THRESHOLD, strict)
-    estimated_tempo = _trend_evidence_weight(
-        "normal", WorkoutType.TEMPO_THRESHOLD, estimated
-    )
-    estimated_intervals = _trend_evidence_weight(
-        "normal", WorkoutType.INTERVALS, estimated
-    )
-
-    assert strict_tempo == pytest.approx(0.65)
-    assert 0 < estimated_intervals < estimated_tempo < strict_tempo < 1
+    assert _trend_evidence_weight("normal", WorkoutType.TEMPO_THRESHOLD, strict) == 0
+    assert _trend_evidence_weight("normal", WorkoutType.TEMPO_THRESHOLD, estimated) == 0
+    assert _trend_evidence_weight("normal", WorkoutType.INTERVALS, estimated) == 0
+    assert _trend_evidence_weight("normal", WorkoutType.RACE, strict) == 0
     assert _trend_evidence_weight("normal", WorkoutType.HIKE, strict) == 0
 
 
-def test_progress_uses_a_scored_tempo_run_with_reduced_influence(tmp_path: Path) -> None:
+def test_progress_shows_a_scored_tempo_run_as_context_only(tmp_path: Path) -> None:
     anchor = datetime.now(timezone.utc)
     with connect(tmp_path / "tempo-progress.sqlite") as connection:
         initialize(connection)
@@ -112,12 +107,159 @@ def test_progress_uses_a_scored_tempo_run_with_reduced_influence(tmp_path: Path)
 
     point = progress.series[0]
     coverage = progress.activity_coverage[0]
-    assert point.included_in_trend is True
-    assert point.trend_weight == pytest.approx(0.65 * 0.59)
-    assert coverage.score_status == "reduced_weight"
+    assert point.included_in_trend is False
+    assert point.trend_weight == 0
+    assert coverage.score_status == "context_only"
     assert coverage.trend_weight == pytest.approx(point.trend_weight)
-    assert "38% influence" in coverage.reason
-    assert progress.current_pace is not None
+    assert "0% influence" in coverage.reason
+    assert progress.current_pace is None
+
+
+def test_quality_progress_does_not_depend_on_an_aerobic_model_result(tmp_path: Path) -> None:
+    anchor = datetime.now(timezone.utc)
+    with connect(tmp_path / "quality-progress.sqlite") as connection:
+        initialize(connection)
+        activity_id = _insert_run(connection, 1, anchor - timedelta(days=1), 4.4, 44, 100)
+        connection.execute(
+            "INSERT INTO run_overrides(activity_id,workout_type,health_tag) "
+            "VALUES ('external-1','tempo_threshold','normal')"
+        )
+        for lap_index, (seconds, distance, average_hr) in enumerate(
+            ((720, 1600, 140), (1080, 2900, 168), (840, 1800, 150))
+        ):
+            connection.execute(
+                """
+                INSERT INTO laps(
+                    activity_id,lap_index,total_time_s,distance_m,
+                    average_hr_bpm,maximum_hr_bpm
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (activity_id, lap_index, seconds, distance, average_hr, average_hr + 5),
+            )
+        connection.commit()
+
+        progress = build_progress(
+            connection,
+            28,
+            config={"target_hr": 145, "zones": {"z3": [151, 166]}},
+        )
+
+    assert len(progress.quality_performance) == 1
+    quality = progress.quality_performance[0]
+    assert quality.duration_minutes == 18
+    assert quality.source == "recorded_lap_2"
+    assert len(progress.series) == 1
+    context = progress.series[0]
+    assert context.activity_id == activity_id
+    assert context.standardized_pace_min_mile is None
+    assert context.context_pace_min_mile == pytest.approx(10.0)
+    assert context.trend_weight == 0
+    assert context.included_in_trend is False
+    coverage = progress.activity_coverage[0]
+    assert coverage.score_status == "context_only"
+    assert "0% influence" in coverage.reason
+    assert progress.current_pace is None
+
+
+def test_manually_excluded_run_walk_remains_visible_at_zero_weight(
+    tmp_path: Path,
+) -> None:
+    anchor = datetime.now(timezone.utc)
+    with connect(tmp_path / "excluded-run-walk-progress.sqlite") as connection:
+        initialize(connection)
+        activity_id = _insert_run(
+            connection,
+            1,
+            anchor - timedelta(days=1),
+            2.5,
+            35,
+            100,
+        )
+        connection.execute(
+            "INSERT INTO run_overrides("
+            "activity_id,include_in_model,workout_type,health_tag"
+            ") VALUES ('external-1',0,'run_walk','other_abnormal')"
+        )
+        connection.commit()
+
+        progress = build_progress(connection, 28)
+
+    assert len(progress.series) == 1
+    point = progress.series[0]
+    assert point.activity_id == activity_id
+    assert point.workout_type == WorkoutType.RUN_WALK
+    assert point.standardized_pace_min_mile is None
+    assert point.context_pace_min_mile == pytest.approx(14.0)
+    assert point.trend_weight == 0
+    assert point.included_in_trend is False
+    coverage = progress.activity_coverage[0]
+    assert coverage.score_status == "context_only"
+    assert "0% influence" in coverage.reason
+    assert progress.current_pace is None
+
+
+def test_progress_uses_run_analysis_fallback_workout_types(tmp_path: Path) -> None:
+    anchor = datetime.now(timezone.utc)
+    with connect(tmp_path / "progress-workout-types.sqlite") as connection:
+        initialize(connection)
+        easy_id = _insert_run(
+            connection,
+            1,
+            anchor - timedelta(days=2),
+            3.5,
+            38,
+            90,
+        )
+        long_id = _insert_run(
+            connection,
+            2,
+            anchor - timedelta(days=1),
+            8.0,
+            88,
+            190,
+        )
+        connection.commit()
+
+        progress = build_progress(connection, 28)
+
+    coverage_types = {
+        item.activity_id: item.workout_type for item in progress.activity_coverage
+    }
+    series_types = {item.activity_id: item.workout_type for item in progress.series}
+    assert coverage_types[easy_id] == WorkoutType.EASY
+    assert coverage_types[long_id] == WorkoutType.LONG
+    assert series_types[easy_id] == WorkoutType.EASY
+    assert series_types[long_id] == WorkoutType.LONG
+
+
+def test_graph_only_context_point_cannot_break_performance_anomaly() -> None:
+    anchor = datetime.now(timezone.utc)
+    scored = [
+        FitnessPoint(
+            activity_id=index,
+            start_time=anchor - timedelta(days=8 - index),
+            raw_pace_min_mile=10.0,
+            standardized_pace_min_mile=10.0,
+            uncertainty_95_min_mile=0.2,
+            distance_miles=4.0,
+            workout_type=WorkoutType.EASY,
+        )
+        for index in range(1, 5)
+    ]
+    context = FitnessPoint(
+        activity_id=5,
+        start_time=anchor,
+        raw_pace_min_mile=14.0,
+        context_pace_min_mile=14.0,
+        standardized_pace_min_mile=None,
+        uncertainty_95_min_mile=0.0,
+        distance_miles=2.5,
+        workout_type=WorkoutType.RUN_WALK,
+        included_in_trend=False,
+        trend_weight=0.0,
+    )
+
+    assert _performance_anomaly([*scored, context]) == "within_recent_range"
 
 
 def test_progress_keeps_pace_volume_and_intensity_as_separate_dimensions(tmp_path: Path) -> None:
