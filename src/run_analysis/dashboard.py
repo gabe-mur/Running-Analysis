@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .fitness_state import build_fitness_state
 from .onboarding import setup_state
-from .progress import build_progress
+from .progress import build_progress, prepare_progress_data
 from .recommendation import recommend_next_run
 from .recommendation_service import ensure_current_weekly_schedule, load_current_status
 from .training_status import build_training_status
@@ -28,17 +28,52 @@ DASHBOARD_WINDOW_DAYS = 90
 
 
 def _horizon(label: str, progress) -> FitnessHorizon:
-    prior_runs = progress.period_comparison.previous.run_count
-    confidence = progress.fitness_confidence
-    if prior_runs < 3:
-        confidence = ConfidenceLevel.LOW if prior_runs else ConfidenceLevel.UNAVAILABLE
+    period_change = progress.period_change
+    within_change = progress.within_window_trend
+    directional = {FitnessTrend.IMPROVING, FitnessTrend.DECLINING}
+    period_directional = bool(
+        period_change and period_change.direction in directional
+    )
+    within_directional = bool(
+        within_change and within_change.direction in directional
+    )
+    conflict = bool(
+        period_directional
+        and within_directional
+        and period_change.direction != within_change.direction
+    )
+    selected_change = (
+        None
+        if conflict
+        else period_change
+        if period_directional
+        else within_change
+        if within_directional
+        else period_change
+    )
     return FitnessHorizon(
         label=label,
         window_days=progress.window_days,
-        trend=progress.fitness_trend,
-        confidence=confidence,
-        pace_change_seconds_per_mile=progress.pace_change_seconds_per_mile,
+        trend=(
+            FitnessTrend.UNCERTAIN
+            if conflict
+            else selected_change.direction
+            if selected_change
+            else progress.fitness_trend
+        ),
+        confidence=(
+            selected_change.confidence
+            if selected_change
+            else progress.fitness_confidence
+        ),
+        pace_change_seconds_per_mile=(
+            selected_change.pace_change_seconds_per_mile
+            if selected_change
+            else progress.pace_change_seconds_per_mile
+        ),
         current_pace=progress.current_pace,
+        period_change=period_change,
+        within_window_trend=within_change,
     )
 
 
@@ -50,6 +85,23 @@ def _signal_status(trend: FitnessTrend) -> str:
         FitnessTrend.UNCERTAIN: "No clear change",
         FitnessTrend.INSUFFICIENT_DATA: "Not enough data",
     }[trend]
+
+
+def _horizon_status(horizon: FitnessHorizon) -> str:
+    selected = next(
+        (
+            value
+            for value in (horizon.period_change, horizon.within_window_trend)
+            if value and value.direction == horizon.trend
+        ),
+        None,
+    )
+    evidence = selected.evidence if selected else None
+    if horizon.trend == FitnessTrend.IMPROVING:
+        return "Likely improving" if evidence == "likely" else "Improved"
+    if horizon.trend == FitnessTrend.DECLINING:
+        return "Likely declining" if evidence == "likely" else "Declined"
+    return _signal_status(horizon.trend)
 
 
 def _quality_fitness_signal(
@@ -306,29 +358,95 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
     if state.recent_illness_or_recovery:
         illness_context = "Recent illness/recovery runs still count toward training, but have less influence on the fitness trend."
     short_horizon = _horizon(f"Current {short.window_days}-day aerobic efficiency", short)
-    # Kept as a compatibility field for existing API clients. The dashboard no longer
-    # mixes a second lookback into its fitness interpretation.
-    long_horizon = _horizon(f"Current {long.window_days}-day aerobic efficiency", long)
-    if short_horizon.trend == FitnessTrend.DECLINING and capacity_up:
+    long_horizon = _horizon(f"Sustained {long.window_days}-day aerobic efficiency", long)
+    directional = {FitnessTrend.IMPROVING, FitnessTrend.DECLINING}
+    conflicting_aerobic_directions = (
+        short_horizon.trend in directional
+        and long_horizon.trend in directional
+        and short_horizon.trend != long_horizon.trend
+    )
+    aerobic_horizon = (
+        short_horizon
+        if short_horizon.trend in directional
+        else long_horizon
+        if long_horizon.trend in directional
+        else short_horizon
+    )
+    aerobic_trend = (
+        FitnessTrend.UNCERTAIN
+        if conflicting_aerobic_directions
+        else aerobic_horizon.trend
+    )
+    aerobic_likely = bool(
+        any(
+            value
+            and value.direction == aerobic_horizon.trend
+            and value.evidence == "likely"
+            for value in (
+                aerobic_horizon.period_change,
+                aerobic_horizon.within_window_trend,
+            )
+        )
+    )
+    if conflicting_aerobic_directions:
+        headline = "Recent and sustained aerobic efficiency point in different directions."
+        summary = (
+            "The recent and sustained comparisons disagree, so neither is being "
+            "collapsed into a single directional claim."
+        )
+    elif aerobic_trend == FitnessTrend.DECLINING and capacity_up:
         headline = "Short-term efficiency is down; running capacity is up."
         summary = (
             "These are not contradictory. Pace at the same heart rate has recently been "
             "slower, while the weekly load you have demonstrated you can sustain has grown. "
             "Illness and accumulated fatigue can affect the first signal without erasing the second."
         )
-    elif short_horizon.trend == FitnessTrend.IMPROVING and capacity_up:
-        headline = "Aerobic efficiency and running capacity are both improving."
-        summary = "You are running more efficiently, and the load you can sustain has grown."
-    elif short_horizon.trend in {FitnessTrend.STABLE, FitnessTrend.UNCERTAIN} and capacity_up:
+    elif aerobic_trend == FitnessTrend.IMPROVING and capacity_up:
+        headline = (
+            "Aerobic efficiency is likely improving, and running capacity is up."
+            if aerobic_likely
+            else "Aerobic efficiency and running capacity are both improving."
+        )
+        summary = (
+            "The pace-at-heart-rate evidence favors improvement, though it has not "
+            "cleared the stronger 95% evidence standard; demonstrated load has grown."
+            if aerobic_likely
+            else "You are running more efficiently, and the load you can sustain has grown."
+        )
+    elif aerobic_trend == FitnessTrend.IMPROVING:
+        headline = (
+            "Aerobic efficiency is likely improving."
+            if aerobic_likely
+            else "Aerobic efficiency is improving."
+        )
+        summary = (
+            "The pace-at-heart-rate evidence favors improvement, though it has not "
+            "cleared the stronger 95% evidence standard."
+            if aerobic_likely
+            else "Pace at the same heart rate has improved with clear directional evidence."
+        )
+    elif aerobic_trend == FitnessTrend.DECLINING:
+        headline = (
+            "Aerobic efficiency is likely declining."
+            if aerobic_likely
+            else "Aerobic efficiency has declined."
+        )
+        summary = (
+            "The pace-at-heart-rate evidence favors a decline, though it has not "
+            "cleared the stronger 95% evidence standard."
+            if aerobic_likely
+            else "Pace at the same heart rate has declined with clear directional evidence."
+        )
+    elif aerobic_trend in {FitnessTrend.STABLE, FitnessTrend.UNCERTAIN} and capacity_up:
         headline = "Training capacity is up; aerobic efficiency has no clear change."
         summary = (
             "The weekly load you can sustain has grown, with no clear change in pace "
             "at the same heart rate."
         )
-    elif short_horizon.trend == FitnessTrend.STABLE:
+    elif aerobic_trend == FitnessTrend.STABLE:
         headline = "Your fitness looks steady."
         summary = "Pace at the same heart rate and your demonstrated capacity are both about the same."
-    elif short_horizon.trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
+    elif aerobic_trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
         headline = "There is no clear fitness change yet."
         summary = "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
     else:
@@ -347,10 +465,17 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
     signals = [
         FitnessSignal(
             label="Aerobic efficiency",
-            trend=short_horizon.trend,
-            status=_signal_status(short_horizon.trend),
-            confidence=short_horizon.confidence,
-            detail=f"Pace at the same heart rate over the last {short_horizon.window_days} days.",
+            trend=aerobic_trend,
+            status=(
+                "No clear change"
+                if conflicting_aerobic_directions
+                else _horizon_status(aerobic_horizon)
+            ),
+            confidence=aerobic_horizon.confidence,
+            detail=(
+                f"Recent evidence uses {short_horizon.window_days} days; sustained "
+                f"evidence uses {long_horizon.window_days} days."
+            ),
         ),
         FitnessSignal(
             label="Durability",
@@ -393,7 +518,19 @@ def build_dashboard(
     window_days: int = DASHBOARD_WINDOW_DAYS,
     project_root: str | Path = ".",
 ) -> DashboardResponse:
-    progress = build_progress(connection, window_days, config=config)
+    prepared = prepare_progress_data(connection)
+    progress = build_progress(
+        connection,
+        window_days,
+        config=config,
+        prepared=prepared,
+    )
+    short_progress = build_progress(
+        connection,
+        min(28, window_days),
+        config=config,
+        prepared=prepared,
+    )
     long_progress = progress
     capacity_progress = progress
     quality_progress = progress
@@ -404,6 +541,7 @@ def build_dashboard(
         config,
         health_status=status.health_status,
         window_days=window_days,
+        prepared_progress=prepared,
     )
     recommendation = recommend_next_run(state, status, config)
     latest = list_runs(connection, limit=1)
@@ -422,7 +560,13 @@ def build_dashboard(
     return DashboardResponse(
         progress=progress,
         training_status=build_training_status(state, config),
-        fitness_interpretation=_interpret_fitness(progress, long_progress, capacity_progress, state, quality_signal),
+        fitness_interpretation=_interpret_fitness(
+            short_progress,
+            long_progress,
+            capacity_progress,
+            state,
+            quality_signal,
+        ),
         last_run=feedback,
         recommendation=recommendation,
         current_status=status,

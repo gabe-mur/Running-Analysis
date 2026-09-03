@@ -9,6 +9,22 @@ from run_analysis.web.app import create_app
 from test_web_phase1 import _write_config
 
 
+def _aerobic_change(direction: str, evidence: str, change: float):
+    from run_analysis.web.schemas import AerobicChangeEvidence
+
+    return AerobicChangeEvidence(
+        basis="test",
+        direction=direction,
+        evidence=evidence,
+        confidence="moderate",
+        pace_change_seconds_per_mile=change,
+        uncertainty_95_seconds_per_mile=20,
+        probability_faster=0.85 if change < 0 else 0.15,
+        run_count=6,
+        coverage_fraction=0.75,
+    )
+
+
 def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -> None:
     _write_config(tmp_path)
     database = tmp_path / "data" / "test.sqlite"
@@ -19,7 +35,7 @@ def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -
     payload = response.json()
     assert payload["last_run"] is None
     assert payload["progress"]["window_days"] == 90
-    assert payload["fitness_interpretation"]["short_term"]["window_days"] == 90
+    assert payload["fitness_interpretation"]["short_term"]["window_days"] == 28
     assert payload["fitness_interpretation"]["long_term"]["window_days"] == 90
     assert payload["progress"]["fitness_trend"] == "insufficient_data"
     assert payload["recommendation"]["workout_type"] == "easy"
@@ -41,6 +57,52 @@ def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -
         "Recent form",
         "High-intensity fitness",
     ]
+
+
+def test_dashboard_horizon_can_show_gradual_within_period_change() -> None:
+    from types import SimpleNamespace
+
+    from run_analysis.dashboard import _horizon
+    from run_analysis.web.schemas import ConfidenceLevel, FitnessTrend
+
+    horizon = _horizon(
+        "Recent",
+        SimpleNamespace(
+            window_days=28,
+            period_change=_aerobic_change("uncertain", "inconclusive", -2),
+            within_window_trend=_aerobic_change("improving", "likely", -14),
+            fitness_trend=FitnessTrend.UNCERTAIN,
+            fitness_confidence=ConfidenceLevel.HIGH,
+            pace_change_seconds_per_mile=-2,
+            current_pace=None,
+        ),
+    )
+
+    assert horizon.trend == FitnessTrend.IMPROVING
+    assert horizon.confidence == ConfidenceLevel.MODERATE
+    assert horizon.pace_change_seconds_per_mile == -14
+
+
+def test_dashboard_horizon_does_not_hide_conflicting_methods() -> None:
+    from types import SimpleNamespace
+
+    from run_analysis.dashboard import _horizon
+    from run_analysis.web.schemas import ConfidenceLevel, FitnessTrend
+
+    horizon = _horizon(
+        "Recent",
+        SimpleNamespace(
+            window_days=28,
+            period_change=_aerobic_change("improving", "likely", -12),
+            within_window_trend=_aerobic_change("declining", "likely", 10),
+            fitness_trend=FitnessTrend.UNCERTAIN,
+            fitness_confidence=ConfidenceLevel.HIGH,
+            pace_change_seconds_per_mile=-12,
+            current_pace=None,
+        ),
+    )
+
+    assert horizon.trend == FitnessTrend.UNCERTAIN
 
 
 def _state(**changes):

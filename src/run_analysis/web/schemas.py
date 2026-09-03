@@ -39,6 +39,12 @@ class FitnessTrend(StrEnum):
     INSUFFICIENT_DATA = "insufficient_data"
 
 
+class ChangeEvidenceStrength(StrEnum):
+    CLEAR = "clear"
+    LIKELY = "likely"
+    INCONCLUSIVE = "inconclusive"
+
+
 class TrainingStatus(StrEnum):
     """What training is currently doing. Not a fitness score."""
 
@@ -525,6 +531,21 @@ class FitnessTrendPoint(ApiModel):
     run_count: int = Field(ge=1)
 
 
+class AerobicChangeEvidence(ApiModel):
+    """Direction and strength of one aerobic-efficiency comparison."""
+
+    basis: str
+    direction: FitnessTrend
+    evidence: ChangeEvidenceStrength
+    confidence: ConfidenceLevel
+    pace_change_seconds_per_mile: float
+    uncertainty_95_seconds_per_mile: float = Field(ge=0)
+    probability_faster: float = Field(ge=0, le=1)
+    run_count: int = Field(ge=1)
+    comparison_run_count: int | None = Field(default=None, ge=1)
+    coverage_fraction: float = Field(ge=0, le=1)
+
+
 class FitnessBenchmarkSummary(ApiModel):
     definition: str
     trend: FitnessTrend
@@ -624,6 +645,8 @@ class ProgressResponse(ApiModel):
     uncertainty_95_min_mile: float | None = Field(default=None, ge=0)
     pace_change_seconds_per_mile: float | None = None
     pace_change_uncertainty_95_seconds_per_mile: float | None = Field(default=None, ge=0)
+    period_change: AerobicChangeEvidence | None = None
+    within_window_trend: AerobicChangeEvidence | None = None
     definition: str
     series: list[FitnessPoint]
     trend_7d: list[FitnessTrendPoint]
@@ -646,6 +669,8 @@ class FitnessHorizon(ApiModel):
     confidence: ConfidenceLevel
     pace_change_seconds_per_mile: float | None = None
     current_pace: PaceValue | None = None
+    period_change: AerobicChangeEvidence | None = None
+    within_window_trend: AerobicChangeEvidence | None = None
 
 
 class FitnessSignal(ApiModel):

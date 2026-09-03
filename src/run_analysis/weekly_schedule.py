@@ -9,9 +9,9 @@ intentional rather than independent recommendations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from itertools import combinations
-from math import ceil, comb, exp, floor, log, sqrt
+from math import ceil, comb, exp, floor, log
 from statistics import median
 from zoneinfo import ZoneInfo
 
@@ -65,11 +65,12 @@ from .web.schemas import (
 
 VISIBLE_HORIZON_DAYS = 7
 PLANNING_HORIZON_DAYS = 21
-WEEKLY_PLANNER_VERSION = 84
+WEEKLY_PLANNER_VERSION = 85
 MAX_ADAPTIVE_CANDIDATES = 64
 MAX_HORIZON_COUNT_OPTIONS = 14
 ALLOCATION_ASSIGNMENTS_PER_TOTAL = 16
 JOINT_DATE_FINALISTS = 3
+DISTANCE_DP_SCALE = 1000
 BASELINE_MINIMUM_AEROBIC_MINUTES = 10.0
 # Optimizer objectives use one common program-fit unit: the cost of exceeding
 # the recoverable two-session envelope by one athlete-relative load unit. This
@@ -83,6 +84,59 @@ AEROBIC_SUPPORT_FIT_FRACTION = 0.60
 # One extra secondary-endurance exposure is a soft shape preference, not a
 # missing primary long-run lane or a target-load failure.
 SECONDARY_ENDURANCE_SHAPE_FRACTION = 0.30
+QUALITY_WORKOUT_TYPES = frozenset(
+    {
+        WorkoutType.INTERVALS,
+        WorkoutType.TEMPO_THRESHOLD,
+        WorkoutType.RACE,
+    }
+)
+
+
+def _race_timing(
+    config: dict,
+    on_date: date,
+) -> tuple[int, int] | None:
+    """Return days to race and taper length without hiding post-race dates."""
+
+    goal = configured_race_goal(config)
+    if goal is None:
+        return None
+    profile, race_date, _ = goal
+    return (race_date - on_date).days, profile.taper_days
+
+
+def _is_taper_date(config: dict, on_date: date) -> bool:
+    timing = _race_timing(config, on_date)
+    return bool(timing and 0 < timing[0] <= timing[1])
+
+
+def _is_taper_or_race_date(config: dict, on_date: date) -> bool:
+    timing = _race_timing(config, on_date)
+    return bool(timing and 0 <= timing[0] <= timing[1])
+
+
+def _distance_options(
+    minimum: float,
+    maximum: float,
+    *,
+    step_miles: float = 0.25,
+) -> list[float]:
+    """Return an inclusive distance grid, preserving a narrow off-grid band."""
+
+    if maximum < minimum - 1e-9:
+        raise ValueError("Maximum distance cannot be below minimum distance")
+    maximum = max(minimum, maximum)
+    scale = round(1.0 / step_miles)
+    first = ceil(minimum * scale - 1e-9)
+    last = floor(maximum * scale + 1e-9)
+    if first <= last:
+        return [value / scale for value in range(first, last + 1)]
+    return [round((minimum + maximum) / 2.0, 4)]
+
+
+def _distance_dp_units(miles: float) -> int:
+    return round(miles * DISTANCE_DP_SCALE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,10 +731,10 @@ def automatic_run_day_offsets(
         1: [1],
         2: [1, 3],
         3: [1, 3, 5],
-        4: [1, 3, 5, 7],
-        5: [1, 2, 4, 5, 7],
-        6: [1, 2, 3, 5, 6, 7],
-        7: [1, 2, 3, 4, 5, 6, 7],
+        4: [1, 3, 4, 6],
+        5: [1, 2, 3, 5, 6],
+        6: [1, 2, 3, 4, 5, 6],
+        7: [1, 2, 3, 4, 5, 6],
     }
     typical_rest_days = int((config or {}).get("coaching", {}).get("typical_rest_days_between_runs", 1))
     recovery_too_short_for_today = False
@@ -1014,13 +1068,7 @@ def _recovery_spacing_cost(
     )
     taxing_next = bool(
         result
-        and result.workout_type
-        in {
-            WorkoutType.LONG,
-            WorkoutType.INTERVALS,
-            WorkoutType.TEMPO_THRESHOLD,
-            WorkoutType.RACE,
-        }
+        and result.workout_type in {WorkoutType.LONG, *QUALITY_WORKOUT_TYPES}
     )
     readiness_limit = (
         TAXING_RUN_RESIDUAL_LIMIT
@@ -1043,7 +1091,6 @@ def _decayed_recovery_load(
     planned: list[RecommendationResponse],
     as_of: datetime,
     easy_reference_miles: float,
-    config: dict,
     *,
     planned_load_units: list[float] | None = None,
     recommendation_load_cache: _RecommendationLoadCache | None = None,
@@ -1106,9 +1153,7 @@ def _recovery_interaction_cost(
     """Price accumulated and proposed athlete-relative session load."""
 
     return (
-        max(0.0, residual_load + proposed_load - 2.0) * PROGRAM_FIT_UNIT
-        + residual_load
-        * proposed_load
+        max(0.0, residual_load + proposed_load - 2.0)
         * PROGRAM_FIT_UNIT
     )
 
@@ -1177,12 +1222,14 @@ def _finalized_program_recovery_cost(
             planned,
             result.planned_for,
             easy_reference_miles,
-            config,
         )
         proposed_load = _recommendation_load_units(
             result, easy_reference_miles
         )
-        cost += _recovery_interaction_cost(residual_load, proposed_load)
+        immediate_recovery_cost = _recovery_interaction_cost(
+            residual_load, proposed_load
+        )
+        cost += immediate_recovery_cost
         # Immediate recovery decays on the existing 12-hour half-life. Add
         # only the residual interaction between that curve and the continuous
         # bridge-density curve, using the same athlete-relative load units.
@@ -1212,10 +1259,17 @@ def _finalized_program_recovery_cost(
             if prior.planned_for is not None
             and prior.planned_for < result.planned_for
         )
-        cost += (
-            bridge_only_residual
-            * proposed_load
-            * PROGRAM_FIT_UNIT
+        # Immediate and bridge recovery share one two-session envelope. Charge
+        # only the incremental breach introduced by the slower bridge signal;
+        # pricing every nonzero pair made distant ordinary runs accumulate an
+        # unbounded frequency tax and duplicated the density objective below.
+        cost += max(
+            0.0,
+            _recovery_interaction_cost(
+                residual_load + bridge_only_residual,
+                proposed_load,
+            )
+            - immediate_recovery_cost,
         )
         planned.append(result)
         planned_loads.append(proposed_load)
@@ -1392,7 +1446,21 @@ def _project_state(
             stable_typical_easy_miles = (
                 opening_window.distance_miles / opening_window.activity_count
             )
-    quality = [item for item in prior_runs if item.workout_type in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}]
+    quality = [
+        item for item in prior_runs if item.workout_type in QUALITY_WORKOUT_TYPES
+    ]
+    prior_runs_14d = [
+        item
+        for item in prior_runs
+        if 0.0
+        <= (state.as_of - item.planned_for).total_seconds()
+        <= 14 * 86400
+    ]
+    quality_14d = [
+        item
+        for item in prior_runs_14d
+        if item.workout_type in QUALITY_WORKOUT_TYPES
+    ]
     long_runs = [item for item in prior_runs if item.workout_type == WorkoutType.LONG]
     windows = {
         days: _project_window(getattr(state.recent_load, f"trailing_{days}d"), prior_runs, state.as_of)
@@ -1421,9 +1489,8 @@ def _project_state(
     moderate_known_minutes = state.recent_load.trailing_14d.moving_minutes
     projected_easy_minutes = sum(
         _midpoint(item) * recent_pace
-        for item in prior_runs
-        if item.workout_type
-        not in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}
+        for item in prior_runs_14d
+        if item.workout_type not in QUALITY_WORKOUT_TYPES
     )
     projected_moderate_fraction = state.moderate_fraction_14d
     if (
@@ -1445,7 +1512,6 @@ def _project_state(
         prior_runs,
         state.as_of,
         sum(typical_easy_distance(state)) / 2,
-        {},
         recommendation_load_cache=recommendation_load_cache,
     )
     fatigue_half_life_days = float(
@@ -1526,7 +1592,7 @@ def _project_state(
             for item in prior_runs
             if item.planned_for
         )
-    last_quality = last.workout_type in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}
+    last_quality = last.workout_type in QUALITY_WORKOUT_TYPES
     last_long = last.workout_type == WorkoutType.LONG
     moderate_minutes, hard_minutes = _prescribed_zone_minutes(last, moving)
     easy_minutes = max(0.0, moving - moderate_minutes - hard_minutes)
@@ -1607,7 +1673,9 @@ def _project_state(
                 *(_midpoint(item) for item in prior_runs),
                 0,
             ),
-            "quality_sessions_14d": state.quality_sessions_14d + len(quality),
+            "quality_sessions_14d": (
+                state.quality_sessions_14d + len(quality_14d)
+            ),
             "completed_quality_session_count": state.completed_quality_session_count + len(quality),
             "running_days_28d": state.running_days_28d + len(prior_runs),
             "moderate_fraction_14d": projected_moderate_fraction,
@@ -1657,7 +1725,6 @@ def _elapsed_workout_role(
     planned: list[RecommendationResponse],
     config: dict,
     *,
-    taper_horizon: bool,
     recommendation_load_cache: _RecommendationLoadCache | None = None,
     projected_state_cache: _ProjectedStateCache | None = None,
 ) -> str:
@@ -1689,11 +1756,12 @@ def _elapsed_workout_role(
         if projected.days_since_quality_run is not None
         else 1.0
     )
-    if long_ratio >= 1.0 and (
-        taper_horizon or long_ratio >= quality_ratio
-    ):
+    tapering = _is_taper_date(config, projected.as_of.date())
+    if tapering:
+        return "easy"
+    if long_ratio >= 1.0 and long_ratio >= quality_ratio:
         return "long"
-    if not taper_horizon and quality_ratio >= 1.0:
+    if quality_ratio >= 1.0:
         return "quality"
     return "easy"
 
@@ -1848,7 +1916,7 @@ def _select_budgeted_timed_recommendation(
             if result.workout_type == WorkoutType.LONG
             else "quality"
             if result.workout_type
-            in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}
+            in QUALITY_WORKOUT_TYPES
             else "easy"
         )
         latest_taxing = next(
@@ -1857,23 +1925,48 @@ def _select_budgeted_timed_recommendation(
                 for item in reversed(planned)
                 if item.planned_for
                 and item.workout_type
-                in {
-                    WorkoutType.LONG,
-                    WorkoutType.INTERVALS,
-                    WorkoutType.TEMPO_THRESHOLD,
-                    WorkoutType.RACE,
-                }
+                in {WorkoutType.LONG, *QUALITY_WORKOUT_TYPES}
             ),
             None,
         )
         taxing_residual = 0.0
         if result.planned_for and latest_taxing and latest_taxing.planned_for:
             easy_reference = sum(typical_easy_distance(state)) / 2
-            taxing_residual = decay_recovery_load(
-                _recommendation_load_units(latest_taxing, easy_reference),
-                (result.planned_for - latest_taxing.planned_for).total_seconds()
-                / 3600,
+            latest_taxing_load = _recommendation_load_units(
+                latest_taxing, easy_reference
             )
+            elapsed_taxing_hours = (
+                result.planned_for - latest_taxing.planned_for
+            ).total_seconds() / 3600
+            taxing_residual = decay_recovery_load(
+                latest_taxing_load,
+                elapsed_taxing_hours,
+            )
+            if latest_taxing.workout_type == WorkoutType.RACE:
+                # A race combines sustained intensity with a potentially large
+                # distance. Preserve easy-running availability on the immediate
+                # recovery curve, but use the existing athlete-relative bridge
+                # timescale before another long or quality session. This avoids
+                # assigning the same fixed recovery period to a 5K and marathon.
+                race_half_life_hours = (
+                    short_term_density_half_life_days(
+                        float(
+                            config.get("coaching", {}).get(
+                                "continuous_fatigue_half_life_days", 7
+                            )
+                        ),
+                        recovery_half_life_hours=RECOVERY_HALF_LIFE_HOURS,
+                    )
+                    * 24.0
+                )
+                taxing_residual = max(
+                    taxing_residual,
+                    decay_recovery_load(
+                        latest_taxing_load,
+                        elapsed_taxing_hours,
+                        half_life_hours=race_half_life_hours,
+                    ),
+                )
         # The projected state contains residue from every completed and
         # planned run. Looking only at the latest taxing session when one was
         # present ignored an intervening easy run and could approve
@@ -1916,7 +2009,6 @@ def _select_budgeted_timed_recommendation(
                     }
                 )
             return state, result
-        allowed.discard(candidate)
 
 
 def _materialize_candidate_sessions(
@@ -1926,7 +2018,6 @@ def _materialize_candidate_sessions(
     request: RecommendationRequest,
     config: dict,
     *,
-    taper_horizon: bool,
     prefix_cache: _CandidatePrefixCache | None = None,
     recommendation_load_cache: _RecommendationLoadCache | None = None,
     projected_state_cache: _ProjectedStateCache | None = None,
@@ -1969,7 +2060,6 @@ def _materialize_candidate_sessions(
             daily_state_options[offset],
             planned,
             config,
-            taper_horizon=taper_horizon,
             recommendation_load_cache=recommendation_load_cache,
             projected_state_cache=projected_state_cache,
         )
@@ -2005,7 +2095,6 @@ def _adaptive_candidate_cost(
     config: dict,
     target_distance_range: tuple[float, float],
     *,
-    taper_horizon: bool,
     completed_miles_by_offset: dict[int, float] | None = None,
     role_loop_penalty: bool = True,
     include_mileage_path: bool = True,
@@ -2021,14 +2110,12 @@ def _adaptive_candidate_cost(
     a slice.
     """
     completed_miles_by_offset = completed_miles_by_offset or {}
-    completed_miles = sum(completed_miles_by_offset.values())
     sessions = _materialize_candidate_sessions(
         offsets,
         daily_states,
         daily_state_options,
         request,
         config,
-        taper_horizon=taper_horizon,
         prefix_cache=prefix_cache,
         recommendation_load_cache=recommendation_load_cache,
         projected_state_cache=projected_state_cache,
@@ -2093,7 +2180,6 @@ def _adaptive_candidate_cost(
             planned[:-1],
             state.as_of,
             easy_reference_miles,
-            config,
             recommendation_load_cache=recommendation_load_cache,
         )
         proposed_load = _recommendation_load_units(
@@ -2182,23 +2268,13 @@ def _adaptive_candidate_cost(
     # the exact decayed load of every preceding session. Mileage-path fit and
     # finalized recovery therefore decide whether density is useful without a
     # hidden preference for an every-other-day calendar.
-    taxing_types = {
-        WorkoutType.LONG,
-        WorkoutType.INTERVALS,
-        WorkoutType.TEMPO_THRESHOLD,
-        WorkoutType.RACE,
-    }
     if role_loop_penalty:
         role_sequence = [
             "long"
             if item.workout_type == WorkoutType.LONG
             else "quality"
             if item.workout_type
-            in {
-                WorkoutType.INTERVALS,
-                WorkoutType.TEMPO_THRESHOLD,
-                WorkoutType.RACE,
-            }
+            in QUALITY_WORKOUT_TYPES
             else "easy"
             for item in planned
         ]
@@ -2221,7 +2297,7 @@ def _adaptive_candidate_cost(
     # expensive across the continuous lookahead.
     cadence_specs = [
         (
-            WorkoutType.LONG,
+            {WorkoutType.LONG},
             daily_states[0].days_since_long_run,
             float(
                 config.get("coaching", {}).get(
@@ -2229,27 +2305,19 @@ def _adaptive_candidate_cost(
                 )
             ),
         ),
+        (
+            set(QUALITY_WORKOUT_TYPES),
+            daily_states[0].days_since_quality_run,
+            float(
+                config.get("coaching", {}).get(
+                    "quality_recency_reference_days", 7
+                )
+            ),
+        ),
     ]
-    if not taper_horizon:
-        cadence_specs.append(
-            (
-                {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD},
-                daily_states[0].days_since_quality_run,
-                float(
-                    config.get("coaching", {}).get(
-                        "quality_recency_reference_days", 7
-                    )
-                ),
-            )
-        )
-    for workout_types, days_since, reference in cadence_specs:
+    for accepted_types, days_since, reference in cadence_specs:
         if days_since is None:
             continue
-        accepted_types = (
-            workout_types
-            if isinstance(workout_types, set)
-            else {workout_types}
-        )
         occurrence_dates = {
             item.planned_for.date()
             for item in planned
@@ -2259,12 +2327,16 @@ def _adaptive_candidate_cost(
         previous_date = daily_states[0].as_of.date()
         for state in daily_states:
             elapsed_days = max(0, (state.as_of.date() - previous_date).days)
-            age += elapsed_days
-            # Charge lateness at the instant an overdue key session occurs,
-            # then reset its age. Resetting first made a nine-day recurrence
-            # look free even though the preceding eight-day state was only at
-            # the edge of the ordinary grace window.
-            cost += max(0.0, age - (reference + 1.0)) * 8.0
+            # Taper days suspend key-session recurrence rather than turning the
+            # entire lookahead into a taper. The race itself resets quality
+            # recency; after the race, ordinary elapsed-time scheduling resumes.
+            if not _is_taper_or_race_date(config, state.as_of.date()):
+                age += elapsed_days
+                # Charge lateness at the instant an overdue key session occurs,
+                # then reset its age. Resetting first made a nine-day recurrence
+                # look free even though the preceding eight-day state was only at
+                # the edge of the ordinary grace window.
+                cost += max(0.0, age - (reference + 1.0)) * 8.0
             if state.as_of.date() in occurrence_dates:
                 age = 0.0
             previous_date = state.as_of.date()
@@ -2319,7 +2391,6 @@ def _adaptive_run_day_offsets_for_frequency(
     target_run_count: int,
     target_distance_range: tuple[float, float],
     *,
-    taper_horizon: bool = False,
     daily_state_options: list[list[FitnessState]] | None = None,
     forced_rest_offsets: set[int] | None = None,
     completed_run_offsets: set[int] | None = None,
@@ -2414,6 +2485,18 @@ def _adaptive_run_day_offsets_for_frequency(
     )
     if total_runs <= 0:
         return []
+    goal = configured_race_goal(config)
+    required_offsets = {
+        offset
+        for offset in allowed_offsets
+        if goal is not None and daily_states[offset].as_of.date() == goal[1]
+    }
+    if len(required_offsets) > total_runs:
+        return []
+    optional_offsets = [
+        offset for offset in allowed_offsets if offset not in required_offsets
+    ]
+    optional_run_count = total_runs - len(required_offsets)
     # Completed runs satisfy the nearest nominal opportunity. This seed is
     # used only to make the combinatorial prefilter efficient; the full load
     # model below does not score adherence to it.
@@ -2529,19 +2612,24 @@ def _adaptive_run_day_offsets_for_frequency(
     # thousands or millions of combinations. Build the same kind of
     # whole-horizon candidates incrementally and retain the strongest partial
     # calendars at each depth. The display boundary never participates.
-    combination_count = comb(len(allowed_offsets), total_runs)
-    if combination_count <= 5_000:
-        candidate_offsets = list(combinations(allowed_offsets, total_runs))
+    combination_count = comb(len(optional_offsets), optional_run_count)
+    if optional_run_count == 0:
+        candidate_offsets = [tuple(sorted(required_offsets))]
+    elif combination_count <= 5_000:
+        candidate_offsets = [
+            tuple(sorted((*values, *required_offsets)))
+            for values in combinations(optional_offsets, optional_run_count)
+        ]
     else:
         beam: list[tuple[float, tuple[int, ...], int]] = [(0.0, (), -1)]
-        for position in range(total_runs):
-            remaining = total_runs - position - 1
+        for position in range(optional_run_count):
+            remaining = optional_run_count - position - 1
             expanded: list[tuple[float, tuple[int, ...], int]] = []
             for score, prefix, previous_index in beam:
                 first_index = previous_index + 1
-                final_index = len(allowed_offsets) - remaining
+                final_index = len(optional_offsets) - remaining
                 for allowed_index in range(first_index, final_index):
-                    offset = allowed_offsets[allowed_index]
+                    offset = optional_offsets[allowed_index]
                     expanded.append(
                         (
                             score + incremental_prefilter_cost(prefix, offset),
@@ -2552,7 +2640,10 @@ def _adaptive_run_day_offsets_for_frequency(
             beam = retain_diverse(expanded)
             if not beam:
                 break
-        candidate_offsets = [prefix for _, prefix, _ in beam]
+        candidate_offsets = [
+            tuple(sorted((*prefix, *required_offsets)))
+            for _, prefix, _ in beam
+        ]
 
     if len(candidate_offsets) > MAX_ADAPTIVE_CANDIDATES:
         ranked_candidates = [
@@ -2605,7 +2696,6 @@ def _adaptive_run_day_offsets_for_frequency(
             request,
             config,
             target_distance_range,
-            taper_horizon=taper_horizon,
             completed_miles_by_offset=completed_miles_by_offset,
             prefix_cache=prefix_cache,
             recommendation_load_cache=recommendation_load_cache,
@@ -2655,7 +2745,6 @@ def _adaptive_run_day_offsets_for_frequency(
                 request,
                 config,
                 target_distance_range,
-                taper_horizon=taper_horizon,
                 completed_miles_by_offset=completed_miles_by_offset,
                 prefix_cache=prefix_cache,
                 recommendation_load_cache=recommendation_load_cache,
@@ -2683,7 +2772,6 @@ def _adaptive_run_day_offsets_for_frequency(
                 request,
                 config,
                 target_distance_range,
-                taper_horizon=taper_horizon,
                 completed_miles_by_offset=completed_miles_by_offset,
                 prefix_cache=prefix_cache,
                 recommendation_load_cache=recommendation_load_cache,
@@ -2698,7 +2786,6 @@ def _adaptive_run_day_offsets_for_frequency(
                 request,
                 config,
                 target_distance_range,
-                taper_horizon=taper_horizon,
                 completed_miles_by_offset=completed_miles_by_offset,
                 include_mileage_path=False,
                 include_recovery_interactions=False,
@@ -2728,7 +2815,6 @@ def _joint_candidate_program_cost(
     config: dict,
     target_distance_range: tuple[float, float],
     *,
-    taper_horizon: bool,
     completed_miles_by_offset: dict[int, float] | None = None,
     prefix_cache: _CandidatePrefixCache | None = None,
     recommendation_load_cache: _RecommendationLoadCache | None = None,
@@ -2752,7 +2838,6 @@ def _joint_candidate_program_cost(
         daily_state_options,
         request,
         config,
-        taper_horizon=taper_horizon,
         prefix_cache=prefix_cache,
         recommendation_load_cache=recommendation_load_cache,
         projected_state_cache=projected_state_cache,
@@ -2767,8 +2852,7 @@ def _joint_candidate_program_cost(
             if result and result.workout_type == WorkoutType.LONG
             else "quality_run"
             if result
-            and result.workout_type
-            in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD}
+            and result.workout_type in QUALITY_WORKOUT_TYPES
             else "easy_run"
             if result and result.workout_type != WorkoutType.REST
             else "guardrail_rest_day"
@@ -2986,7 +3070,6 @@ def adaptive_run_day_offsets(
     target_run_count: int,
     target_distance_range: tuple[float, float],
     *,
-    taper_horizon: bool = False,
     daily_state_options: list[list[FitnessState]] | None = None,
     forced_rest_offsets: set[int] | None = None,
     completed_run_offsets: set[int] | None = None,
@@ -3083,7 +3166,6 @@ def adaptive_run_day_offsets(
             config,
             max(1, round(horizon_run_count / horizon_scale)),
             target_distance_range,
-            taper_horizon=taper_horizon,
             daily_state_options=daily_state_options,
             forced_rest_offsets=forced_rest_offsets,
             completed_run_offsets=completed_run_offsets,
@@ -3106,7 +3188,6 @@ def adaptive_run_day_offsets(
             request,
             config,
             target_distance_range,
-            taper_horizon=taper_horizon,
             completed_miles_by_offset=completed_miles_by_offset,
             role_loop_penalty=False,
             include_mileage_path=False,
@@ -3124,7 +3205,6 @@ def adaptive_run_day_offsets(
                 request,
                 config,
                 target_distance_range,
-                taper_horizon=taper_horizon,
                 completed_miles_by_offset=completed_miles_by_offset,
                 prefix_cache=prefix_cache,
                 recommendation_load_cache=recommendation_load_cache,
@@ -3169,8 +3249,8 @@ def _allocate_visible_distance_ranges(
     """Jointly allocate session distance and retain only meaningful roles.
 
     The solver compares a semantically distinct long-run plan with an aerobic
-    endurance alternative. It optimizes the supplied horizon on a half-mile
-    grid, balancing target coverage, local load density, per-session load,
+    endurance alternative. It optimizes the supplied horizon on a quarter-mile
+    midpoint grid, balancing target coverage, local load density, per-session load,
     progression limits, and role meaning. Recovery/caution sessions remain
     fixed and are never enlarged to make a mileage number work.
     """
@@ -3216,8 +3296,7 @@ def _allocate_visible_distance_ranges(
             "long"
             if result.workout_type == WorkoutType.LONG
             else "quality"
-            if result.workout_type
-            in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD}
+            if result.workout_type in QUALITY_WORKOUT_TYPES
             else "easy"
         )
         easy_reference = typical_easy_distance(daily_states[index])
@@ -3452,18 +3531,8 @@ def _allocate_visible_distance_ranges(
         # Every option represents the prescription midpoint. Quarter-mile
         # centers support ordinary half-mile-wide route ranges without moving
         # the value the optimizer actually budgeted.
-        option_scale = 4
-        maximum = max(
-            minimum,
-            floor(maximum * option_scale + 1e-9) / option_scale,
-        )
-        options = [
-            step / option_scale
-            for step in range(
-                ceil(minimum * option_scale - 1e-9),
-                int(maximum * option_scale) + 1,
-            )
-        ]
+        maximum = max(minimum, maximum)
+        options = _distance_options(minimum, maximum)
         records.append(
             {
                 "index": index,
@@ -3473,20 +3542,10 @@ def _allocate_visible_distance_ranges(
                 "maximum": maximum,
                 "preferred": preferred,
                 "options": options,
-                "aerobic_options": [
-                    step / 4
-                    for step in range(
-                        ceil(easy_reference[1] * 4 - 1e-9),
-                        int(
-                            max(
-                                easy_reference[1],
-                                floor(aerobic_maximum * 4) / 4,
-                            )
-                            * 4
-                        )
-                        + 1,
-                    )
-                ],
+                "aerobic_options": _distance_options(
+                    easy_reference[1],
+                    max(easy_reference[1], aerobic_maximum),
+                ),
             }
         )
         previous_run_index = index
@@ -3606,7 +3665,6 @@ def _allocate_visible_distance_ranges(
             [],
             planned_at,
             stable_easy_reference,
-            config,
         )
         for index, planned_at in planned_at_by_index.items()
     }
@@ -3692,7 +3750,6 @@ def _allocate_visible_distance_ranges(
                 <= 1.0
             )
             if projected and projected_prior_matches:
-                planned_at = result.planned_for or daily_states[index].as_of
                 base_units = base_load_units_by_index[index]
                 allocated_units = allocated_load_units(index, provisional)
 
@@ -3881,7 +3938,7 @@ def _allocate_visible_distance_ranges(
                 if long_option is not None and primary_long is not None
                 else {}
             )
-            initial_units = int((long_option or 0) * 4)
+            initial_units = _distance_dp_units(long_option or 0)
             initial_cost = (
                 (long_option - ideals[primary_long["index"]]) ** 2
                 if long_option is not None and primary_long is not None
@@ -3932,7 +3989,7 @@ def _allocate_visible_distance_ranges(
                 for units, candidates in dp.items():
                     for cost, assignment in candidates:
                         for option in options:
-                            next_units = units + int(option * 4)
+                            next_units = units + _distance_dp_units(option)
                             next_cost = cost + (
                                 option - ideals[record["index"]]
                             ) ** 2
@@ -4146,12 +4203,7 @@ def _allocate_visible_distance_ranges(
                             "long"
                             if prior.workout_type == WorkoutType.LONG
                             else "quality"
-                            if prior.workout_type
-                            in {
-                                WorkoutType.INTERVALS,
-                                WorkoutType.TEMPO_THRESHOLD,
-                                WorkoutType.RACE,
-                            }
+                            if prior.workout_type in QUALITY_WORKOUT_TYPES
                             else "easy"
                         )
                         current_role = (
@@ -4783,11 +4835,9 @@ def build_weekly_schedule(
     )
     goal = configured_race_goal(config, on_date=daily_states[0].as_of.date())
     race_offset: int | None = None
-    taper_horizon = False
     if goal:
-        goal_profile, race_date, _ = goal
+        _, race_date, _ = goal
         race_offset = (race_date - daily_states[0].as_of.date()).days
-        taper_horizon = 0 <= race_offset <= goal_profile.taper_days
     desired_offsets = (
         adaptive_run_day_offsets(
             daily_states,
@@ -4795,7 +4845,6 @@ def build_weekly_schedule(
             config,
             int(target_run_count or 0),
             target_distance_range,
-            taper_horizon=taper_horizon,
             daily_state_options=daily_state_options,
             forced_rest_offsets=forced_rest_offsets,
             completed_run_offsets=completed_run_offsets,
@@ -4803,12 +4852,21 @@ def build_weekly_schedule(
             prior_run_offsets=prior_run_offsets,
         )
         if planning_horizon_days > VISIBLE_HORIZON_DAYS
-        else automatic_run_day_offsets(
-            offset_state,
-            request.health_status,
-            config,
-            target_run_count,
-            horizon_days=planning_horizon_days,
+        else (
+            []
+            if target_run_count is not None
+            and target_run_count - completed_run_count <= 0
+            else automatic_run_day_offsets(
+                offset_state,
+                request.health_status,
+                config,
+                (
+                    max(0, target_run_count - completed_run_count)
+                    if target_run_count is not None
+                    else None
+                ),
+                horizon_days=planning_horizon_days,
+            )
         )
     )
     offsets = [
@@ -4844,7 +4902,7 @@ def build_weekly_schedule(
             workout_types = {item.workout_type for item in completed}
             role = (
                 "completed_quality_run"
-                if workout_types & {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD, WorkoutType.RACE}
+                if workout_types & QUALITY_WORKOUT_TYPES
                 else "completed_long_run"
                 if WorkoutType.LONG in workout_types
                 else "completed_recovery_run"
@@ -4896,7 +4954,6 @@ def build_weekly_schedule(
                 daily_state_options[offset],
                 planned,
                 config,
-                taper_horizon=taper_horizon,
             ),
         )
         timing_adjusted_for_recovery = (

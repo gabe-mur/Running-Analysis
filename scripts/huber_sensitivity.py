@@ -31,7 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from run_analysis.analytics import build_fitness_analytics  # noqa: E402
 from run_analysis.config import load_config  # noqa: E402
 from run_analysis.db import connect  # noqa: E402
-from run_analysis.progress import _scored_runs, _sessions  # noqa: E402
+from run_analysis.progress import (  # noqa: E402
+    _long_run_threshold_from_connection,
+    _scored_runs,
+    _sessions,
+)
 
 WINDOWS = (14, 28, 56, 90)
 
@@ -39,7 +43,8 @@ WINDOWS = (14, 28, 56, 90)
 def _load_real_rows() -> list[dict]:
     config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
     with connect(config["paths"]["database"]) as connection:
-        _sessions_list, details = _sessions(connection)
+        long_run_threshold = _long_run_threshold_from_connection(connection)
+        _sessions_list, details = _sessions(connection, long_run_threshold)
         analytics_rows, _points, _steady, _steady_points = _scored_runs(connection, details)
     return analytics_rows
 

@@ -147,6 +147,73 @@ def test_randomized_weekly_plans_preserve_core_invariants() -> None:
             assert recovery_trace.facts["easy_recovery_pressure"] == 0.0
 
 
+def test_randomized_production_horizon_preserves_core_invariants() -> None:
+    """Exercise the adaptive path that production actually calls.
+
+    The larger seven-day sweep above cheaply covers many unusual input states.
+    These cases are intentionally fewer because each one searches complete
+    21-day calendars and allocates their finalized workout distances.
+    """
+
+    rng = Random(21091)
+    for _ in range(8):
+        base = _random_state(rng)
+        health = rng.choice(
+            [
+                CurrentHealthStatus.NORMAL,
+                CurrentHealthStatus.LITTLE_TIRED,
+                CurrentHealthStatus.SICK_OR_RECOVERING,
+            ]
+        )
+        states = [
+            base.model_copy(
+                update={
+                    "as_of": base.as_of + timedelta(days=offset),
+                    "days_since_last_run": (base.days_since_last_run or 0)
+                    + offset,
+                    "days_since_quality_run": (
+                        base.days_since_quality_run or 0
+                    )
+                    + offset,
+                    "days_since_long_run": (base.days_since_long_run or 0)
+                    + offset,
+                }
+            )
+            for offset in range(21)
+        ]
+        target_low = rng.uniform(6, 25)
+        schedule = build_weekly_schedule(
+            states,
+            RecommendationRequest(health_status=health),
+            CONFIG,
+            target_run_count=rng.randint(1, 7),
+            target_distance_range=(target_low, target_low + rng.uniform(1, 5)),
+        )
+
+        assert len(schedule.days) == 7
+        assert len(schedule.planning_days) == 21
+        assert [day.date for day in schedule.planning_days] == sorted(
+            day.date for day in schedule.planning_days
+        )
+        planned = [
+            day.recommendation
+            for day in schedule.planning_days
+            if day.recommendation
+        ]
+        running = [
+            item for item in planned if item.workout_type != WorkoutType.REST
+        ]
+        assert all(
+            item.distance_range_miles is None
+            or item.distance_range_miles[0] <= item.distance_range_miles[1]
+            for item in planned
+        )
+        if health == CurrentHealthStatus.SICK_OR_RECOVERING:
+            assert all(
+                item.workout_type == WorkoutType.RECOVERY for item in running
+            )
+
+
 def test_extreme_overload_does_not_prescribe_quality_or_long_run() -> None:
     base = _state()
     recent = base.recent_load.model_copy(

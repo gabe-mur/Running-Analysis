@@ -26,6 +26,8 @@ from .training_load import (
 from .intensity_balance import assess_intensity_balance
 from .vo2_estimation import estimate_local_vo2, vo2_series
 from .web.schemas import (
+    AerobicChangeEvidence,
+    ChangeEvidenceStrength,
     ConfidenceLevel,
     ConsistencySummary,
     FitnessPoint,
@@ -349,6 +351,45 @@ def _trend(value: str) -> FitnessTrend:
     return mapping.get(value, FitnessTrend.INSUFFICIENT_DATA)
 
 
+def _change_evidence(
+    value: dict | None,
+    *,
+    basis: str,
+    confidence: ConfidenceLevel,
+    comparison_run_count: int | None = None,
+) -> AerobicChangeEvidence | None:
+    if value is None:
+        return None
+    direction = _trend(
+        str(value.get("directional_interpretation", value.get("direction")))
+    )
+    evidence = ChangeEvidenceStrength(
+        str(value.get("evidence_strength", "inconclusive"))
+    )
+    # Directional probability cannot repair sparse coverage. Keep the numeric
+    # estimate visible, but do not label it likely when the contributing
+    # period itself has low evidence.
+    if confidence in {ConfidenceLevel.LOW, ConfidenceLevel.UNAVAILABLE}:
+        direction = FitnessTrend.UNCERTAIN
+        evidence = ChangeEvidenceStrength.INCONCLUSIVE
+    return AerobicChangeEvidence(
+        basis=basis,
+        direction=direction,
+        evidence=evidence,
+        confidence=confidence,
+        pace_change_seconds_per_mile=float(
+            value["pace_change_seconds_per_mile"]
+        ),
+        uncertainty_95_seconds_per_mile=float(
+            value["uncertainty_95_seconds_per_mile"]
+        ),
+        probability_faster=float(value["probability_faster"]),
+        run_count=int(value.get("run_count", 1)),
+        comparison_run_count=comparison_run_count,
+        coverage_fraction=float(value.get("coverage_fraction", 0.0)),
+    )
+
+
 def _trend_series(rows: list[dict], days: int) -> list[FitnessTrendPoint]:
     if not rows:
         return []
@@ -562,7 +603,12 @@ def build_progress(
     points = [point for point in points if chart_start < point.start_time <= as_of]
     steady_points = [point for point in steady_points if chart_start < point.start_time <= as_of]
     analysis = (
-        build_fitness_analytics(analytics_rows, window_days, target_hr)
+        build_fitness_analytics(
+            analytics_rows,
+            window_days,
+            target_hr,
+            evaluation_time=as_of,
+        )
         if analytics_rows
         else {"available": False}
     )
@@ -571,6 +617,8 @@ def build_progress(
     uncertainty = None
     pace_change = None
     pace_change_uncertainty = None
+    period_change = None
+    within_window_trend = None
     trend = FitnessTrend.INSUFFICIENT_DATA
     confidence = ConfidenceLevel.UNAVAILABLE
     definition = (
@@ -598,9 +646,52 @@ def build_progress(
             FitnessTrend.DECLINING,
         }:
             trend = FitnessTrend.UNCERTAIN
+        if change:
+            prior = change["prior"]
+            period_change = _change_evidence(
+                {
+                    **change,
+                    "run_count": current["run_count"],
+                    "coverage_fraction": min(
+                        current["coverage_fraction"],
+                        prior["coverage_fraction"],
+                    ),
+                },
+                basis=(
+                    f"last {window_days} days versus the preceding "
+                    f"{window_days} days"
+                ),
+                confidence=confidence,
+                comparison_run_count=int(prior["run_count"]),
+            )
+        slope = analysis.get("within_window_trend")
+        if slope:
+            slope_confidence = (
+                ConfidenceLevel.HIGH
+                if slope["run_count"] >= 6
+                and slope["coverage_fraction"] >= 0.5
+                and analysis.get("days_since_latest_scored_run", float("inf"))
+                <= 7
+                else ConfidenceLevel.MODERATE
+                if slope["run_count"] >= 3
+                and slope["coverage_fraction"] >= 0.25
+                and analysis.get("days_since_latest_scored_run", float("inf"))
+                <= 21
+                else ConfidenceLevel.LOW
+            )
+            within_window_trend = _change_evidence(
+                slope,
+                basis=f"weighted trajectory within the last {window_days} days",
+                confidence=slope_confidence,
+            )
 
     steady_analysis = (
-        build_fitness_analytics(steady_rows, window_days, target_hr)
+        build_fitness_analytics(
+            steady_rows,
+            window_days,
+            target_hr,
+            evaluation_time=as_of,
+        )
         if steady_rows
         else {"available": False}
     )
@@ -803,6 +894,8 @@ def build_progress(
         uncertainty_95_min_mile=uncertainty,
         pace_change_seconds_per_mile=pace_change,
         pace_change_uncertainty_95_seconds_per_mile=pace_change_uncertainty,
+        period_change=period_change,
+        within_window_trend=within_window_trend,
         definition=definition,
         series=points,
         trend_7d=[item for item in _trend_series(analytics_rows, 7) if item.as_of > chart_start],

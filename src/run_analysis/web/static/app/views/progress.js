@@ -26,13 +26,43 @@ export async function renderProgress() {
   const comparison = progress.period_comparison;
   const change = progress.pace_change_seconds_per_mile;
   const changeUncertainty = progress.pace_change_uncertainty_95_seconds_per_mile;
-  const trendText = progress.fitness_trend === "improving" ? "Your aerobic efficiency is improving." : progress.fitness_trend === "declining" ? "Your aerobic efficiency has declined recently." : progress.fitness_trend === "stable" ? "Your aerobic efficiency is about the same." : progress.fitness_trend === "uncertain" ? "There is no clear change in aerobic efficiency." : "More comparable runs are needed.";
-  const paceChange = Number.isFinite(change) && ["improving", "declining"].includes(progress.fitness_trend)
-    ? `${Math.abs(change).toFixed(0)} sec/mi ${change > 0 ? "slower" : "faster"}`
+  const periodChange = progress.period_change;
+  const slope = progress.within_window_trend;
+  const directional = (value) => ["improving", "declining"].includes(value?.direction);
+  const evidenceConflict = directional(periodChange)
+    && directional(slope)
+    && periodChange.direction !== slope.direction;
+  const displayChange = evidenceConflict
+    ? null
+    : directional(periodChange)
+      ? periodChange
+      : directional(slope)
+        ? slope
+        : periodChange;
+  const displayTrend = evidenceConflict
+    ? "uncertain"
+    : displayChange?.direction ?? progress.fitness_trend;
+  const displayDelta = displayChange?.pace_change_seconds_per_mile;
+  const trendText = displayTrend === "improving"
+    ? periodChange?.evidence === "likely" ? "Your aerobic efficiency is likely improving." : "Your aerobic efficiency is improving."
+    : displayTrend === "declining"
+      ? periodChange?.evidence === "likely" ? "Your aerobic efficiency is likely declining." : "Your aerobic efficiency has declined recently."
+      : displayTrend === "stable" ? "Your aerobic efficiency is about the same." : displayTrend === "uncertain" ? "There is no clear change in aerobic efficiency." : "More comparable runs are needed.";
+  const paceChange = Number.isFinite(displayDelta) && ["improving", "declining"].includes(displayTrend)
+    ? `${displayChange?.evidence === "likely" ? "Likely " : ""}${Math.abs(displayDelta).toFixed(0)} sec/mi ${displayDelta > 0 ? "slower" : "faster"}`
     : Number.isFinite(change) ? "No clear change" : "Not enough data";
+  const directionalProbability = periodChange
+    ? (change <= 0 ? periodChange.probability_faster : 1 - periodChange.probability_faster) * 100
+    : null;
   const paceChangeDetail = Number.isFinite(change)
-    ? `The estimate is ${change > 0 ? "+" : ""}${change.toFixed(0)} sec/mi${Number.isFinite(changeUncertainty) ? `; the likely range extends about ${changeUncertainty.toFixed(0)} sec/mi either way` : ""}.`
+    ? `Compared with the preceding ${fitnessWindowLabel(progressWindow)}, the estimate is ${change > 0 ? "+" : ""}${change.toFixed(0)} sec/mi${Number.isFinite(changeUncertainty) ? ` with ±${changeUncertainty.toFixed(0)} sec/mi 95% uncertainty` : ""}${Number.isFinite(directionalProbability) ? `; ${directionalProbability.toFixed(0)}% directional probability` : ""}.`
     : "The previous period does not have enough comparable runs.";
+  const slopeDetail = slope
+    ? ` Within this period, the weighted trajectory is ${slope.evidence === "likely" ? "likely " : slope.evidence === "clear" ? "clearly " : "not clearly "}${slope.direction === "improving" ? "improving" : slope.direction === "declining" ? "declining" : "directional"} (${Math.abs(slope.pace_change_seconds_per_mile).toFixed(0)} sec/mi across the selected window).`
+    : "";
+  const conflictDetail = evidenceConflict
+    ? " The adjacent-period comparison and within-period trajectory point in different directions, so the view does not collapse them into one claim."
+    : "";
   const ratio = progress.current_load.acute_distance_to_capacity_ratio;
   // A week far above demonstrated capacity is a caution, not an achievement,
   // and a week far below it is not either -- only the usual band is neutral.
@@ -54,9 +84,9 @@ export async function renderProgress() {
       <div class="page-heading"><div><p class="eyebrow">Progress</p><h1>${trendText}</h1><p>Compares your pace at the same heart rate, weather, grade, and point in the run.</p></div><div class="headline-pace"><strong>${progress.current_pace?.display ?? "—"}</strong><span>estimated pace at ${targetHrLabel()}</span></div></div>
       ${goalMarkup(goal, "wide")}
       <div class="toolbar"><div class="segmented" aria-label="Fitness time frame">${progress.available_windows.map((days) => `<button type="button" data-window="${days}" class="${days === progressWindow ? "selected" : ""}">${fitnessWindowLabel(days)}</button>`).join("")}</div><div class="segmented"><button type="button" data-metric="standardized" class="${progressMetric === "standardized" ? "selected" : ""}">Adjusted pace</button><button type="button" data-metric="raw" class="${progressMetric === "raw" ? "selected" : ""}">Unadjusted pace</button><button type="button" data-metric="both" class="${progressMetric === "both" ? "selected" : ""}">Both</button></div></div>
-      <article class="wide-card chart-card"><div class="card-heading"><div><p class="eyebrow">Last ${fitnessWindowLabel(progressWindow)}</p><h2>${progressMetric === "standardized" ? `Adjusted pace at ${targetHrLabel()}` : progressMetric === "raw" ? `Unadjusted pace at ${targetHrLabel()}` : "Adjusted and unadjusted pace"}</h2></div><span class="quality ${progress.fitness_confidence}">${evidenceLabel(progress.fitness_confidence)}</span></div>${fitnessChart(progress.series, progressMetric, progressMetric !== "raw" ? progress.trend_28d : [], progress.as_of, progressWindow)}<p class="chart-note">Each dot is one run. The line is your 28-day average, which is what the app reasons from. Thin vertical bars show the likely range for each estimate.</p></article>
+      <article class="wide-card chart-card"><div class="card-heading"><div><p class="eyebrow">Last ${fitnessWindowLabel(progressWindow)}</p><h2>${progressMetric === "standardized" ? `Adjusted pace at ${targetHrLabel()}` : progressMetric === "raw" ? `Unadjusted pace at ${targetHrLabel()}` : "Adjusted and unadjusted pace"}</h2></div><span class="quality ${progress.fitness_confidence}">${evidenceLabel(progress.fitness_confidence)}</span></div>${fitnessChart(progress.series, progressMetric, progressMetric !== "raw" ? progress.trend_28d : [], progress.as_of, progressWindow)}<p class="chart-note">Each dot is one run. The line is a rolling 28-day estimate shown across the selected history. Thin vertical bars show the likely range for each run estimate.</p></article>
       <div class="metric-grid progress-metrics">
-        <article><span>Aerobic efficiency</span><strong>${trendValue(progress.fitness_trend, paceChange)}</strong><small>${escapeHtml(paceChangeDetail)} ${evidenceLabel(progress.fitness_confidence)}.</small></article>
+        <article><span>Aerobic efficiency</span><strong>${trendValue(displayTrend, paceChange)}</strong><small>${escapeHtml(paceChangeDetail + slopeDetail + conflictDetail)} ${evidenceLabel(progress.fitness_confidence)}.</small></article>
         <article><span>Last 7 days</span><strong>${comparisonValue(progress.current_load.trailing_7d.distance_miles, progress.current_load.capacity_reference_miles, `${number(progress.current_load.trailing_7d.distance_miles)} mi`, { deadband: 1 })}</strong><small>${number(progress.current_load.trailing_7d.zone_load, 0)} training-load points</small></article>
         <article><span>This week vs usual</span><strong>${Number.isFinite(ratio) ? directionValue(loadDirection, loadSentiment, `${number(ratio * 100, 0)}%`) : "—"}</strong><small>${number(progress.current_load.trailing_7d.distance_miles)} mi this week · about ${number(progress.current_load.capacity_reference_miles)} mi in a typical week</small></article>
         <article><span>Longest recent run</span><strong>${comparisonValue(progress.consistency.longest_run_miles, previousLongest, `${number(progress.consistency.longest_run_miles)} mi`, { deadband: 1 })}</strong><small>${number(progress.consistency.runs_per_week, 1)} runs per week · ${number(previousLongest)} mi previously</small></article>

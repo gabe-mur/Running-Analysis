@@ -51,7 +51,7 @@ def test_yesterday_evening_run_delays_a_morning_slot_without_losing_target() -> 
     )
     assert automatic_run_day_offsets(
         base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=4
-    ) == [1, 3, 5, 7]
+    ) == [1, 3, 4, 6]
 
 
 def test_yesterday_run_does_not_push_an_evening_slot_to_tomorrow() -> None:
@@ -62,6 +62,17 @@ def test_yesterday_run_does_not_push_an_evening_slot_to_tomorrow() -> None:
     assert automatic_run_day_offsets(
         base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=4
     ) == [0, 2, 4, 6]
+
+
+def test_seven_day_fallback_never_restores_today_when_recovery_delays_it() -> None:
+    base = _state(
+        as_of=datetime(2026, 8, 25, 7, tzinfo=timezone.utc),
+        days_since_last_run=0.5,
+    )
+
+    assert automatic_run_day_offsets(
+        base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=7
+    ) == [1, 2, 3, 4, 5, 6]
 
 
 def test_fourteen_day_cadence_is_distributed_across_week_boundary() -> None:
@@ -86,6 +97,15 @@ def test_twenty_one_day_cadence_spans_three_continuous_cycles() -> None:
         target_run_count=3,
         horizon_days=21,
     ) == [0, 2, 5, 7, 9, 12, 14, 16, 19]
+
+
+def test_distance_grid_preserves_a_narrow_off_grid_feasible_band() -> None:
+    assert weekly_schedule._distance_options(11.3461, 11.3461) == pytest.approx(
+        [11.3461]
+    )
+    assert weekly_schedule._distance_dp_units(11.3461) != (
+        weekly_schedule._distance_dp_units(11.5)
+    )
 
 
 def test_candidate_work_reuse_preserves_exact_calendar_selection() -> None:
@@ -259,6 +279,32 @@ def test_projected_support_runs_do_not_redefine_typical_easy_distance() -> None:
     assert typical_easy_distance(projected) == typical_easy_distance(future)
 
 
+def test_projected_quality_count_uses_only_the_trailing_fourteen_days() -> None:
+    first_at = datetime(2026, 9, 2, 19, tzinfo=timezone.utc)
+    base = _state(
+        as_of=first_at,
+        quality_sessions_14d=0,
+        completed_quality_session_count=0,
+    )
+    quality = recommend_next_run(
+        base,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        weekly_role="quality",
+        allowed_candidates={"quality"},
+    )
+    older = quality.model_copy(update={"planned_for": first_at})
+    recent = quality.model_copy(
+        update={"planned_for": first_at + timedelta(days=18)}
+    )
+    future = base.model_copy(update={"as_of": first_at + timedelta(days=20)})
+
+    projected = _project_state(future, [older, recent], CONFIG)
+
+    assert projected.quality_sessions_14d == 1
+    assert projected.completed_quality_session_count == 2
+
+
 def test_due_quality_role_is_scaled_instead_of_silently_replaced_by_easy() -> None:
     planned_at = datetime(2026, 9, 2, 19, tzinfo=timezone.utc)
     base = _state(
@@ -395,10 +441,10 @@ def test_low_cost_run_does_not_override_cumulative_recovery_load() -> None:
 
     assert automatic_run_day_offsets(
         base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=4
-    ) == [1, 3, 5, 7]
+    ) == [1, 3, 4, 6]
 
 
-def test_horizon_never_pulls_work_later_merely_to_fill_seven_days() -> None:
+def test_seven_day_fallback_retains_requested_work_inside_its_boundary() -> None:
     base = _state(
         as_of=datetime(2026, 8, 25, 7, tzinfo=timezone.utc),
         days_since_last_run=0.5,
@@ -424,9 +470,14 @@ def test_horizon_never_pulls_work_later_merely_to_fill_seven_days() -> None:
         target_run_count=4,
         target_distance_range=(15.5, 18.0),
     )
-    assert [index for index, day in enumerate(schedule.days) if day.recommendation] == [1, 3, 5]
-    assert schedule.run_count == 3
-    assert schedule.target_run_count == 3
+    assert [index for index, day in enumerate(schedule.days) if day.recommendation] == [
+        1,
+        3,
+        4,
+        6,
+    ]
+    assert schedule.run_count == 4
+    assert schedule.target_run_count == 4
 
 
 def test_final_visible_run_role_comes_from_elapsed_cadence_not_horizon() -> None:
@@ -2081,7 +2132,6 @@ def test_elapsed_gap_cost_crosses_display_boundary_without_run_quota() -> None:
         request,
         CONFIG,
         (15.5, 18.0),
-        taper_horizon=False,
         role_loop_penalty=False,
         include_mileage_path=False,
         include_recovery_interactions=False,
@@ -2093,7 +2143,6 @@ def test_elapsed_gap_cost_crosses_display_boundary_without_run_quota() -> None:
         request,
         CONFIG,
         (15.5, 18.0),
-        taper_horizon=False,
         role_loop_penalty=False,
         include_mileage_path=False,
         include_recovery_interactions=False,
@@ -3058,10 +3107,10 @@ def test_transient_session_load_quarters_over_one_day() -> None:
     )
 
     after_one_day = _decayed_recovery_load(
-        one_day, [planned], one_day.as_of, 3.0, CONFIG
+        one_day, [planned], one_day.as_of, 3.0
     )
     after_two_days = _decayed_recovery_load(
-        two_days, [planned], two_days.as_of, 3.0, CONFIG
+        two_days, [planned], two_days.as_of, 3.0
     )
     assert after_two_days < after_one_day
     assert abs(after_one_day - after_two_days * 4) < 1e-9
@@ -3201,7 +3250,11 @@ def test_finalized_program_prices_committed_short_term_density() -> None:
     isolated_short_recovery = _finalized_program_recovery_cost(
         isolated_short, states, CONFIG
     )
-    assert clustered_short_recovery > isolated_short_recovery
+    # Ordinary sessions that remain inside the shared two-session recovery
+    # envelope have no categorical spacing tax. The continuous density model
+    # above still distinguishes a repeatedly clustered program.
+    assert clustered_short_recovery == pytest.approx(0.0)
+    assert isolated_short_recovery == pytest.approx(0.0)
 
 
 def test_post_long_catch_up_keeps_the_immediate_slot_aerobic() -> None:
@@ -3245,7 +3298,6 @@ def test_post_long_catch_up_keeps_the_immediate_slot_aerobic() -> None:
         [[state] for state in states],
         RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
         CONFIG,
-        taper_horizon=False,
     )
 
     assert sessions[0].offset == 0
@@ -3278,3 +3330,67 @@ def test_race_inside_horizon_is_scheduled_without_previous_day_compression() -> 
     assert schedule.days[2].recommendation is None
     assert schedule.days[3].recommendation is not None
     assert schedule.days[3].recommendation.workout_type == WorkoutType.RACE
+
+
+def test_taper_applies_only_before_race_and_normal_roles_resume_after_recovery() -> None:
+    base = _state(
+        running_days_28d=16,
+        days_since_last_run=2.0,
+        days_since_long_run=7.0,
+        days_since_quality_run=7.0,
+    )
+    states = [
+        base.model_copy(
+            update={
+                "as_of": base.as_of + timedelta(days=offset),
+                "days_since_last_run": 2.0 + offset,
+                "days_since_long_run": 7.0 + offset,
+                "days_since_quality_run": 7.0 + offset,
+            }
+        )
+        for offset in range(21)
+    ]
+    race_offset = 4
+    config = {
+        **CONFIG,
+        "coaching": {
+            **CONFIG["coaching"],
+            "training_goal": "half_marathon",
+            "goal_date": states[race_offset].as_of.date().isoformat(),
+            "goal_pace_min_mile": 9.0,
+        },
+    }
+
+    schedule = build_weekly_schedule(
+        states,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        config,
+        target_run_count=4,
+        target_distance_range=(16.9, 18.0),
+    )
+    taxing = {
+        WorkoutType.LONG,
+        WorkoutType.INTERVALS,
+        WorkoutType.TEMPO_THRESHOLD,
+    }
+
+    assert schedule.planning_days[race_offset].recommendation is not None
+    assert (
+        schedule.planning_days[race_offset].recommendation.workout_type
+        == WorkoutType.RACE
+    )
+    assert all(
+        day.recommendation is None
+        or day.recommendation.workout_type not in taxing
+        for day in schedule.planning_days[:race_offset]
+    )
+    assert all(
+        day.recommendation is None
+        or day.recommendation.workout_type not in taxing
+        for day in schedule.planning_days[race_offset + 1 : race_offset + 5]
+    )
+    assert any(
+        day.recommendation
+        and day.recommendation.workout_type in taxing
+        for day in schedule.planning_days[race_offset + 5 :]
+    )

@@ -59,6 +59,56 @@ def test_change_inside_combined_uncertainty_is_not_forced_directional() -> None:
     assert change["direction"] == "stable_or_uncertain"
 
 
+def test_likely_change_is_reported_without_promoting_the_coaching_signal() -> None:
+    runs = [_run(day, 10.0) for day in (0, 7, 14, 21)]
+    runs += [_run(day, 9.8) for day in (28, 35, 42, 49)]
+    for row in runs:
+        row["uncertainty_95"] = 0.5
+
+    change = build_fitness_analytics(runs, 28)["change_prior_window"]
+
+    assert change["evidence_strength"] == "likely"
+    assert change["directional_interpretation"] == "improving"
+    assert change["direction"] == "stable_or_uncertain"
+
+
+def test_clear_change_retains_the_strong_directional_signal() -> None:
+    runs = [_run(day, 10.0) for day in (0, 7, 14, 21)]
+    runs += [_run(day, 9.0) for day in (28, 35, 42, 49)]
+
+    change = build_fitness_analytics(runs, 28)["change_prior_window"]
+
+    assert change["evidence_strength"] == "clear"
+    assert change["directional_interpretation"] == "improving"
+    assert change["direction"] == "improving"
+
+
+def test_gradual_change_has_a_separate_within_window_trajectory() -> None:
+    runs = [_run(day, 10.5 - day * 0.01) for day in range(0, 56, 4)]
+
+    trend = build_fitness_analytics(runs, 56)["within_window_trend"]
+
+    assert trend is not None
+    assert trend["pace_change_seconds_per_mile"] < 0
+    assert trend["directional_interpretation"] == "improving"
+    assert trend["evidence_strength"] in {"likely", "clear"}
+
+
+def test_historical_evaluation_measures_freshness_at_that_time() -> None:
+    runs = [_run(day, 10.0) for day in range(0, 57, 4)]
+    historical_now = datetime.fromisoformat(runs[-1]["start_time_utc"])
+
+    analysis = build_fitness_analytics(
+        runs,
+        28,
+        evaluation_time=historical_now,
+    )
+
+    assert analysis["days_since_latest_scored_run"] == 0
+    assert analysis["evidence_quality"] == "good"
+    assert analysis["comparison_evidence_quality"] == "good"
+
+
 
 def test_analytics_definition_names_the_configured_comparison_heart_rate() -> None:
     """Changing the comparison HR must change what the app says, not only what

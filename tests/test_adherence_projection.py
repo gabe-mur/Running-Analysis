@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from statistics import median_high
 
 from run_analysis.adherence_projection import (
@@ -98,7 +98,10 @@ def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> Non
 def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
     monkeypatch,
 ) -> None:
-    template = _state(running_days_28d=12)
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        running_days_28d=12,
+    )
     seed = [
         ProjectionRun(
             start_time=template.as_of - timedelta(days=offset),
@@ -171,7 +174,10 @@ def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
 def test_human_projection_feeds_skipped_commitments_back_into_replans(
     monkeypatch,
 ) -> None:
-    template = _state(running_days_28d=12)
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        running_days_28d=12,
+    )
     seed = [
         ProjectionRun(
             start_time=template.as_of - timedelta(days=offset),

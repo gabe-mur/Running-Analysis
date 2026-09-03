@@ -10,8 +10,8 @@ covariate, or do the reverse.
 
 The primary score no longer selects environmental weights by whichever candidate
 best predicts this athlete's historical windows. Each run instead produces its
-own pace-at-comparison-HR estimate. Adjustable 14-, 28-, 42-, 56-, and 90-day
-curves are
+own pace-at-comparison-HR estimate. Adjustable 14-, 28-, 42-, 56-, 90-,
+180-, and 365-day curves are
 descriptive robust summaries of those per-run estimates, not fitted latent
 fitness states.
 
@@ -183,9 +183,27 @@ unweighted value; direction calls were unchanged across the 14-, 28-, 56-, and
 90-day windows. Re-run that script after any change to the weighting.
 
 The selectable fitness horizon changes interpretation: 14 days responds quickly
-but is noisy; 90 days is stable but slow. The current level, comparison with the
-preceding equal-length window, probability of improvement, personal-history
-percentile, best sustained period, and evidence density all update together.
+but is noisy; longer windows are more stable but slower. The current level,
+comparison with the preceding equal-length window, within-window trajectory,
+probability of improvement, personal-history percentile, best sustained period,
+and evidence density all update together. The history range and smoothing
+bandwidth are deliberately separate: the chart can show six months of runs
+while retaining a rolling 28-day line. Making that line a six-month smoother
+would conceal shorter improvement, interruption, and recovery phases.
+
+Direction is evaluated in two complementary ways. The first compares the
+weighted mean of the selected period with the preceding equal-length period.
+The second fits a measurement-weighted, Huber-robust slope through the selected
+period, which can detect gradual movement that two adjacent averages obscure.
+If both are directional but disagree, the display reports no clear change
+rather than choosing one silently.
+
+Evidence labels make the statistical claim explicit. **Likely** means at least
+80% one-sided probability in one direction. **Clear** means the estimated
+change excludes zero at the 95% two-sided level. Sparse or stale coverage cannot
+earn either label. The planner and training-status logic continue to use only
+the clear signal; a likely display result is useful feedback, not permission to
+increase training load.
 
 ## Training status
 
@@ -256,10 +274,11 @@ fitness. The application reports three distinct dimensions:
   meaningful progress, but neither mathematically forces faster pace at a
   fixed HR.
 
-The headline uses the current 28 days and current versus prior 90-day periods.
-Progress charts show at most the trailing 365 days. Older activities remain in
-run history rather than silently defining the current baseline. Sparse
-comparison periods lower confidence.
+The dashboard considers a responsive 28-day horizon and a sustained 90-day
+horizon, and says when they disagree. The Progress view uses whichever horizon
+the athlete selects. Progress charts show at most the trailing 365 days. Older
+activities remain in run history rather than silently defining the current
+baseline. Sparse comparison periods lower confidence.
 
 Health-tagged runs retain full distance, duration, and load. Their vote in the
 aerobic-efficiency aggregate is reduced rather than removed, because a run made
@@ -280,6 +299,26 @@ illness-tagged interval session contributes nothing to the trend while an
 illness-tagged easy run contributes a quarter vote. Every observation stays
 visible in run history and in the coverage table either way, so the app does
 not erase or falsify those sessions.
+
+Graph membership is deliberately broader than trend evidence. Every running
+activity with usable distance and moving time remains a point on the Progress
+chart even when it has zero weight or cannot support a standardized
+pace-at-comparison-HR estimate. When no standardized estimate exists, the point
+is drawn at its unadjusted full-run pace and labeled as workout context with 0%
+influence. It does not enter the robust trend, the VO2 conversion, or the latest
+performance-response classification. A manual `include_in_model = false`
+choice has the same fitness-evidence effect without deleting the completed
+distance, duration, intensity, or recovery load from training history.
+
+Workout classification is resolved once with the same precedence in Run
+Analysis, Progress, and Weekly Plan: a manual workout-type override wins, then
+the matched prescribed workout, then an athlete-relative fallback. An unlabeled
+run at or above the current dynamic long-run threshold is classified as long;
+other positive-duration running is classified as easy. The fallback does not
+infer a quality label merely from heart-rate zones, because an unexpectedly
+hard easy run and a deliberately prescribed quality session have different
+planning meaning even though their recorded load is fully counted in both
+cases.
 
 ## VO2-max estimate
 
@@ -377,6 +416,10 @@ together. Final allocated roles—not provisional labels—must preserve long an
 quality cadence. Once elapsed recency selects a role, the generic single-run
 score cannot silently replace it with easy mileage; exact cumulative recovery
 may still make that substitution, and the allocator can shorten a quality dose.
+This role binding is deliberate: the coordinator chooses the purpose of each
+slot from the whole calendar, while health, the date-specific taper, and exact
+recovery are separate eligibility checks. A negative preference score is not
+silently treated as a new hard veto.
 The finite day-21 edge is not a mileage deadline. A boundary-free load corridor
 governs when mileage can be placed, the full-horizon rate governs how much is
 funded, and a recency-decayed prior-plan preference prevents normal adherence
@@ -482,6 +525,15 @@ not claims of medical safety or universal optimality. They are consistent with
 observational recreational-marathon evidence associating less than 40 km/week
 and a longest endurance run below 25 km with slower performance.
 
+Tapering is evaluated on each calendar date. It suppresses ordinary long and
+quality roles only before the race, makes the race itself a required optimizer
+candidate, and does not label the rest of a 21-day horizon as taper merely
+because a race appears near its beginning. After the race, another taxing
+session waits on athlete-relative race load decaying through the existing
+short-term density timescale; an easy run can become available sooner. Thus a
+5K and marathon do not receive the same fixed post-race ban, and normal role
+recurrence resumes once the modeled load supports it.
+
 Recent intensity is shown with the athlete's configured five zones and grouped
 for coaching as easy (Z1+Z2), moderate (Z3), and hard (Z4+Z5). The engine flags
 moderate-intensity leakage but does not enforce a universal 80/20 quota. The
@@ -525,6 +577,13 @@ allocation all consume this same decaying signal. Calendar spacing remains a
 soft cadence preference only; crossing a named number of hours or days never
 causes recovery load to disappear.
 
+Pairwise recovery has an explicit zero-cost envelope: a preceding residual and
+the proposed session are charged only for the portion of their combined
+athlete-relative load above two ordinary-session units. The slower bridge
+signal shares that same envelope and contributes only the additional breach
+not already priced by immediate recovery. It does not charge every nonzero pair
+of runs merely because some exponentially decaying residue still exists.
+
 The whole-program comparison also carries short- and longer-timescale mileage
 density forward through the conditional plan. A discretely scheduled run
 necessarily creates a pulse above a smooth mileage-rate target, so each curve
@@ -536,7 +595,9 @@ residual loads overlap.
 
 Quality recurrence likewise has no minimum-days prohibition. Its priority
 rebuilds continuously as the most recent quality session ages, while recent
-14-day dose supplies a fading satisfaction signal. A taxing session can move
+14-day dose supplies a fading satisfaction signal. Projected sessions enter
+that dose only while their timestamps remain inside the trailing 14 days; an
+early-horizon workout cannot suppress quality indefinitely at day 20. A taxing session can move
 earlier when recovery load is genuinely clear; a low recent count cannot by
 itself manufacture another hard session immediately after the last one.
 
