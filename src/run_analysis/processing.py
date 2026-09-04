@@ -224,10 +224,24 @@ def _eligibility(
     usable_segments = sum(not segment.is_pathological for segment in segments)
     if usable_segments < 4:
         reasons.append("insufficient_valid_segments")
-    if override:
-        if override["include_in_model"] == 0:
+    # Prescription matching can contribute only a workout type when the user
+    # has not saved a manual override. Treat that partial mapping exactly like
+    # a database row whose remaining fields are NULL.
+    override_keys = set(override.keys()) if override is not None else set()
+    include_in_model = (
+        override["include_in_model"]
+        if override is not None and "include_in_model" in override_keys
+        else None
+    )
+    workout_type = (
+        override["workout_type"]
+        if override is not None and "workout_type" in override_keys
+        else None
+    )
+    if override is not None:
+        if include_in_model == 0:
             reasons.append("manual_exclusion")
-        if override["workout_type"] and str(override["workout_type"]).casefold() in {
+        if workout_type and str(workout_type).casefold() in {
             "walk",
             "walk/jog",
             "hike",
@@ -235,7 +249,7 @@ def _eligibility(
             "bike",
             "cycling",
         }:
-            reasons.append(f"workout_type_{override['workout_type']}")
+            reasons.append(f"workout_type_{workout_type}")
     # Explicit inclusion can override contextual/manual labels, but never the
     # hard data requirements that make weather/grade modeling impossible.
     hard = {
@@ -248,7 +262,7 @@ def _eligibility(
         "probable_walk_or_hike_sensor_signature",
         "probable_bike_sensor_signature",
     }
-    if override and override["include_in_model"] == 1:
+    if include_in_model == 1:
         reasons = [reason for reason in reasons if reason in hard]
     return not reasons, sorted(set(reasons))
 

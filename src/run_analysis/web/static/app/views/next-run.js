@@ -54,23 +54,35 @@ function weeklyScheduleMarkup(schedule, goal) {
     const activities = day.activities.map((activity) => `<a href="#run/${activity.activity_id}"><strong>${number(activity.distance_miles)} mi · ${titleCase(activity.workout_type)}</strong><small>${titleCase(activity.health_tag)}</small></a>`).join("");
     return `<article class="trailing-day ${day.activities.length ? "active-day" : "rest-day"}"><p class="eyebrow">${calendarDateLabel(day.date)}</p><h2>${titleCase(day.day_role)}</h2>${activities || "<small>No recorded activity</small>"}</article>`;
   }).join("");
-  // The planned week against the capacity it was derived from. Above or below
-  // is information; only a big overshoot is a caution.
-  const plannedMid = (schedule.projected_distance_range_miles[0] + schedule.projected_distance_range_miles[1]) / 2;
+  // A visible seven-day total and a continuous weekly-equivalent load are not
+  // interchangeable. The former describes the cards on screen; the latter is
+  // the boundary-free quantity that can be compared with retained capacity.
   const capacity = evidence.capacity_reference_miles;
-  const plannedRatio = capacity > 0 && !baselineMode ? plannedMid / capacity : null;
-  const planDirection = plannedRatio === null ? DIRECTION.NONE
-    : plannedRatio > 1.05 ? DIRECTION.UP : plannedRatio < 0.95 ? DIRECTION.DOWN : DIRECTION.FLAT;
-  const planSentiment = plannedRatio === null ? SENTIMENT.NONE
-    : plannedRatio >= 1.3 ? SENTIMENT.BAD : SENTIMENT.NEUTRAL;
-  const versusCapacity = plannedRatio === null ? ""
-    : `<p class="plan-versus">${directionValue(planDirection, planSentiment, `${number(plannedRatio * 100, 0)}% of your ${number(capacity)} mi/week demonstrated capacity`)}</p>`;
+  const peakLoad = schedule.peak_projected_continuous_mileage_rate;
+  const programRate = schedule.planned_14d_weekly_rate;
+  const targetLow = schedule.target_distance_range_miles[0];
+  const targetHigh = schedule.target_distance_range_miles[1];
+  const planDirection = !Number.isFinite(peakLoad) ? DIRECTION.NONE
+    : peakLoad > targetHigh ? DIRECTION.UP
+      : peakLoad < targetLow ? DIRECTION.DOWN
+        : DIRECTION.FLAT;
+  const planSentiment = !Number.isFinite(peakLoad) ? SENTIMENT.NONE
+    : peakLoad > targetHigh ? SENTIMENT.BAD : SENTIMENT.NEUTRAL;
+  const programStatus = !baselineMode && Number.isFinite(peakLoad)
+    ? `<p class="plan-versus">${directionValue(planDirection, planSentiment, `Projected rolling load: ${number(peakLoad)} mi/week · ${peakLoad >= targetLow && peakLoad <= targetHigh ? "within target" : peakLoad > targetHigh ? "above target" : "building toward target"}`)}</p>`
+    : "";
+  const peakContext = capacity > 0 && Number.isFinite(peakLoad)
+    ? `Your rolling mileage load peaks around ${number(peakLoad)} mi/week, compared with your ${number(capacity)} mi/week demonstrated capacity.`
+    : null;
+  const programContext = !baselineMode && Number.isFinite(programRate)
+    ? `Your training target is ${number(targetLow)}–${number(targetHigh)} mi/week. ${peakContext ?? ""} Rolling load lets older runs fade gradually instead of resetting at the edge of this seven-day view.`
+    : null;
   const referenceText = baselineRequired
     ? `The planner has no measured running distance or frequency to extrapolate. The first session is time-based, so it will not substitute a generic beginner mileage target.`
     : evidence.planning_mode === "baseline_building"
       ? `Weekly capacity is still being established, so the app is collecting one recovery-compatible aerobic duration at a time.`
       : evidence.capacity_reference_miles > 0
-    ? `The 21-day load and recovery model selected ${schedule.target_run_count} run days in this view; retained training supports an average ${number(schedule.target_distance_range_miles[0])}–${number(schedule.target_distance_range_miles[1])} miles per seven days across the plan.`
+    ? programContext ?? `The 21-day load and recovery model selected ${schedule.target_run_count} run days in this view; retained training supports an average ${number(schedule.target_distance_range_miles[0])}–${number(schedule.target_distance_range_miles[1])} miles per seven days across the plan.`
     : `This is a starter plan. It will adjust after more runs are uploaded.`;
   const summaryTitle = baselineRequired
     ? `${schedule.run_count} baseline run · 10–30 minutes`
@@ -79,7 +91,7 @@ function weeklyScheduleMarkup(schedule, goal) {
       : `${schedule.completed_run_count ? `${schedule.completed_run_count} completed · ` : ""}${schedule.run_count} planned runs · ${number(schedule.projected_distance_range_miles[0])}–${number(schedule.projected_distance_range_miles[1])} miles`;
   const baselineGuide = baselineMode ? `<article class="wide-card baseline-guide"><p class="eyebrow">How calibration works</p><h2>${baselineRequired ? "Start with measurement, not a guessed plan" : "One observed session at a time"}</h2><ol><li>${baselineRequired ? "Complete the scheduled 10–30-minute conversational Zone 2 run or run/walk. Stop for pain, fatigue, and/or elevated heart rate and end the run at a maximum of 30 minutes." : "Complete the single easy baseline run. Its duration repeats the aerobic exposure you have actually demonstrated."}</li><li>Upload the result so duration, distance, effort, intensity, and recovery become evidence.</li><li>The app repeats or adjusts observed exposure until a weekly capacity is measurable, then transitions automatically into continuous planning.</li></ol></article>` : "";
   const plannedDays = `<div class="week-grid">${dayCards}</div>`;
-  return `<div class="plan-summary-grid"><article class="wide-card schedule-summary"><div><p class="eyebrow">${calendarDateLabel(schedule.start_date)} through ${calendarDateLabel(schedule.end_date)}</p><h2>${summaryTitle}</h2><p>${escapeHtml(schedule.summary)}</p>${versusCapacity}<small>${escapeHtml(referenceText)}</small><details><summary>How was this range chosen?</summary><p>${escapeHtml(evidence.rationale)}</p></details></div></article>${goalMarkup(goal, "panel")}</div>${baselineGuide}${plannedDays}<article class="wide-card trailing-summary"><p class="eyebrow">Recent training</p><h2>Previous 7 days</h2><div class="week-grid trailing-week">${trailingCards}</div></article>`;
+  return `<div class="plan-summary-grid"><article class="wide-card schedule-summary"><div><p class="eyebrow">${calendarDateLabel(schedule.start_date)} through ${calendarDateLabel(schedule.end_date)}</p><h2>${summaryTitle}</h2><p>${escapeHtml(schedule.summary)}</p>${programStatus}<small>${escapeHtml(referenceText)}</small><details><summary>How was this range chosen?</summary><p>${escapeHtml(evidence.rationale)}</p></details></div></article>${goalMarkup(goal, "panel")}</div>${baselineGuide}${plannedDays}<article class="wide-card trailing-summary"><p class="eyebrow">Recent training</p><h2>Previous 7 days</h2><div class="week-grid trailing-week">${trailingCards}</div></article>`;
 }
 
 export async function renderNextRun() {

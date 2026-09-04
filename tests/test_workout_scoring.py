@@ -268,6 +268,100 @@ def test_unstructured_quality_text_cannot_pass_from_distance_alone() -> None:
     assert analysis.execution_status == "Prescription attempted"
 
 
+def test_prescribed_aerobic_run_keeps_match_but_flags_hr_divergence() -> None:
+    connection = _laps_connection()
+    planned_for = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.EASY,
+        title="Medium-long aerobic run",
+        distance_range_miles=(4.2, 4.8),
+        target_zones=["Z1", "Z2"],
+        structure=[
+            WorkoutStep(
+                instruction="Stay primarily in Z1–Z2; no fast finish.",
+                target_zones=["Z1", "Z2"],
+            )
+        ],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.75,
+        moving_minutes=55,
+        elapsed_minutes=56,
+        stopped_minutes=1,
+        zone_load=145,
+        zone_breakdown=ZoneBreakdown(
+            easy_minutes=35,
+            moderate_minutes=12,
+            hard_minutes=8,
+        ),
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [154, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=3.5,
+        distance_delta_miles=0,
+        match_confidence="high",
+    )
+
+    assert analysis.workout_type == WorkoutType.EASY
+    assert analysis.execution_status == "Distance completed; intensity diverged"
+    assert analysis.aerobic_intensity_adherence_percent == pytest.approx(63.64, abs=0.01)
+    assert analysis.above_prescribed_intensity_minutes == 20
+    assert "counts toward recovery" in analysis.summary
+    assert analysis.detected_work_minutes is None
+
+
+def test_prescribed_aerobic_run_with_normal_spillover_is_completed() -> None:
+    connection = _laps_connection()
+    planned_for = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.EASY,
+        title="Easy aerobic run",
+        distance_range_miles=(4.0, 4.5),
+        target_zones=["Z1", "Z2"],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.25,
+        moving_minutes=45,
+        elapsed_minutes=45,
+        stopped_minutes=0,
+        zone_load=80,
+        zone_breakdown=ZoneBreakdown(
+            easy_minutes=38,
+            moderate_minutes=7,
+            hard_minutes=0,
+        ),
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [154, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=1,
+        distance_delta_miles=0,
+        match_confidence="high",
+    )
+
+    assert analysis.execution_status == "Completed as prescribed"
+    assert analysis.aerobic_intensity_adherence_percent == pytest.approx(84.44, abs=0.01)
+
+
 def test_threshold_analysis_detects_sustained_manual_lap_without_saved_plan() -> None:
     connection = _laps_connection()
     for lap, (seconds, hr) in enumerate(((660, 144), (1081, 168), (896, 152))):

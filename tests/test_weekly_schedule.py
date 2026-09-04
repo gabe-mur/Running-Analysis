@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from math import log
+from types import SimpleNamespace
 
 import pytest
 import run_analysis.weekly_schedule as weekly_schedule
@@ -13,6 +14,7 @@ from run_analysis.weekly_schedule import (
     _decayed_recovery_load,
     _finalized_program_recovery_cost,
     _ordinary_easy_expansion_reference,
+    _peak_projected_continuous_mileage_rate,
     _project_state,
     _rest_day_rationale,
     _select_joint_finalists,
@@ -103,6 +105,37 @@ def test_distance_grid_preserves_a_narrow_off_grid_feasible_band() -> None:
     assert weekly_schedule._distance_options(11.3461, 11.3461) == pytest.approx(
         [11.3461]
     )
+
+
+def test_visible_continuous_mileage_peak_uses_actual_session_times() -> None:
+    opening = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    days = [
+        SimpleNamespace(
+            planned_at=opening,
+            recommendation=SimpleNamespace(
+                workout_type=WorkoutType.EASY,
+                distance_range_miles=(3.5, 4.5),
+            ),
+        ),
+        SimpleNamespace(
+            planned_at=opening + timedelta(days=2),
+            recommendation=SimpleNamespace(
+                workout_type=WorkoutType.LONG,
+                distance_range_miles=(6.0, 7.0),
+            ),
+        ),
+    ]
+
+    peak = _peak_projected_continuous_mileage_rate(
+        10.0,
+        opening,
+        days,
+        half_life_days=7.0,
+    )
+
+    first_rate = 10.0 + log(2.0) * 4.0
+    second_rate = first_rate * 0.5 ** (2.0 / 7.0) + log(2.0) * 6.5
+    assert peak == pytest.approx(max(first_rate, second_rate))
     assert weekly_schedule._distance_dp_units(11.3461) != (
         weekly_schedule._distance_dp_units(11.5)
     )
@@ -733,7 +766,6 @@ def test_continuous_path_is_invariant_when_a_rest_day_moves_the_origin() -> None
         opening_weekly_rate=opening * 0.5 ** (1 / 7),
         half_life_days=7,
     )
-
     assert original == pytest.approx(reloaded)
 
 
@@ -1690,6 +1722,24 @@ def test_fourteen_day_plan_can_use_more_short_runs_than_cadence_reference() -> N
     ordinary_run_midpoint = sum(typical_easy_distance(base)) / 2
     assert visible_midpoint <= (
         schedule.target_distance_range_miles[1] + ordinary_run_midpoint
+    )
+    visible_scheduled_midpoint = sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in schedule.days
+        if day.recommendation and day.recommendation.distance_range_miles
+    )
+    planning_midpoint = sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in schedule.planning_days
+        if day.recommendation and day.recommendation.distance_range_miles
+    )
+    assert schedule.visible_7d_scheduled_miles == pytest.approx(
+        visible_scheduled_midpoint,
+        abs=0.01,
+    )
+    assert schedule.planned_14d_weekly_rate == pytest.approx(
+        planning_midpoint / 2,
+        abs=0.01,
     )
     assert all(
         day.recommendation.distance_range_miles[1]

@@ -463,6 +463,17 @@ seven-day vacation. These absences are not disclosed to the planner in advance,
 so each daily regeneration must respond to the activity history it would
 actually receive. Scenario probabilities are test inputs, not coaching rules.
 
+A separate deterministic overload harness compares the same daily planner
+against an observed-HR control. It can add athlete-relative distance to one
+scheduled run, add intensity without changing its distance, insert an
+unscheduled easy run, or create a three-day running sequence. Every completed
+deviation is fed into the next day's full 21-day regeneration. Structured
+snapshots retain the opening load, complete proposed horizon, and committed
+sessions at every reload, allowing changes in near-term mileage, frequency,
+taxing-session timing, and delayed rebound to be measured directly. Run
+`scripts/simulate_overload_absorption.py` to inspect these comparisons. Its
+deviation sizes are configurable test inputs, not planner limits.
+
 ## Training load and coaching interpretation
 
 Session difficulty is deliberately not folded into standardized pace. The app
@@ -592,6 +603,16 @@ that stacks beyond that dynamic session corridor is charged as excess density.
 This prevents an ordinary isolated run from being mistaken for overtraining
 while still making several individually tolerable runs costly when their
 residual loads overlap.
+
+The seven cards shown in the interface are a display slice, not the model's
+load boundary. The summary therefore keeps three quantities separate: mileage
+scheduled in the visible seven days, the prescribed-midpoint weekly average
+across the surrounding 14 days, and the peak rolling mileage load projected
+through the visible plan. Plan status uses the 14-day average against the
+training target; the seven-day total remains useful for logistics, and the
+rolling peak shows whether the locally dense part of the schedule is actually
+stacking load. This works symmetrically for four-run and three-run display
+slices without rewarding or penalizing either side of an arbitrary boundary.
 
 Quality recurrence likewise has no minimum-days prohibition. Its priority
 rebuilds continuously as the most recent quality session ages, while recent

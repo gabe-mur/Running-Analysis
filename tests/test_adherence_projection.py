@@ -3,8 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from statistics import median_high
 
+import pytest
+
 from run_analysis.adherence_projection import (
     HumanAdherenceProfile,
+    OverloadAdherenceProfile,
+    OverloadScenario,
     ProjectionRun,
     _completed_activities_on_plan_date,
     _human_breaks,
@@ -299,6 +303,212 @@ def test_human_projection_can_add_an_unscheduled_rest_day_run(monkeypatch) -> No
     assert projection[0].planned_run_count == 0
     assert projection[0].unscheduled_run_count == 7
     assert projection[0].run_count == 7
+
+
+def _single_then_empty_schedule():
+    calls = 0
+
+    def schedule(daily_states, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        generated_at = daily_states[0].as_of
+        days = []
+        if calls == 1:
+            planned_for = (generated_at + timedelta(days=1)).replace(
+                hour=7,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            recommendation = RecommendationResponse(
+                generated_at=generated_at,
+                fitness_state_as_of=generated_at,
+                planned_for=planned_for,
+                workout_type=WorkoutType.EASY,
+                title="Overload fixture",
+                distance_range_miles=(4.0, 4.0),
+                confidence=ConfidenceLevel.MODERATE,
+                readiness=ReadinessFlag.READY,
+            )
+            days.append(
+                WeeklyScheduleDay(
+                    date=planned_for.date(),
+                    planned_at=planned_for,
+                    recommendation=recommendation,
+                    day_role="easy_run",
+                    rationale="Overload fixture.",
+                )
+            )
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=1,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=len(days),
+            projected_distance_range_miles=(
+                (4.0, 4.0) if days else (0.0, 0.0)
+            ),
+            summary="Overload fixture.",
+            days=days,
+            planning_days=days,
+        )
+
+    return schedule
+
+
+def test_deterministic_distance_overload_is_observed_by_the_next_replan(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    seed = [
+        ProjectionRun(
+            start_time=template.as_of - timedelta(days=day),
+            distance_miles=4.0,
+            moving_minutes=44.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_difficulty(miles=4.0),
+        )
+        for day in range(2, 30, 2)
+    ]
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        seed,
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        overload_profile=OverloadAdherenceProfile(
+            scenario=OverloadScenario.EXTRA_DISTANCE
+        ),
+    )
+
+    events = projection[0].adherence_event_records
+    assert len(events) == 1
+    assert events[0].kind == "overload"
+    assert "2.0 extra miles" in events[0].detail
+    assert projection[0].assumed_completed_miles == 6.0
+    snapshots = projection[0].replan_snapshots
+    assert len(snapshots) == 7
+    assert snapshots[1].opening_load_ratio > snapshots[0].opening_load_ratio
+
+
+def test_dense_sequence_profile_injects_runs_only_after_daily_replans(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        overload_profile=OverloadAdherenceProfile(
+            scenario=OverloadScenario.DENSE_SEQUENCE
+        ),
+    )
+
+    overloads = [
+        event
+        for event in projection[0].adherence_event_records
+        if event.kind == "overload"
+    ]
+    assert len(overloads) == 2
+    assert projection[0].run_count == 3
+    assert projection[0].maximum_consecutive_run_days == 3
+    assert all("unscheduled easy" in event.detail for event in overloads)
+
+
+def test_unscheduled_easy_profile_injects_one_rest_day_run(monkeypatch) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        overload_profile=OverloadAdherenceProfile(
+            scenario=OverloadScenario.UNSCHEDULED_EASY
+        ),
+    )
+
+    overloads = [
+        event
+        for event in projection[0].adherence_event_records
+        if event.kind == "overload"
+    ]
+    assert len(overloads) == 1
+    assert projection[0].run_count == 2
+    assert "unscheduled easy" in overloads[0].detail
+
+
+def test_extra_intensity_profile_preserves_distance_and_records_overload(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        overload_profile=OverloadAdherenceProfile(
+            scenario=OverloadScenario.EXTRA_INTENSITY
+        ),
+    )
+
+    assert projection[0].assumed_completed_miles == 4.0
+    assert len(projection[0].adherence_event_records) == 1
+    assert projection[0].adherence_event_records[0].detail == (
+        "overload: extra intensity"
+    )
+
+
+def test_overload_diagnostics_reject_coarse_replanning() -> None:
+    with pytest.raises(ValueError, match="daily replanning"):
+        simulate_adherence(
+            _state(),
+            [],
+            CONFIG,
+            _state().as_of,
+            weeks=1,
+            replan_interval_days=7,
+            overload_profile=OverloadAdherenceProfile(
+                scenario=OverloadScenario.EXTRA_INTENSITY
+            ),
+        )
 
 
 def test_adherence_projection_rolls_real_planner_forward_without_mutating_seed() -> None:

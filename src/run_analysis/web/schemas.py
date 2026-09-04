@@ -446,6 +446,7 @@ class PrescriptionMatchAnalysis(ApiModel):
     confidence: ConfidenceLevel
     title: str
     planned_for: datetime
+    workout_type: WorkoutType
     quality_session_type: QualitySessionType | None = None
     target_distance_range_miles: tuple[float, float] | None = None
     target_duration_range_minutes: tuple[float, float] | None = None
@@ -456,6 +457,8 @@ class PrescriptionMatchAnalysis(ApiModel):
     summary: str
     target_work_minutes: float | None = Field(default=None, ge=0)
     detected_work_minutes: float | None = Field(default=None, ge=0)
+    aerobic_intensity_adherence_percent: float | None = Field(default=None, ge=0, le=100)
+    above_prescribed_intensity_minutes: float | None = Field(default=None, ge=0)
     detection_source: str
 
 
@@ -955,6 +958,16 @@ class WeeklyScheduleResponse(ApiModel):
     completed_run_count: int = Field(default=0, ge=0, le=7)
     run_count: int = Field(ge=0, le=7)
     projected_distance_range_miles: tuple[float, float]
+    visible_7d_scheduled_miles: float | None = Field(default=None, ge=0)
+    planned_14d_weekly_rate: float | None = Field(default=None, ge=0)
+    peak_projected_continuous_mileage_rate: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Peak boundary-free mileage rate projected across the visible "
+            "seven-day plan, in equivalent weekly miles."
+        ),
+    )
     summary: str
     days: list[WeeklyScheduleDay]
     planning_days: list[WeeklyScheduleDay] = Field(

@@ -19,7 +19,7 @@ from .forecast import (
 )
 from .recommendation import recommend_next_run
 from .recovery import decay_recovery_load
-from .training_load import short_term_density_half_life_days
+from .training_load import continuous_distance_rate, short_term_density_half_life_days
 from .prescription_matching import archive_weekly_prescriptions
 from .run_feedback import get_run_feedback, list_runs
 from .weekly_schedule import (
@@ -27,6 +27,7 @@ from .weekly_schedule import (
     WEEKLY_PLANNER_VERSION,
     PLANNING_HORIZON_DAYS,
     PlanningActivity,
+    _peak_projected_continuous_mileage_rate,
     build_weekly_schedule,
     derive_weekly_target,
 )
@@ -593,6 +594,113 @@ def load_latest_weekly_planning_days(
     ]
 
 
+def _enrich_saved_schedule_load_context(
+    connection: sqlite3.Connection,
+    schedule: WeeklyScheduleResponse,
+    config: dict,
+    as_of: datetime,
+) -> WeeklyScheduleResponse:
+    """Add display load context without asking the optimizer for a new plan."""
+
+    planning_days = load_latest_weekly_planning_days(connection)
+    if not planning_days:
+        planning_days = list(schedule.days)
+    visible_scheduled = sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in schedule.days
+        if day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.distance_range_miles is not None
+    )
+    context_days = planning_days[:14] if len(planning_days) >= 14 else []
+    context_miles = sum(
+        activity.distance_miles
+        for day in context_days
+        for activity in day.completed_activities
+    ) + sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in context_days
+        if day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.distance_range_miles is not None
+    )
+    rate_14d = (
+        context_miles / 2.0
+        if len(context_days) == 14
+        else None
+    )
+    half_life_days = float(
+        config.get("coaching", {}).get(
+            "continuous_fatigue_half_life_days",
+            7,
+        )
+    )
+    # This is a cheap distance-only projection. It deliberately does not
+    # rebuild fitness state or invoke any recommendation/optimizer work.
+    sessions = prepare_progress_data(connection).sessions
+    opening_rate = continuous_distance_rate(
+        sessions,
+        as_of,
+        half_life_days=half_life_days,
+    )
+    peak = _peak_projected_continuous_mileage_rate(
+        opening_rate,
+        as_of,
+        list(schedule.days),
+        half_life_days=half_life_days,
+    )
+    summary = schedule.summary
+    target_low, target_high = schedule.target_distance_range_miles
+    visible_midpoint = sum(schedule.projected_distance_range_miles) / 2
+    special_rest_context = bool(
+        any(day.forced_rest for day in schedule.days)
+        or "changed to rest" in summary
+    )
+    if (
+        not special_rest_context
+        and rate_14d is not None
+        and target_low <= rate_14d <= target_high
+    ):
+        if visible_midpoint > target_high:
+            summary = (
+                "The first seven days are busier, but your 14-day average and "
+                "rolling mileage load stay on target."
+            )
+        elif visible_midpoint < target_low:
+            summary = (
+                "The first seven days are lighter, but your 14-day average "
+                "stays on target."
+            )
+    enriched = schedule.model_copy(
+        update={
+            "visible_7d_scheduled_miles": round(visible_scheduled, 2),
+            "planned_14d_weekly_rate": (
+                round(rate_14d, 2) if rate_14d is not None else None
+            ),
+            "peak_projected_continuous_mileage_rate": (
+                round(peak, 2) if peak is not None else None
+            ),
+            "summary": summary,
+            "planning_days": planning_days,
+        }
+    )
+    connection.execute(
+        """
+        INSERT INTO app_state(key,value_json,updated_at_utc)
+        VALUES ('weekly_schedule',?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value_json=excluded.value_json,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        (
+            enriched.model_dump_json(),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    connection.commit()
+    return enriched
+
+
 def _today_plan_time_is_stale(
     schedule: WeeklyScheduleResponse,
     local_now: datetime,
@@ -786,6 +894,17 @@ def ensure_current_weekly_schedule(
         and not _weekly_plan_shape_is_stale(current)
     )
     if reusable and current is not None:
+        if (
+            current.visible_7d_scheduled_miles is None
+            or current.planned_14d_weekly_rate is None
+            or current.peak_projected_continuous_mileage_rate is None
+        ):
+            current = _enrich_saved_schedule_load_context(
+                connection,
+                current,
+                config,
+                local_now,
+            )
         if _weekly_emergency_alerts_are_stale(current, local_now, config):
             refreshed = _refresh_saved_schedule_emergency_alerts(
                 connection,

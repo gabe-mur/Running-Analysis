@@ -620,8 +620,47 @@ def _prescription_analysis(
         WorkoutType.TEMPO_THRESHOLD,
         WorkoutType.RACE,
     }
+    prescribed_aerobic = (
+        prescription.workout_type
+        in {WorkoutType.EASY, WorkoutType.RECOVERY, WorkoutType.LONG}
+        and not quality_steps
+    )
+    known_hr_minutes = (
+        difficulty.zone_breakdown.easy_minutes
+        + difficulty.zone_breakdown.moderate_minutes
+        + difficulty.zone_breakdown.hard_minutes
+    )
+    aerobic_intensity_adherence = (
+        difficulty.zone_breakdown.easy_minutes / known_hr_minutes
+        if prescribed_aerobic and known_hr_minutes > 0
+        else None
+    )
+    above_prescribed_intensity_minutes = (
+        difficulty.zone_breakdown.moderate_minutes
+        + difficulty.zone_breakdown.hard_minutes
+        if prescribed_aerobic and known_hr_minutes > 0
+        else None
+    )
+    # Use the same aerobic-control standard as the ordinary workout analysis:
+    # recovery runs are deliberately stricter; easy and long runs may include
+    # limited normal HR spillover without being declared a different workout.
+    aerobic_target_share = (
+        0.90 if prescription.workout_type == WorkoutType.RECOVERY else 0.80
+    )
+    aerobic_intensity_close = (
+        aerobic_intensity_adherence is not None
+        and aerobic_intensity_adherence >= aerobic_target_share
+    )
     work_close = bool(
-        (not requires_work_detection and target_work is None)
+        (
+            prescribed_aerobic
+            and aerobic_intensity_close
+        )
+        or (
+            not prescribed_aerobic
+            and not requires_work_detection
+            and target_work is None
+        )
         or (
             target_work is not None
             and
@@ -632,7 +671,29 @@ def _prescription_analysis(
     )
     distance_close = distance_delta_miles <= 0.25
     duration_close = duration_delta_minutes <= 1e-9
-    if work_close and distance_close and duration_close:
+    if prescribed_aerobic and not aerobic_intensity_close and aerobic_intensity_adherence is not None:
+        adherence_percent = aerobic_intensity_adherence * 100
+        status = (
+            "Distance completed; intensity diverged"
+            if distance_close and duration_close
+            else "Prescription attempted"
+        )
+        summary = (
+            "The upload matches the planned aerobic workout, but "
+            f"{above_prescribed_intensity_minutes:.1f} minutes were above Z2 "
+            f"({adherence_percent:.0f}% remained at or below Z2). "
+            "It stays matched to the aerobic prescription while the observed "
+            "heart-rate load counts toward recovery."
+        )
+        source = "heart_rate_zone_adherence"
+    elif prescribed_aerobic and aerobic_intensity_adherence is None:
+        status = "Structure completed"
+        summary = (
+            "Timing and distance match the saved aerobic prescription, but "
+            "heart-rate coverage is insufficient to verify intensity execution."
+        )
+        source = "heart_rate_unavailable"
+    elif work_close and distance_close and duration_close:
         status = "Completed as prescribed"
         summary = (
             "Recorded timing, distance or duration, and work dose match the saved "
@@ -659,6 +720,7 @@ def _prescription_analysis(
         confidence=confidence,
         title=prescription.title,
         planned_for=prescription.planned_for,
+        workout_type=prescription.workout_type,
         quality_session_type=prescription.quality_session_type,
         target_distance_range_miles=prescription.distance_range_miles,
         target_duration_range_minutes=prescription.duration_range_minutes,
@@ -669,6 +731,12 @@ def _prescription_analysis(
         summary=summary,
         target_work_minutes=target_work,
         detected_work_minutes=detected_work,
+        aerobic_intensity_adherence_percent=(
+            aerobic_intensity_adherence * 100
+            if aerobic_intensity_adherence is not None
+            else None
+        ),
+        above_prescribed_intensity_minutes=above_prescribed_intensity_minutes,
         detection_source=source,
     )
 

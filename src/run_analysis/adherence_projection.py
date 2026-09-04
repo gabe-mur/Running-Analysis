@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from enum import Enum
 from random import Random
 
 from .durability import supported_long_run_capacity
@@ -88,6 +89,58 @@ class HumanAdherenceProfile:
     vacation_days: int = 7
 
 
+class OverloadScenario(str, Enum):
+    """Deterministic deviations used to inspect closed-loop load absorption."""
+
+    CONTROL = "control"
+    EXTRA_DISTANCE = "extra_distance"
+    EXTRA_INTENSITY = "extra_intensity"
+    UNSCHEDULED_EASY = "unscheduled_easy"
+    DENSE_SEQUENCE = "dense_sequence"
+
+
+@dataclass(frozen=True, slots=True)
+class OverloadAdherenceProfile:
+    """One athlete-relative overload introduced into an otherwise clean loop.
+
+    These values define stress-test inputs, not coaching thresholds. Distance
+    deviations scale from the athlete's ordinary easy session so the same
+    scenario remains meaningful for runners with different mileage.
+    """
+
+    scenario: OverloadScenario
+    trigger_scheduled_run: int = 1
+    extra_distance_easy_fraction: float = 0.50
+    unscheduled_easy_fraction: float = 0.75
+    dense_sequence_additional_days: int = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionPlanSession:
+    planned_for: datetime
+    workout_type: WorkoutType
+    midpoint_miles: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionReplan:
+    """Structured daily planner output retained for absorption diagnostics."""
+
+    generated_at: datetime
+    opening_load_ratio: float | None
+    target_low_miles: float
+    target_high_miles: float
+    planned_sessions: tuple[ProjectionPlanSession, ...]
+    committed_sessions: tuple[ProjectionPlanSession, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionAdherenceEvent:
+    occurred_at: datetime
+    kind: str
+    detail: str
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionWeek:
     week: int
@@ -108,6 +161,8 @@ class ProjectionWeek:
     skipped_run_count: int = 0
     unscheduled_run_count: int = 0
     adherence_events: tuple[str, ...] = ()
+    replan_snapshots: tuple[ProjectionReplan, ...] = ()
+    adherence_event_records: tuple[ProjectionAdherenceEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,8 +686,9 @@ def simulate_adherence(
     weeks: int = 13,
     replan_interval_days: int = 1,
     human_profile: HumanAdherenceProfile | None = None,
+    overload_profile: OverloadAdherenceProfile | None = None,
 ) -> list[ProjectionWeek]:
-    """Roll the real planner forward under perfect or bounded human adherence.
+    """Roll the real planner forward under controlled adherence behavior.
 
     The simulator projects scheduling and training load only. It assumes a
     normal response and does not invent future pace, HR, sleep, soreness,
@@ -645,12 +701,26 @@ def simulate_adherence(
 
     if not 1 <= replan_interval_days <= 7:
         raise ValueError("replan_interval_days must be between 1 and 7")
+    if human_profile is not None and overload_profile is not None:
+        raise ValueError(
+            "Human and deterministic overload profiles are mutually exclusive"
+        )
+    if overload_profile is not None and replan_interval_days != 1:
+        raise ValueError("Closed-loop overload diagnostics require daily replanning")
+    if (
+        overload_profile is not None
+        and overload_profile.trigger_scheduled_run < 1
+    ):
+        raise ValueError("trigger_scheduled_run must be at least one")
 
     history = list(recorded_runs)
     summaries: dict[int, dict] = {}
     commitments: dict[date, tuple[datetime, float, float]] = {}
     adherence_events: list[tuple[datetime, str, str]] = []
     behavior_rng = Random(human_profile.seed) if human_profile else None
+    scheduled_execution_count = 0
+    overload_trigger_date: date | None = None
+    unscheduled_overload_complete = False
     candidate_hours = sorted(
         int(value)
         for value in config.get("weather", {}).get(
@@ -762,6 +832,7 @@ def simulate_adherence(
             week_index,
             {
                 "replans": [],
+                "snapshots": [],
             },
         )
         visible_plan = [
@@ -792,6 +863,32 @@ def simulate_adherence(
                     if item.planned_for
                 )
                 or "none"
+            )
+        )
+        summary["snapshots"].append(
+            ProjectionReplan(
+                generated_at=plan_start,
+                opening_load_ratio=opening,
+                target_low_miles=target_range[0],
+                target_high_miles=target_range[1],
+                planned_sessions=tuple(
+                    ProjectionPlanSession(
+                        planned_for=item.planned_for,
+                        workout_type=item.workout_type,
+                        midpoint_miles=sum(item.distance_range_miles) / 2,
+                    )
+                    for item in visible_plan
+                    if item.planned_for and item.distance_range_miles
+                ),
+                committed_sessions=tuple(
+                    ProjectionPlanSession(
+                        planned_for=item.planned_for,
+                        workout_type=item.workout_type,
+                        midpoint_miles=sum(item.distance_range_miles) / 2,
+                    )
+                    for item in committed
+                    if item.planned_for and item.distance_range_miles
+                ),
             )
         )
         for item in committed:
@@ -873,10 +970,57 @@ def simulate_adherence(
             )
             if too_intense:
                 notes.append("more intense than prescribed")
+            if overload_profile is not None:
+                scheduled_execution_count += 1
+                if (
+                    scheduled_execution_count
+                    == overload_profile.trigger_scheduled_run
+                ):
+                    overload_trigger_date = item.planned_for.date()
+                    ordinary_miles = (
+                        _state_at(
+                            template,
+                            history,
+                            item.planned_for,
+                            capacity,
+                        ).typical_easy_run_miles
+                        or miles
+                    )
+                    if (
+                        overload_profile.scenario
+                        == OverloadScenario.EXTRA_DISTANCE
+                    ):
+                        added_miles = max(
+                            0.0,
+                            ordinary_miles
+                            * overload_profile.extra_distance_easy_fraction,
+                        )
+                        miles += added_miles
+                        notes.append(
+                            f"overload: {added_miles:.1f} extra miles"
+                        )
+                    elif (
+                        overload_profile.scenario
+                        == OverloadScenario.EXTRA_INTENSITY
+                    ):
+                        too_intense = True
+                        notes.append("overload: extra intensity")
             adherence_note = "; ".join(notes) or "within prescribed margin"
             if notes:
                 adherence_events.append(
-                    (item.planned_for, "deviation", adherence_note)
+                    (
+                        item.planned_for,
+                        (
+                            "overload"
+                            if overload_profile is not None
+                            and any(
+                                note.startswith("overload:")
+                                for note in notes
+                            )
+                            else "deviation"
+                        ),
+                        adherence_note,
+                    )
                 )
             history.append(
                 ProjectionRun(
@@ -892,7 +1036,7 @@ def simulate_adherence(
                             actual_type,
                             too_intense=too_intense,
                         )
-                        if human_profile
+                        if human_profile or overload_profile
                         else _projected_difficulty(item, miles, pace)
                     ),
                     projected=True,
@@ -906,19 +1050,55 @@ def simulate_adherence(
                     prescribed_low_miles=item.distance_range_miles[0],
                     prescribed_high_miles=item.distance_range_miles[1],
                     prescription_title=item.title,
-                    adherence_note=(adherence_note if human_profile else None),
+                    adherence_note=(
+                        adherence_note
+                        if human_profile or overload_profile
+                        else None
+                    ),
                 )
             )
+        deterministic_unscheduled = False
         if (
-            human_profile
-            and behavior_rng is not None
+            overload_profile is not None
+            and overload_trigger_date is not None
             and not any(
                 item.planned_for
                 and item.planned_for.date() == plan_start.date()
                 for item in committed
             )
-            and behavior_rng.random()
-            < human_profile.unscheduled_easy_probability_per_day
+        ):
+            days_after_trigger = (
+                plan_start.date() - overload_trigger_date
+            ).days
+            if (
+                overload_profile.scenario
+                == OverloadScenario.UNSCHEDULED_EASY
+                and days_after_trigger >= 1
+                and not unscheduled_overload_complete
+            ):
+                deterministic_unscheduled = True
+                unscheduled_overload_complete = True
+            elif (
+                overload_profile.scenario
+                == OverloadScenario.DENSE_SEQUENCE
+                and 1
+                <= days_after_trigger
+                <= overload_profile.dense_sequence_additional_days
+            ):
+                deterministic_unscheduled = True
+        if (
+            deterministic_unscheduled
+            or (
+                human_profile
+                and behavior_rng is not None
+                and not any(
+                    item.planned_for
+                    and item.planned_for.date() == plan_start.date()
+                    for item in committed
+                )
+                and behavior_rng.random()
+                < human_profile.unscheduled_easy_probability_per_day
+            )
         ):
             unscheduled_at = datetime.combine(
                 plan_start.date(), time(19), tzinfo=start_at.tzinfo
@@ -943,7 +1123,19 @@ def simulate_adherence(
                     ).typical_easy_run_miles
                     or 3.0
                 )
-                miles = max(1.0, ordinary * behavior_rng.uniform(0.60, 0.90))
+                miles = (
+                    max(
+                        0.5,
+                        ordinary
+                        * overload_profile.unscheduled_easy_fraction,
+                    )
+                    if deterministic_unscheduled
+                    and overload_profile is not None
+                    else max(
+                        1.0,
+                        ordinary * behavior_rng.uniform(0.60, 0.90),
+                    )
+                )
                 synthetic = RecommendationResponse(
                     generated_at=plan_start,
                     fitness_state_as_of=plan_start,
@@ -955,8 +1147,10 @@ def simulate_adherence(
                     confidence=ConfidenceLevel.MODERATE,
                     readiness=ReadinessFlag.READY,
                 )
-                too_intense = (
-                    behavior_rng.random()
+                too_intense = bool(
+                    human_profile is not None
+                    and behavior_rng is not None
+                    and behavior_rng.random()
                     < human_profile.intensity_drift_probability
                 )
                 history.append(
@@ -975,14 +1169,27 @@ def simulate_adherence(
                         projected=True,
                         planning_role="support_easy",
                         prescription_title="Unscheduled easy run",
-                        adherence_note="unscheduled easy run",
+                        adherence_note=(
+                            "overload: unscheduled easy run"
+                            if deterministic_unscheduled
+                            else "unscheduled easy run"
+                        ),
                     )
                 )
                 adherence_events.append(
                     (
                         unscheduled_at,
-                        "unscheduled",
-                        f"unscheduled easy {miles:.1f} mi"
+                        (
+                            "overload"
+                            if deterministic_unscheduled
+                            else "unscheduled"
+                        ),
+                        (
+                            "overload: "
+                            if deterministic_unscheduled
+                            else ""
+                        )
+                        + f"unscheduled easy {miles:.1f} mi"
                         + (" with intensity drift" if too_intense else ""),
                     )
                 )
@@ -1103,7 +1310,10 @@ def simulate_adherence(
             for item in adherence_events
             if week_start_date <= item[0].date() < week_end_date
         ]
-        summary = summaries.get(week_index, {"replans": []})
+        summary = summaries.get(
+            week_index,
+            {"replans": [], "snapshots": []},
+        )
         results.append(
             ProjectionWeek(
             week=week_index + 1,
@@ -1150,6 +1360,15 @@ def simulate_adherence(
                     f"{at.strftime('%a %b %-d')}: {message}"
                     for at, _, message in week_events
                 )
+            ),
+            replan_snapshots=tuple(summary["snapshots"]),
+            adherence_event_records=tuple(
+                ProjectionAdherenceEvent(
+                    occurred_at=at,
+                    kind=kind,
+                    detail=message,
+                )
+                for at, kind, message in week_events
             ),
         )
         )

@@ -72,6 +72,41 @@ def test_upload_pipeline_imports_and_reports_independent_stage_failures(tmp_path
     assert all(path.parent == tmp_path / "uploads" for path in (tmp_path / "uploads").iterdir())
 
 
+def test_upload_does_not_model_or_replan_partially_processed_activity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_config(tmp_path)
+
+    def processing_failure(*_args, **_kwargs):
+        raise RuntimeError("processing failed")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dependent stage must not run")
+
+    monkeypatch.setattr(
+        "run_analysis.web.upload_service.process_activities",
+        processing_failure,
+    )
+    monkeypatch.setattr("run_analysis.web.upload_service.fit_models", forbidden)
+    monkeypatch.setattr(
+        "run_analysis.web.upload_service.generate_weekly_schedule",
+        forbidden,
+    )
+
+    result = run_upload_pipeline(
+        tmp_path,
+        "config.yaml",
+        [UploadPayload("run.tcx", _tcx_bytes(gps=False))],
+    )
+
+    stages = {stage.name: stage for stage in result.stages}
+    assert stages["process"].status == "failed"
+    assert stages["weather"].status == "complete"
+    assert stages["model"].status == "skipped"
+    assert stages["schedule"].status == "skipped"
+
+
 def test_upload_endpoint_accepts_multiple_tcx_files(tmp_path: Path) -> None:
     _write_config(tmp_path)
     client = TestClient(create_app(tmp_path))

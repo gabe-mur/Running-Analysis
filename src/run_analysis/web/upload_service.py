@@ -164,6 +164,7 @@ def run_upload_pipeline(
 
         if imported_any:
             overrides_path = resolve_project_path(root, config["paths"]["overrides"])
+            processing_complete = False
             try:
                 sync_overrides(connection, overrides_path)
                 process_summary = process_activities(connection, config)
@@ -183,6 +184,7 @@ def run_upload_pipeline(
                     # the classification.
                     process_summary = process_activities(connection, config)
                 stages.append(UploadStage(name="process", status="complete", detail=_detail(process_summary)))
+                processing_complete = True
                 if matched_activity_ids:
                     stages.append(
                         UploadStage(
@@ -210,52 +212,61 @@ def run_upload_pipeline(
                     )
                 )
 
-            try:
-                output = root / "output" / "model_results.json"
-                output.parent.mkdir(parents=True, exist_ok=True)
-                model_summary = fit_models(connection, config, output)
-                stages.append(UploadStage(name="model", status="complete", detail=_detail(model_summary)))
-            except InsufficientModelDataError as exc:
-                stages.append(
-                    UploadStage(
-                        name="model",
-                        status="deferred",
-                        detail=f"More usable history is needed before fitness modeling: {exc}",
+            if processing_complete:
+                try:
+                    output = root / "output" / "model_results.json"
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    model_summary = fit_models(connection, config, output)
+                    stages.append(UploadStage(name="model", status="complete", detail=_detail(model_summary)))
+                except InsufficientModelDataError as exc:
+                    stages.append(
+                        UploadStage(
+                            name="model",
+                            status="deferred",
+                            detail=f"More usable history is needed before fitness modeling: {exc}",
+                        )
                     )
-                )
-            except Exception as exc:
-                stages.append(
-                    UploadStage(
-                        name="model",
-                        status="failed",
-                        detail=f"Run remains available without a fitness score: {exc}",
+                except Exception as exc:
+                    stages.append(
+                        UploadStage(
+                            name="model",
+                            status="failed",
+                            detail=f"Run remains available without a fitness score: {exc}",
+                        )
                     )
-                )
-            try:
-                current = load_current_status(connection)
-                schedule = generate_weekly_schedule(
-                    connection,
-                    config,
-                    WeeklyScheduleRequest(health_status=current.health_status),
-                    root,
-                )
-                stages.append(
-                    UploadStage(
-                        name="schedule",
-                        status="complete",
-                        detail=(
-                            f"Refreshed today-through-{schedule.end_date.isoformat()} plan "
-                            f"from the updated activity history."
-                        ),
+                try:
+                    current = load_current_status(connection)
+                    schedule = generate_weekly_schedule(
+                        connection,
+                        config,
+                        WeeklyScheduleRequest(health_status=current.health_status),
+                        root,
                     )
-                )
-            except Exception as exc:
-                stages.append(
-                    UploadStage(
-                        name="schedule",
-                        status="failed",
-                        detail=f"Run was analyzed but the saved weekly plan could not refresh: {exc}",
+                    stages.append(
+                        UploadStage(
+                            name="schedule",
+                            status="complete",
+                            detail=(
+                                f"Refreshed today-through-{schedule.end_date.isoformat()} plan "
+                                f"from the updated activity history."
+                            ),
+                        )
                     )
+                except Exception as exc:
+                    stages.append(
+                        UploadStage(
+                            name="schedule",
+                            status="failed",
+                            detail=f"Run was analyzed but the saved weekly plan could not refresh: {exc}",
+                        )
+                    )
+            else:
+                detail = "Skipped because activity processing did not complete."
+                stages.extend(
+                    [
+                        UploadStage(name="model", status="skipped", detail=detail),
+                        UploadStage(name="schedule", status="skipped", detail=detail),
+                    ]
                 )
         else:
             for name in ("process", "weather", "model", "schedule"):

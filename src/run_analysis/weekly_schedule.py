@@ -277,6 +277,52 @@ def _continuous_mileage_path_violation(
     return max(0.0, worst)
 
 
+def _peak_projected_continuous_mileage_rate(
+    opening_weekly_rate: float | None,
+    opening_at: datetime,
+    days: list[WeeklyScheduleDay],
+    *,
+    half_life_days: float,
+) -> float | None:
+    """Project the visible plan on the same boundary-free mileage scale.
+
+    The optimizer evaluates several load signals, but the interface previously
+    compared a literal seven-day card total with retained weekly capacity. This
+    projection keeps those concepts separate: completed work is already in the
+    opening rate, planned midpoint mileage is added at its actual scheduled
+    time, and the existing rate decays continuously between sessions.
+    """
+
+    if opening_weekly_rate is None:
+        return None
+    half_life = max(0.1, float(half_life_days))
+    session_normalization = log(2.0) * 7.0 / half_life
+    rate = max(0.0, opening_weekly_rate)
+    peak = rate
+    previous_at = opening_at
+    planned = sorted(
+        (
+            day.planned_at,
+            sum(day.recommendation.distance_range_miles) / 2,
+        )
+        for day in days
+        if day.planned_at is not None
+        and day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.distance_range_miles is not None
+    )
+    for planned_at, midpoint_miles in planned:
+        elapsed_days = max(
+            0.0,
+            (planned_at - previous_at).total_seconds() / 86400.0,
+        )
+        rate *= 0.5 ** (elapsed_days / half_life)
+        rate += session_normalization * midpoint_miles
+        peak = max(peak, rate)
+        previous_at = planned_at
+    return peak
+
+
 def _weekly_rate_alignment_cost(
     projected_weekly_rate: float,
     target_weekly_range: tuple[float, float],
@@ -5066,12 +5112,77 @@ def build_weekly_schedule(
     )
     forced_rest_count = sum(day.forced_rest for day in visible_days)
     projected_range = (round(distance_low, 1), round(distance_high, 1))
+    visible_7d_scheduled_miles = sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in visible_days
+        if day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.distance_range_miles is not None
+    )
+    context_days = planning_days[:14] if len(planning_days) >= 14 else []
+    context_miles = sum(
+        activity.distance_miles
+        for day in context_days
+        for activity in day.completed_activities
+    ) + sum(
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in context_days
+        if day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.distance_range_miles is not None
+    )
+    planned_14d_weekly_rate = (
+        context_miles * 7.0 / len(context_days)
+        if context_days
+        else None
+    )
+    fatigue_half_life_days = float(
+        config.get("coaching", {}).get(
+            "continuous_fatigue_half_life_days",
+            7,
+        )
+    )
+    peak_projected_continuous_mileage_rate = (
+        _peak_projected_continuous_mileage_rate(
+            daily_states[0].recent_load.continuous_distance_miles,
+            daily_states[0].as_of,
+            visible_days,
+            half_life_days=fatigue_half_life_days,
+        )
+    )
     if guardrail_rest_count:
         horizon_explanation = f"{guardrail_rest_count} planned day{'s were' if guardrail_rest_count != 1 else ' was'} changed to rest based on recovery, health, load, or weather."
     elif forced_rest_count:
         horizon_explanation = (
             "The continuous 21-day plan was recalculated around your selected "
             "rest-day constraints."
+        )
+    elif (
+        planned_14d_weekly_rate is not None
+        and sum(projected_range) / 2 > target_distance_range[1]
+        and target_distance_range[0]
+        <= planned_14d_weekly_rate
+        <= target_distance_range[1]
+        and (
+            peak_projected_continuous_mileage_rate is None
+            or peak_projected_continuous_mileage_rate
+            <= target_distance_range[1] + 1e-9
+        )
+    ):
+        horizon_explanation = (
+            "The first seven days are busier, but your 14-day average and "
+            "rolling mileage load stay on target."
+        )
+    elif (
+        planned_14d_weekly_rate is not None
+        and sum(projected_range) / 2 < target_distance_range[0]
+        and target_distance_range[0]
+        <= planned_14d_weekly_rate
+        <= target_distance_range[1]
+    ):
+        horizon_explanation = (
+            "The first seven days are lighter, but your 14-day average stays "
+            "on target."
         )
     else:
         horizon_explanation = summarize_distance_alignment(
@@ -5092,6 +5203,17 @@ def build_weekly_schedule(
         completed_run_count=completed_run_count,
         run_count=len(run_results),
         projected_distance_range_miles=projected_range,
+        visible_7d_scheduled_miles=round(visible_7d_scheduled_miles, 2),
+        planned_14d_weekly_rate=(
+            round(planned_14d_weekly_rate, 2)
+            if planned_14d_weekly_rate is not None
+            else None
+        ),
+        peak_projected_continuous_mileage_rate=(
+            round(peak_projected_continuous_mileage_rate, 2)
+            if peak_projected_continuous_mileage_rate is not None
+            else None
+        ),
         summary=horizon_explanation,
         days=visible_days,
         planning_days=planning_days,
