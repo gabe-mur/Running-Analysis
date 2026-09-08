@@ -65,7 +65,7 @@ from .web.schemas import (
 
 VISIBLE_HORIZON_DAYS = 7
 PLANNING_HORIZON_DAYS = 21
-WEEKLY_PLANNER_VERSION = 85
+WEEKLY_PLANNER_VERSION = 86
 MAX_ADAPTIVE_CANDIDATES = 64
 MAX_HORIZON_COUNT_OPTIONS = 14
 ALLOCATION_ASSIGNMENTS_PER_TOTAL = 16
@@ -3511,9 +3511,7 @@ def _allocate_visible_distance_ranges(
             # It may scale down below the original range when load requires,
             # but ordinary budget allocation never enlarges the session.
             original_midpoint = (lower + upper) / 2
-            quality_center = floor(
-                (original_midpoint + 0.25) * 2 + 1e-9
-            ) / 2
+            quality_center = round(original_midpoint * 4) / 4
             preferred = quality_center
             maximum = preferred
             weight = 1.05
@@ -3657,9 +3655,29 @@ def _allocate_visible_distance_ranges(
             if not record["options"]:
                 record["options"] = [record["maximum"]]
 
-    primary_long = next(
-        (record for record in records if record["role"] == "long"),
-        None,
+    long_records = [
+        record for record in records if record["role"] == "long"
+    ]
+    primary_long = long_records[0] if long_records else None
+
+    # This allocator now receives the entire rolling lookahead, which can
+    # legitimately contain more than one long run.  The original seven-day
+    # implementation protected only the first one; later long runs were then
+    # treated like generic mileage and could regress even when the horizon had
+    # ample room for every selected long-run prescription.  Preserve all of
+    # their coaching-derived preferred distances when those preferences fit
+    # alongside the minimum useful dose of the other selected sessions.
+    preferred_longs_fit = bool(
+        long_records
+        and completed_miles
+        + fixed_midpoint
+        + sum(
+            record["preferred"]
+            if record["role"] == "long"
+            else record["minimum"]
+            for record in records
+        )
+        <= target_range[1] + 1e-9
     )
 
     def ranges_for(
@@ -3916,19 +3934,7 @@ def _allocate_visible_distance_ranges(
                 if option + 1e-9
                 >= minimum_meaningful
             ]
-            minimum_other_mileage = (
-                completed_miles
-                + fixed_midpoint
-                + sum(
-                    record["minimum"]
-                    for record in records
-                    if record is not primary_long
-                )
-            )
-            if (
-                minimum_other_mileage + primary_long["preferred"]
-                <= target_range[1] + 1e-9
-            ):
+            if preferred_longs_fit:
                 long_options = [
                     option
                     for option in long_options
@@ -3975,10 +3981,11 @@ def _allocate_visible_distance_ranges(
                 # the selected long recommendation as the soft allocation
                 # ideal. Recovery caps and total-load penalties may still
                 # scale it down; balance alone no longer erases progression.
-                ideals[primary_long["index"]] = max(
-                    ideals[primary_long["index"]],
-                    primary_long["preferred"],
-                )
+                for long_record in long_records:
+                    ideals[long_record["index"]] = max(
+                        ideals[long_record["index"]],
+                        long_record["preferred"],
+                    )
             initial_assignment = (
                 {primary_long["index"]: long_option}
                 if long_option is not None and primary_long is not None
@@ -4021,6 +4028,16 @@ def _allocate_visible_distance_ranges(
                         if option <= meaningful_easy_ceiling + 1e-9
                     ]
                 if preserve_quality_dose and record["role"] == "quality":
+                    options = [
+                        option
+                        for option in options
+                        if option + 1e-9 >= record["preferred"]
+                    ]
+                if (
+                    retain_long
+                    and preferred_longs_fit
+                    and record["role"] == "long"
+                ):
                     options = [
                         option
                         for option in options

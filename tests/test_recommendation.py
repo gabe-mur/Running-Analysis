@@ -19,6 +19,7 @@ from run_analysis.web.schemas import (
     FitnessTrend,
     LoadContext,
     LoadWindow,
+    PaceValue,
     PlannedWeather,
     RecommendationRequest,
     SessionDifficulty,
@@ -793,8 +794,8 @@ def test_shortened_quality_scales_work_dose_instead_of_deleting_quality() -> Non
 
     assert shortened.workout_type == WorkoutType.TEMPO_THRESHOLD
     assert shortened.quality_session_type == "threshold"
-    assert shortened.structure[1].duration_minutes == 12
-    assert "Run 12 minutes continuously" in shortened.structure[1].instruction
+    assert shortened.structure[1].duration_minutes == 16
+    assert "Run 16 minutes continuously" in shortened.structure[1].instruction
     assert any("instead of deleting" in reason for reason in shortened.reasons)
 
 
@@ -810,13 +811,11 @@ def test_only_two_hour_quality_sessions_expand_to_multi_part_structure() -> None
     assert structure_extended_quality_session(ordinary, 45.0) == ordinary
 
     allocated = structure_extended_quality_session(ordinary, 60.0)
-    assert allocated.title == ordinary.title
-    assert any(
-        "full prescribed distance is accounted for" in step.instruction
+    assert allocated == ordinary
+    assert allocated.distance_range_miles == (3.5, 4.0)
+    assert not any(
+        "full prescribed distance" in step.instruction
         for step in allocated.structure
-    )
-    assert any(
-        "fixed quality dose" in reason for reason in allocated.reasons
     )
 
     extended = structure_extended_quality_session(ordinary, 150.0)
@@ -826,6 +825,50 @@ def test_only_two_hour_quality_sessions_expand_to_multi_part_structure() -> None
     assert "150 minutes total" in instructions
     assert "Do not add more quality work" in instructions
     assert any("quality dose is capped" in reason for reason in extended.reasons)
+
+
+def test_fixed_time_quality_distance_uses_athlete_pace_without_padding() -> None:
+    settings = {
+        **CONFIG,
+        "coaching": {
+            **CONFIG["coaching"],
+            "quality_sessions": {
+                "fartlek": False,
+                "short_intervals": True,
+                "long_intervals": False,
+                "threshold": False,
+                "progression": False,
+                "hill_repeats": False,
+            },
+        },
+    }
+    slower = _recommend(
+        _state(
+            days_since_quality_run=8,
+            standardized_pace_at_target_hr=PaceValue(
+                minutes_per_mile=12.0,
+                display="12:00/mi",
+            ),
+        ),
+        config=settings,
+    )
+    faster = _recommend(
+        _state(
+            days_since_quality_run=8,
+            standardized_pace_at_target_hr=PaceValue(
+                minutes_per_mile=9.0,
+                display="9:00/mi",
+            ),
+        ),
+        config=settings,
+    )
+
+    assert sum(faster.distance_range_miles) > sum(slower.distance_range_miles)
+    assert not any(
+        "full prescribed distance" in step.instruction
+        for result in (slower, faster)
+        for step in result.structure
+    )
 
 
 def test_general_fitness_quality_stimuli_rotate_without_random_plan_churn() -> None:

@@ -1438,6 +1438,41 @@ def test_safe_meaningful_long_is_reserved_before_other_weekly_mileage() -> None:
     )
 
 
+def test_full_horizon_preserves_each_supported_long_run() -> None:
+    base = _state(
+        longest_run_30d_miles=7.0,
+        retained_long_run_capacity_miles=7.0,
+        days_since_last_run=3.0,
+        days_since_long_run=8.0,
+        days_since_quality_run=8.0,
+        typical_easy_run_miles=4.0,
+    )
+    states, days = _role_days_for_allocation(
+        base, ["long", "easy", "quality", "easy", "long"]
+    )
+    prescribed_long_midpoints = [
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in days
+        if day.recommendation.workout_type == WorkoutType.LONG
+    ]
+
+    allocated = _allocate_visible_distance_ranges(
+        days,
+        states,
+        (40.0, 45.0),
+        CONFIG,
+        weekly_target_range=(15.0, 18.0),
+    )
+    allocated_long_midpoints = [
+        sum(day.recommendation.distance_range_miles) / 2
+        for day in allocated
+        if day.recommendation.workout_type == WorkoutType.LONG
+    ]
+
+    assert len(allocated_long_midpoints) == 2
+    assert allocated_long_midpoints == prescribed_long_midpoints
+
+
 def test_tight_week_preserves_quality_dose_and_shrinks_aerobic_mileage() -> None:
     base = _state(
         longest_run_30d_miles=6.0,

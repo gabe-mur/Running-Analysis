@@ -381,6 +381,54 @@ def _select_quality_variant(
     return enabled[state.completed_quality_session_count % len(enabled)]
 
 
+def _quality_structure_distance(
+    state: FitnessState,
+    kind: QualitySessionType,
+    structure: list[WorkoutStep],
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    """Size fixed-time quality sessions from the work actually prescribed.
+
+    Warm-up, work, recoveries, and cool-down all count toward mileage.  What
+    does not count is an invented easy-running block added only to make a
+    weekly arithmetic target.  Distance remains an execution range because
+    the same timed effort covers different ground at different paces.
+    """
+
+    if kind not in {
+        QualitySessionType.SHORT_INTERVALS,
+        QualitySessionType.LONG_INTERVALS,
+        QualitySessionType.THRESHOLD,
+    }:
+        return fallback
+    total_minutes = 0.0
+    for step in structure:
+        if step.duration_minutes is not None:
+            total_minutes += step.duration_minutes
+        elif step.repetitions and step.work_duration_minutes:
+            total_minutes += step.repetitions * step.work_duration_minutes
+            if step.recovery_duration_minutes:
+                total_minutes += (
+                    max(0, step.repetitions - 1)
+                    * step.recovery_duration_minutes
+                )
+        else:
+            return fallback
+    pace = (
+        state.standardized_pace_at_target_hr.minutes_per_mile
+        if state.standardized_pace_at_target_hr is not None
+        else None
+    )
+    recent = state.recent_load.trailing_28d
+    if pace is None and recent.distance_miles > 0 and recent.moving_minutes > 0:
+        pace = recent.moving_minutes / recent.distance_miles
+    if pace is None or pace <= 0:
+        return fallback
+    pace = min(20.0, max(6.0, pace))
+    center = max(0.5, round((total_minutes / pace) * 4) / 4)
+    return (round(max(0.1, center - 0.25), 2), round(center + 0.25, 2))
+
+
 def _quality_prescription(kind: QualitySessionType) -> dict[str, Any]:
     prescriptions: dict[QualitySessionType, dict[str, Any]] = {
         QualitySessionType.FARTLEK: {
@@ -609,50 +657,7 @@ def structure_extended_quality_session(
         return result
     kind = result.quality_session_type
     if estimated_duration_minutes < EXTENDED_QUALITY_DURATION_MINUTES:
-        ordinary_template_minutes = {
-            QualitySessionType.FARTLEK: 45.0,
-            QualitySessionType.SHORT_INTERVALS: 42.0,
-            QualitySessionType.LONG_INTERVALS: 41.0,
-            QualitySessionType.THRESHOLD: 40.0,
-            QualitySessionType.HILL_REPEATS: 35.0,
-        }.get(kind)
-        # A progression prescription already defines effort by portions of the
-        # whole run. Other fixed-dose quality templates need to say where any
-        # mileage added by the weekly allocator belongs.
-        if (
-            ordinary_template_minutes is None
-            or estimated_duration_minutes <= ordinary_template_minutes + 5
-        ):
-            return result
-        extra_minutes = int(
-            round(
-                (estimated_duration_minutes - ordinary_template_minutes) / 5
-            )
-            * 5
-        )
-        if extra_minutes < 5:
-            return result
-        added_easy = WorkoutStep(
-            instruction=(
-                f"After the quality work, add about {extra_minutes} minutes of easy Z2 running before the cool-down so the full prescribed distance is accounted for."
-            ),
-            duration_minutes=float(extra_minutes),
-            target_zones=["Z2"],
-        )
-        insertion = max(0, len(result.structure) - 1)
-        return result.model_copy(
-            update={
-                "structure": [
-                    *result.structure[:insertion],
-                    added_easy,
-                    *result.structure[insertion:],
-                ],
-                "reasons": [
-                    *result.reasons,
-                    "Any distance beyond the fixed quality dose is assigned to easy aerobic running.",
-                ],
-            }
-        )
+        return result
     work: dict[QualitySessionType, tuple[str, WorkoutStep]] = {
         QualitySessionType.FARTLEK: (
             "Extended fartlek aerobic session",
@@ -1623,6 +1628,12 @@ def recommend_next_run(
         quality_kind = _select_quality_variant(state, settings)
         prescription = _quality_prescription(quality_kind)
         structure = list(prescription["structure"])
+        quality_distance = _quality_structure_distance(
+            state,
+            quality_kind,
+            structure,
+            prescription["distance"],
+        )
         if goal:
             structure.append(_goal_quality_context(quality_kind, goal_profile.label, goal_pace))
         enabled_quality = [
@@ -1663,7 +1674,7 @@ def recommend_next_run(
             workout_type=prescription["workout_type"],
             quality_session_type=quality_kind,
             title=prescription["title"],
-            distance=prescription["distance"],
+            distance=quality_distance,
             zones=prescription["zones"],
             structure=structure,
             reasons=[

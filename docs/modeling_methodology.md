@@ -545,7 +545,19 @@ justify spending that headroom.
 Once recovery and workout scoring select a safe, meaningful long run, the
 weekly allocator reserves that target before quality structure and easy-mile
 distribution; it does not erase the role merely to make all run distances more
-equal.
+equal. This reservation applies to every long run in the rolling lookahead,
+not only the first visible one. If all of their preferred distances fit beside
+the minimum useful doses of the other selected sessions, a later long run
+cannot be reduced as generic mileage merely because it lies beyond day seven.
+
+Fixed-time quality sessions are sized from their prescribed warm-up, work,
+recoveries, and cool-down using the athlete's available pace evidence. Those
+components all count toward planned mileage, but the allocator does not append
+easy running after a complete ordinary quality workout solely to spend a
+mileage remainder. The freed load competes for placement on aerobic and long
+days under the same recovery model. Only a genuinely extended quality day—at
+least two hours—uses the separate bounded multi-part design in which a fixed
+quality dose is embedded in a longer aerobic session.
 
 Race goals add a required trajectory rather than merely changing workout
 labels. Each profile defines a preparation-level peak weekly volume and long
