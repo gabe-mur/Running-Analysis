@@ -780,6 +780,39 @@ def test_prior_full_plan_is_only_a_soft_continuity_preference() -> None:
     assert weekly_schedule._plan_continuity_cost([1, 3, 5, 20], prior) < shifted
 
 
+def test_full_model_calendar_choice_keeps_continuity_in_final_comparison(
+    monkeypatch,
+) -> None:
+    base = _state(running_days_28d=10)
+    states = [
+        base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
+        for offset in range(3)
+    ]
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_adaptive_candidate_cost",
+        lambda *args, **kwargs: 0.0,
+    )
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_joint_candidate_program_cost",
+        lambda *args, **kwargs: (0.0, 0.0, 0.0, 0.0),
+    )
+
+    selected = weekly_schedule._adaptive_run_day_offsets_for_frequency(
+        states,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        target_run_count=1,
+        target_distance_range=(3.0, 4.0),
+        horizon_run_count=1,
+        joint_program_scoring=True,
+        prior_run_offsets={1},
+    )
+
+    assert selected == [1]
+
+
 def test_twenty_one_day_plan_is_retained_internally_but_not_serialized() -> None:
     base = _state(running_days_28d=10)
     states = [

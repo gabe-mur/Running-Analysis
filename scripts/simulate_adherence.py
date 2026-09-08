@@ -14,8 +14,13 @@ from run_analysis.adherence_projection import (
 )
 from run_analysis.config import load_config, resolve_project_path
 from run_analysis.db import connect, initialize
-from run_analysis.recommendation_service import current_fitness_state
+from run_analysis.recommendation_service import (
+    current_fitness_state,
+    load_latest_weekly_planning_days,
+    load_latest_weekly_schedule,
+)
 from run_analysis.run_feedback import list_runs
+from run_analysis.weekly_schedule import WEEKLY_PLANNER_VERSION
 
 
 def main() -> None:
@@ -55,6 +60,18 @@ def main() -> None:
         initialize(connection)
         state = current_fitness_state(connection, config)
         runs = runs_from_summaries(list_runs(connection, limit=5000))
+        initial_schedule = load_latest_weekly_schedule(connection)
+        if (
+            initial_schedule is not None
+            and initial_schedule.planner_version == WEEKLY_PLANNER_VERSION
+        ):
+            initial_schedule = initial_schedule.model_copy(
+                update={
+                    "planning_days": load_latest_weekly_planning_days(connection)
+                }
+            )
+        else:
+            initial_schedule = None
     weeks = simulate_adherence(
         state,
         runs,
@@ -67,6 +84,7 @@ def main() -> None:
             if args.mode == "human"
             else None
         ),
+        initial_schedule=initial_schedule,
     )
     print(
         "week | start | committed attempts/actual | target | prescribed | actual | "

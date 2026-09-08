@@ -17,6 +17,7 @@ from run_analysis.adherence_projection import (
     _state_at,
     simulate_adherence,
 )
+from run_analysis.weekly_schedule import derive_weekly_target
 from run_analysis.web.schemas import (
     ConfidenceLevel,
     QualitySessionType,
@@ -97,6 +98,52 @@ def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> Non
     assert len(completed) == 1
     assert completed[0].start_time == morning
     assert completed[0].distance_miles == 3.5
+
+
+def test_projection_passes_saved_plan_to_first_replan(monkeypatch) -> None:
+    template = _state()
+    captured_prior_schedules = []
+    initial = WeeklyScheduleResponse(
+        generated_at=template.as_of - timedelta(hours=1),
+        start_date=template.as_of.date(),
+        end_date=template.as_of.date() + timedelta(days=6),
+        target_run_count=0,
+        target_distance_range_miles=(0.0, 0.0),
+        target_evidence=derive_weekly_target([], template.as_of, CONFIG)[2],
+        run_count=0,
+        projected_distance_range_miles=(0.0, 0.0),
+        summary="Saved-plan fixture.",
+        days=[],
+        planning_days=[],
+    )
+
+    def empty_schedule(daily_states, *args, **kwargs):
+        captured_prior_schedules.append(kwargs.get("prior_schedule"))
+        generated_at = daily_states[0].as_of
+        return initial.model_copy(
+            update={
+                "generated_at": generated_at,
+                "start_date": generated_at.date(),
+                "end_date": generated_at.date() + timedelta(days=6),
+            }
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        empty_schedule,
+    )
+
+    simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        initial_schedule=initial,
+    )
+
+    assert captured_prior_schedules[0] is initial
+    assert captured_prior_schedules[1] is not initial
 
 
 def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(

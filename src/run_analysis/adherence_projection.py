@@ -38,6 +38,7 @@ from .web.schemas import (
     SessionDifficulty,
     TrailingDayActivity,
     WorkoutType,
+    WeeklyScheduleResponse,
     ZoneBreakdown,
 )
 
@@ -687,6 +688,7 @@ def simulate_adherence(
     replan_interval_days: int = 1,
     human_profile: HumanAdherenceProfile | None = None,
     overload_profile: OverloadAdherenceProfile | None = None,
+    initial_schedule: WeeklyScheduleResponse | None = None,
 ) -> list[ProjectionWeek]:
     """Roll the real planner forward under controlled adherence behavior.
 
@@ -751,7 +753,12 @@ def simulate_adherence(
         time.min,
         tzinfo=start_at.tzinfo,
     )
-    previous_schedule = None
+    # The live app replans against its saved full-horizon schedule. Starting a
+    # projection from an empty prior plan makes the first simulated reload a
+    # materially different decision and can manufacture an opening-boundary
+    # move that production continuity would have priced. Tests may omit this
+    # when they intentionally want a clean-room projection.
+    previous_schedule = initial_schedule
     for plan_offset in range(0, total_days, replan_interval_days):
         plan_start = start_at + timedelta(days=plan_offset)
         commit_end = min(

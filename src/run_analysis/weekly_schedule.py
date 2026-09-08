@@ -65,7 +65,7 @@ from .web.schemas import (
 
 VISIBLE_HORIZON_DAYS = 7
 PLANNING_HORIZON_DAYS = 21
-WEEKLY_PLANNER_VERSION = 86
+WEEKLY_PLANNER_VERSION = 87
 MAX_ADAPTIVE_CANDIDATES = 64
 MAX_HORIZON_COUNT_OPTIONS = 14
 ALLOCATION_ASSIGNMENTS_PER_TOTAL = 16
@@ -2845,7 +2845,8 @@ def _adaptive_run_day_offsets_for_frequency(
                         joint_cost,
                         recovery_calendar_cost,
                         ordinary_easy_midpoint,
-                    ),
+                    )
+                    + _plan_continuity_cost(offsets, prior_run_offsets),
                     offsets,
                 )
             )
