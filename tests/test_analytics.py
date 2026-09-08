@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from run_analysis.analytics import build_fitness_analytics, build_fitness_analytics_set
 
 
@@ -92,6 +94,76 @@ def test_gradual_change_has_a_separate_within_window_trajectory() -> None:
     assert trend["pace_change_seconds_per_mile"] < 0
     assert trend["directional_interpretation"] == "improving"
     assert trend["evidence_strength"] in {"likely", "clear"}
+
+
+def test_within_window_change_is_not_extrapolated_beyond_observed_span() -> None:
+    runs = [_run(day, 10.0 + day * 0.01) for day in (12, 16, 20, 24, 28)]
+
+    trend = build_fitness_analytics(runs, 28)["within_window_trend"]
+
+    assert trend is not None
+    assert trend["coverage_span_days"] == 16
+    assert trend["pace_change_seconds_per_mile"] == pytest.approx(9.6)
+    assert "observed 16.0-day span" in trend["basis"]
+
+
+def test_period_change_controls_for_different_run_distance_mix() -> None:
+    prior = []
+    current = []
+    for day, distance in zip((0, 7, 14, 21), (6.0, 7.0, 8.0, 9.0)):
+        row = _run(day, 10.0 + 0.1 * distance)
+        row["distance_miles"] = distance
+        prior.append(row)
+    for day, distance in zip((28, 35, 42, 49), (2.0, 3.0, 4.0, 5.0)):
+        row = _run(day, 10.0 + 0.1 * distance)
+        row["distance_miles"] = distance
+        current.append(row)
+
+    change = build_fitness_analytics(prior + current, 28)["change_prior_window"]
+
+    # The raw period means differ by 24 sec/mi, entirely because the second
+    # period contains shorter runs. The adjusted fitness change is zero.
+    assert change is not None
+    assert change["distance_adjusted"] is True
+    assert change["pace_change_seconds_per_mile"] == pytest.approx(0, abs=1e-8)
+    assert change["distance_effect_seconds_per_mile_per_added_mile"] == pytest.approx(6)
+    assert "controlling for run distance" in change["comparison"]
+
+
+def test_period_change_is_withheld_when_distance_and_period_are_inseparable() -> None:
+    runs = []
+    for day in (0, 7, 14, 21):
+        row = _run(day, 10.8)
+        row["distance_miles"] = 8.0
+        runs.append(row)
+    for day in (28, 35, 42, 49):
+        row = _run(day, 10.2)
+        row["distance_miles"] = 2.0
+        runs.append(row)
+
+    analysis = build_fitness_analytics(runs, 28)
+
+    assert analysis["change_prior_window"] is None
+    assert analysis["status"] == "insufficient_comparison"
+
+
+def test_within_window_trajectory_controls_for_run_distance() -> None:
+    runs = []
+    for day, distance in zip((0, 4, 8, 12, 16), (3.0, 6.0, 4.0, 2.0, 5.0)):
+        row = _run(day, 10.0 + 0.1 * distance)
+        row["distance_miles"] = distance
+        runs.append(row)
+    for day, distance in zip((28, 32, 36, 40, 44), (2.0, 5.0, 3.0, 6.0, 4.0)):
+        row = _run(day, 10.0 + 0.1 * distance)
+        row["distance_miles"] = distance
+        runs.append(row)
+
+    trend = build_fitness_analytics(runs, 28)["within_window_trend"]
+
+    assert trend is not None
+    assert trend["distance_adjusted"] is True
+    assert trend["pace_change_seconds_per_mile"] == pytest.approx(0, abs=1e-8)
+    assert trend["distance_effect_seconds_per_mile_per_added_mile"] == pytest.approx(6)
 
 
 def test_historical_evaluation_measures_freshness_at_that_time() -> None:

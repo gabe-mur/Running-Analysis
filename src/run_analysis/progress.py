@@ -206,6 +206,8 @@ def _scored_runs(
                     "standardized_pace": float(standardized),
                     "uncertainty_95": uncertainty,
                     "trend_weight": trend_weight,
+                    "distance_miles": float(row["total_distance_m"] or 0)
+                    / METERS_PER_MILE,
                 }
             )
         points.append(
@@ -235,6 +237,8 @@ def _scored_runs(
                         "standardized_pace": steady_pace,
                         "uncertainty_95": steady_uncertainty,
                         "trend_weight": trend_weight,
+                        "distance_miles": float(row["total_distance_m"] or 0)
+                        / METERS_PER_MILE,
                     }
                 )
             steady_points.append(
@@ -387,6 +391,21 @@ def _change_evidence(
         run_count=int(value.get("run_count", 1)),
         comparison_run_count=comparison_run_count,
         coverage_fraction=float(value.get("coverage_fraction", 0.0)),
+        distance_adjusted=bool(value.get("distance_adjusted", False)),
+        distance_effect_seconds_per_mile_per_added_mile=_optional_float(
+            value.get("distance_effect_seconds_per_mile_per_added_mile")
+        ),
+        distance_effect_uncertainty_95_seconds_per_mile_per_added_mile=_optional_float(
+            value.get(
+                "distance_effect_uncertainty_95_seconds_per_mile_per_added_mile"
+            )
+        ),
+        current_weighted_distance_miles=_optional_float(
+            value.get("current_weighted_distance_miles")
+        ),
+        prior_weighted_distance_miles=_optional_float(
+            value.get("prior_weighted_distance_miles")
+        ),
     )
 
 
@@ -622,7 +641,8 @@ def build_progress(
     trend = FitnessTrend.INSUFFICIENT_DATA
     confidence = ConfidenceLevel.UNAVAILABLE
     definition = (
-        f"Estimated pace at {target_hr:g} bpm and reference conditions "
+        f"Estimated pace at {target_hr:g} bpm, minute {reference_minutes:g}, "
+        "and reference conditions "
         f"over the last {window_days} days"
     )
     current_standardized = previous_standardized = None
@@ -658,7 +678,9 @@ def build_progress(
                     ),
                 },
                 basis=(
-                    f"last {window_days} days versus the preceding "
+                    str(change.get("comparison"))
+                    if change.get("comparison")
+                    else f"last {window_days} days versus the preceding "
                     f"{window_days} days"
                 ),
                 confidence=confidence,
@@ -681,7 +703,12 @@ def build_progress(
             )
             within_window_trend = _change_evidence(
                 slope,
-                basis=f"weighted trajectory within the last {window_days} days",
+                basis=str(
+                    slope.get(
+                        "basis",
+                        f"weighted trajectory within the last {window_days} days",
+                    )
+                ),
                 confidence=slope_confidence,
             )
 

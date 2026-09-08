@@ -20,8 +20,8 @@ The states answer "what is my training doing right now", not "how fit am I":
 ``recovering``
     Current health status or recent responses indicate recovery.
 ``strained``
-    Acute load is high, or the most recent comparable effort was unusually
-    costly.
+    Acute load is high, or independent response signals agree that the most
+    recent effort was unusually costly.
 ``underloaded``
     Sustained running materially below retained capacity for long enough to
     matter.
@@ -58,7 +58,7 @@ class StatusRule:
 STATUS_RULES: tuple[StatusRule, ...] = (
     StatusRule("status_insufficient_evidence", "Too few recent runs or no demonstrated capacity to classify training."),
     StatusRule("status_recovering", "Current health status, or a health-tagged run not yet followed by normal running, indicates recovery."),
-    StatusRule("status_strained", "Acute load is high relative to demonstrated capacity, or the latest comparable effort was unusually costly."),
+    StatusRule("status_strained", "Acute load is high relative to demonstrated capacity, or an unusually costly effort is corroborated by high drift."),
     StatusRule("status_rebuilding", "Sustained running is below retained capacity after a gap, while continuously decayed training load is rebuilding."),
     StatusRule("status_underloaded", "Sustained running has been materially below retained capacity long enough to matter."),
     StatusRule("status_building", "Load sits near demonstrated capacity with quality exposure and no recovery or strain flags."),
@@ -184,9 +184,15 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
         )
         return _summary(TrainingStatus.RECOVERING, detail, ConfidenceLevel.HIGH, trace, state)
 
-    # 3. Strain outranks progression: a costly response matters more than
-    #    whether the mileage chart is pointing the right way.
-    strained = (acute_ratio is not None and acute_ratio >= high_load_ratio) or costly or high_drift
+    # 3. Strain outranks progression, but a single slow pace-at-HR observation
+    #    is recent-form evidence rather than proof that training load itself is
+    #    excessive. Require either high accumulated load or corroboration from
+    #    an independently calculated within-run drift response.
+    response_strain = costly and high_drift
+    strained = (
+        (acute_ratio is not None and acute_ratio >= high_load_ratio)
+        or response_strain
+    )
     trace.append(
         _trace(
             "status_strained",
@@ -197,6 +203,7 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
             high_load_ratio=high_load_ratio,
             recent_performance_anomaly=state.recent_performance_anomaly,
             last_run_drift_percent=state.last_run_drift_percent,
+            costly_response_corroborated=response_strain,
         )
     )
     if strained:
@@ -205,9 +212,9 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
             reasons.append(
                 f"continuously decayed training fatigue is {acute_ratio * 100:.0f}% of the {capacity:.1f} mi/week you have demonstrated"
             )
-        if costly:
+        if response_strain:
             reasons.append("your latest comparable run cost more effort than usual")
-        if high_drift:
+        if response_strain:
             reasons.append(f"the latest run drifted {state.last_run_drift_percent:.1f}% in its second half")
         return _summary(
             TrainingStatus.STRAINED,

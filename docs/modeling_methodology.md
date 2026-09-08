@@ -155,8 +155,12 @@ Minute 20 is a statistical comparison point, not a physiological threshold. It
 is late enough to reduce warm-up transients, early enough to limit late-run
 fatigue, and directly interpolated by most historical runs. Limited extrapolation
 widens uncertainty; activities more than five minutes short of supporting the
-reference are unscored. Total duration is never used as an adjustment, and
-cardiac drift remains a separate diagnostic.
+reference are unscored. Eligible evidence through minute 60 can improve the
+estimate, but its effective sample size is capped so a long run cannot create
+artificial precision. Total duration is not inserted as another correction:
+doing so would risk treating the physiological demands and pacing choices of
+long running as a measurement error. Cardiac drift and demonstrated duration
+remain separate durability signals.
 
 ## Interpretation
 
@@ -166,6 +170,13 @@ scored run has
 an auditable chain:
 
 `Raw pace @target_hr → environmental adjustment → standardized pace @target_hr`
+
+Standardizing within-run time makes short and long outings more comparable, but
+does not make them physiologically interchangeable. A short run can avoid
+late-run fatigue, while a long run demonstrates durability that this score does
+not award as faster pace. The dashboard therefore interprets the efficiency
+trend alongside duration, load, recovery, and drift rather than allowing a
+sequence of short runs to stand in for endurance progress.
 
 The environmental adjustment is decomposed into grade, temperature, dew point,
 wind, and drift. Each part carries its own evidence label and personal-data
@@ -198,6 +209,18 @@ period, which can detect gradual movement that two adjacent averages obscure.
 If both are directional but disagree, the display reports no clear change
 rather than choosing one silently.
 
+The adjacent-period test estimates run distance and period simultaneously. Its
+distance effect, including its uncertainty, is then carried into the
+within-period trajectory instead of being re-estimated from a much smaller
+recent slice. This prevents a block of short outings from looking like improved
+fitness merely because long-run pacing is slower from the start. The adjustment
+is fit inside the comparison, not stored as a permanent seconds-per-mile reward
+for long running. When period and distance are too closely aligned to
+distinguish, the design is rank-deficient and the app withholds the directional
+comparison. Per-run points remain the observed minute-20-standardized
+estimates, and durability remains a separate signal rather than being converted
+into pace.
+
 Evidence labels make the statistical claim explicit. **Likely** means at least
 80% one-sided probability in one direction. **Clear** means the estimated
 change excludes zero at the 95% two-sided level. Sparse or stale coverage cannot
@@ -219,7 +242,7 @@ signals stay visible underneath.
 | Maintaining | Steady load and performance, no strong signal either way |
 | Rebuilding | Below retained capacity, but the most recent week is climbing back |
 | Recovering | Current health check-in, or a health-tagged run not yet followed by three normal runs |
-| Strained | Acute week at or above the configured high-load ratio, an unusually costly latest response, or high second-half drift |
+| Strained | Continuously decayed load at or above the configured high-load ratio, or an unusually costly latest response corroborated by high second-half drift |
 | Underloaded | Sustained running below 70% of retained capacity and not climbing |
 | Not enough data | Fewer than four activities in 28 days, or no demonstrated capacity |
 
@@ -550,6 +573,14 @@ for coaching as easy (Z1+Z2), moderate (Z3), and hard (Z4+Z5). The engine flags
 moderate-intensity leakage but does not enforce a universal 80/20 quota. The
 observational endurance literature uses several incompatible zone systems, so
 the interface keeps this athlete's definitions explicit.
+
+Recorded HR-zone time always remains the source of truth for training load and
+recovery. For the narrower question of whether an aerobic prescription was
+executed as intended, moderate-zone time receives continuous terrain context.
+The share plausibly attributable to climbing is estimated from the measured
+grade-cost ratio on moderate-HR segments; there is no binary "hilly" cutoff.
+Both raw and terrain-contextual adherence are shown, and the terrain adjustment
+never erases the physiological cost of the climb from later planning.
 
 ## Recovery model
 

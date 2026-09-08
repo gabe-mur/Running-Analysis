@@ -16,6 +16,7 @@ from .run_feedback import get_run_feedback, list_runs
 from .web.schemas import DashboardResponse
 from .web.schemas import (
     ConfidenceLevel,
+    ChangeEvidenceStrength,
     FitnessHorizon,
     FitnessInterpretation,
     FitnessSignal,
@@ -42,13 +43,38 @@ def _horizon(label: str, progress) -> FitnessHorizon:
         and within_directional
         and period_change.direction != within_change.direction
     )
+    period_supports_within = bool(
+        period_change
+        and within_change
+        and (
+            (
+                within_change.direction == FitnessTrend.IMPROVING
+                and period_change.probability_faster >= 0.5
+            )
+            or (
+                within_change.direction == FitnessTrend.DECLINING
+                and period_change.probability_faster <= 0.5
+            )
+        )
+    )
+    # A likely (80%) within-window slope is useful recent-form evidence, but it
+    # should not by itself overturn an adjacent-window comparison whose point
+    # estimate leans the other way. A clear (95%) slope can stand alone.
+    within_can_lead = bool(
+        within_directional
+        and (
+            within_change.evidence == ChangeEvidenceStrength.CLEAR
+            or period_change is None
+            or period_supports_within
+        )
+    )
     selected_change = (
         None
         if conflict
         else period_change
         if period_directional
         else within_change
-        if within_directional
+        if within_can_lead
         else period_change
     )
     return FitnessHorizon(
@@ -448,7 +474,13 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         summary = "Pace at the same heart rate and your demonstrated capacity are both about the same."
     elif aerobic_trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
         headline = "There is no clear fitness change yet."
-        summary = "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
+        summary = (
+            "The latest run was less efficient at the comparison heart rate, but one "
+            "fatigue-sensitive response does not establish a fitness decline; the "
+            "broader period comparison remains essentially unchanged."
+            if state.recent_performance_anomaly == "unusually_costly"
+            else "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
+        )
     else:
         headline = "Your recent fitness signals are mixed."
         summary = "Aerobic efficiency, recovery, and training volume are pointing in different directions."
@@ -506,6 +538,8 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         illness_context=illness_context,
         caveats=[
             "The dashboard verdict uses the robust all-window model; the strict two-minute benchmark is a validation signal, not the primary estimate.",
+            "Period changes and within-period trajectories control for run-distance mix; if distance and time period cannot be separated, no directional claim is made.",
+            "Runs are compared near the configured point within a run, but total-duration and pacing-strategy differences can still affect the observation; durability is reported separately.",
             "More mileage and longer runs demonstrate greater training capacity, not automatically faster pace at a fixed heart rate.",
             "A respiratory illness can temporarily alter performance; this app records that context but does not diagnose recovery.",
         ],

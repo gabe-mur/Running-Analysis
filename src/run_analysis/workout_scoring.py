@@ -31,6 +31,7 @@ from .web.schemas import (
     WorkoutAnalysisMetric,
     WorkoutType,
 )
+from .terrain_intensity import terrain_moderate_context
 
 
 def _pace(seconds: float, distance_m: float) -> float | None:
@@ -641,6 +642,24 @@ def _prescription_analysis(
         if prescribed_aerobic and known_hr_minutes > 0
         else None
     )
+    terrain = terrain_moderate_context(
+        connection,
+        activity_id,
+        z3_low_bpm=float(config["zones"]["z3"][0]),
+        z3_high_bpm=float(config["zones"]["z3"][1]),
+        raw_moderate_minutes=difficulty.zone_breakdown.moderate_minutes,
+    )
+    effective_above_intensity_minutes = (
+        terrain.effective_moderate_minutes
+        + difficulty.zone_breakdown.hard_minutes
+        if prescribed_aerobic and known_hr_minutes > 0
+        else None
+    )
+    terrain_adjusted_adherence = (
+        1.0 - effective_above_intensity_minutes / known_hr_minutes
+        if effective_above_intensity_minutes is not None and known_hr_minutes > 0
+        else None
+    )
     # Use the same aerobic-control standard as the ordinary workout analysis:
     # recovery runs are deliberately stricter; easy and long runs may include
     # limited normal HR spillover without being declared a different workout.
@@ -648,8 +667,8 @@ def _prescription_analysis(
         0.90 if prescription.workout_type == WorkoutType.RECOVERY else 0.80
     )
     aerobic_intensity_close = (
-        aerobic_intensity_adherence is not None
-        and aerobic_intensity_adherence >= aerobic_target_share
+        terrain_adjusted_adherence is not None
+        and terrain_adjusted_adherence >= aerobic_target_share
     )
     work_close = bool(
         (
@@ -673,19 +692,31 @@ def _prescription_analysis(
     duration_close = duration_delta_minutes <= 1e-9
     if prescribed_aerobic and not aerobic_intensity_close and aerobic_intensity_adherence is not None:
         adherence_percent = aerobic_intensity_adherence * 100
+        adjusted_percent = (terrain_adjusted_adherence or 0.0) * 100
         status = (
             "Distance completed; intensity diverged"
             if distance_close and duration_close
             else "Prescription attempted"
         )
+        terrain_text = (
+            f"Climbing accounts for {terrain.grade_attributed_minutes:.1f} minutes of the moderate response; "
+            f"terrain-adjusted adherence is {adjusted_percent:.1f}%. "
+            if terrain.grade_attributed_minutes > 0
+            else ""
+        )
         summary = (
             "The upload matches the planned aerobic workout, but "
             f"{above_prescribed_intensity_minutes:.1f} minutes were above Z2 "
-            f"({adherence_percent:.0f}% remained at or below Z2). "
+            f"({adherence_percent:.0f}% raw aerobic HR time). "
+            f"{terrain_text}"
             "It stays matched to the aerobic prescription while the observed "
             "heart-rate load counts toward recovery."
         )
-        source = "heart_rate_zone_adherence"
+        source = (
+            "heart_rate_with_grade_context"
+            if terrain.grade_attributed_minutes > 0
+            else "heart_rate_zone_adherence"
+        )
     elif prescribed_aerobic and aerobic_intensity_adherence is None:
         status = "Structure completed"
         summary = (
@@ -693,6 +724,26 @@ def _prescription_analysis(
             "heart-rate coverage is insufficient to verify intensity execution."
         )
         source = "heart_rate_unavailable"
+    elif (
+        prescribed_aerobic
+        and aerobic_intensity_adherence is not None
+        and aerobic_intensity_adherence < aerobic_target_share
+        and aerobic_intensity_close
+    ):
+        adjusted_percent = (terrain_adjusted_adherence or 0.0) * 100
+        status = (
+            "Completed as prescribed"
+            if distance_close and duration_close
+            else "Structure completed"
+        )
+        summary = (
+            f"Raw HR time was {aerobic_intensity_adherence * 100:.0f}% aerobic. "
+            f"Climbing accounts for {terrain.grade_attributed_minutes:.1f} minutes "
+            f"of the moderate response, bringing terrain-adjusted adherence to "
+            f"{adjusted_percent:.1f}%. The full recorded heart-rate load still "
+            "counts toward recovery."
+        )
+        source = "heart_rate_with_grade_context"
     elif work_close and distance_close and duration_close:
         status = "Completed as prescribed"
         summary = (
@@ -736,7 +787,14 @@ def _prescription_analysis(
             if aerobic_intensity_adherence is not None
             else None
         ),
+        terrain_adjusted_aerobic_adherence_percent=(
+            terrain_adjusted_adherence * 100
+            if terrain_adjusted_adherence is not None
+            else None
+        ),
         above_prescribed_intensity_minutes=above_prescribed_intensity_minutes,
+        effective_above_prescribed_intensity_minutes=effective_above_intensity_minutes,
+        grade_attributed_moderate_minutes=terrain.grade_attributed_minutes,
         detection_source=source,
     )
 

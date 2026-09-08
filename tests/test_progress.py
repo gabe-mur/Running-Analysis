@@ -401,6 +401,7 @@ def test_progress_copy_follows_the_configured_comparison_heart_rate(tmp_path: Pa
         )
     assert progress.target_hr_bpm == 147
     assert "147 bpm" in progress.definition
+    assert "minute 18" in progress.definition
     assert "145" not in progress.definition
     assert "147 bpm" in progress.steady_aerobic.definition
     assert "minute 18" in progress.steady_aerobic.definition

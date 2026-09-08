@@ -133,15 +133,25 @@ def test_continuous_fatigue_prevents_a_boxcar_boundary_strain_label() -> None:
     assert summary.status != TrainingStatus.STRAINED
 
 
-def test_an_unusually_costly_response_is_strained_even_at_normal_volume() -> None:
+def test_one_unusually_costly_response_does_not_label_normal_load_strained() -> None:
     summary = build_training_status(_state(recent_performance_anomaly="unusually_costly"))
+    assert summary.status != TrainingStatus.STRAINED
+
+
+def test_one_high_drift_response_does_not_label_normal_load_strained() -> None:
+    summary = build_training_status(_state(last_run_drift_percent=12.0))
+    assert summary.status != TrainingStatus.STRAINED
+
+
+def test_costly_response_and_high_drift_together_are_strained() -> None:
+    summary = build_training_status(
+        _state(
+            recent_performance_anomaly="unusually_costly",
+            last_run_drift_percent=12.0,
+        )
+    )
     assert summary.status == TrainingStatus.STRAINED
     assert "cost more effort" in summary.detail
-
-
-def test_high_second_half_drift_is_strained() -> None:
-    summary = build_training_status(_state(last_run_drift_percent=12.0))
-    assert summary.status == TrainingStatus.STRAINED
     assert "drifted" in summary.detail
 
 

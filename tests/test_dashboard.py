@@ -105,6 +105,30 @@ def test_dashboard_horizon_does_not_hide_conflicting_methods() -> None:
     assert horizon.trend == FitnessTrend.UNCERTAIN
 
 
+def test_likely_slope_does_not_override_opposite_period_point_estimate() -> None:
+    from types import SimpleNamespace
+
+    from run_analysis.dashboard import _horizon
+    from run_analysis.web.schemas import ConfidenceLevel, FitnessTrend
+
+    horizon = _horizon(
+        "Recent",
+        SimpleNamespace(
+            window_days=28,
+            # Inconclusive, but its point estimate leans faster.
+            period_change=_aerobic_change("uncertain", "inconclusive", -2),
+            within_window_trend=_aerobic_change("declining", "likely", 53),
+            fitness_trend=FitnessTrend.UNCERTAIN,
+            fitness_confidence=ConfidenceLevel.HIGH,
+            pace_change_seconds_per_mile=-2,
+            current_pace=None,
+        ),
+    )
+
+    assert horizon.trend == FitnessTrend.UNCERTAIN
+    assert horizon.pace_change_seconds_per_mile == -2
+
+
 def _state(**changes):
     """Minimal fitness state for the recent-form rule."""
     from types import SimpleNamespace

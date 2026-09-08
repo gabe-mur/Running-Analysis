@@ -82,12 +82,107 @@ def _weighted_line(
     return intercept, slope, x_mean, x_variance_sum
 
 
+def _weighted_plane(
+    x_values: list[float],
+    y_values: list[float],
+    context_values: list[float],
+    weights: list[float],
+) -> tuple[float, float, float, float, float] | None:
+    """Fit ``y = intercept + x + context`` and retain x's unique support.
+
+    The final value is the weighted variance in ``x`` left after projecting it
+    on the context covariate.  It approaches zero when run distance and period
+    (or run distance and date) are inseparable, which is exactly when a
+    distance-adjusted fitness claim should be withheld.
+    """
+
+    weight_sum = sum(weights)
+    if weight_sum <= 0:
+        return None
+    x_mean = sum(w * x for w, x in zip(weights, x_values)) / weight_sum
+    y_mean = sum(w * y for w, y in zip(weights, y_values)) / weight_sum
+    context_mean = (
+        sum(w * value for w, value in zip(weights, context_values)) / weight_sum
+    )
+    centered_x = [value - x_mean for value in x_values]
+    centered_y = [value - y_mean for value in y_values]
+    centered_context = [value - context_mean for value in context_values]
+    sxx = sum(w * value**2 for w, value in zip(weights, centered_x))
+    scc = sum(w * value**2 for w, value in zip(weights, centered_context))
+    sxc = sum(
+        w * x * context
+        for w, x, context in zip(weights, centered_x, centered_context)
+    )
+    sxy = sum(
+        w * x * y for w, x, y in zip(weights, centered_x, centered_y)
+    )
+    scy = sum(
+        w * context * y
+        for w, context, y in zip(weights, centered_context, centered_y)
+    )
+    if sxx <= 1e-12 or scc <= 1e-12:
+        return None
+    determinant = sxx * scc - sxc**2
+    scale = max(sxx * scc, 1.0)
+    if determinant <= 1e-12 * scale:
+        return None
+    x_slope = (sxy * scc - scy * sxc) / determinant
+    context_slope = (scy * sxx - sxy * sxc) / determinant
+    intercept = y_mean - x_slope * x_mean - context_slope * context_mean
+    residual_x_variance_sum = sxx - sxc**2 / scc
+    if residual_x_variance_sum <= 1e-12:
+        return None
+    return (
+        intercept,
+        x_slope,
+        context_slope,
+        x_mean,
+        residual_x_variance_sum,
+    )
+
+
+def _robust_plane(
+    x_values: list[float],
+    y_values: list[float],
+    context_values: list[float],
+    base_weights: list[float],
+    *,
+    robust: bool,
+) -> tuple[tuple[float, float, float, float, float], list[float]] | None:
+    weights = list(base_weights)
+    fitted = _weighted_plane(x_values, y_values, context_values, weights)
+    if fitted is None:
+        return None
+    for _ in range(8 if robust else 0):
+        intercept, x_slope, context_slope, _, _ = fitted
+        residuals = [
+            y - (intercept + x_slope * x + context_slope * context)
+            for x, y, context in zip(x_values, y_values, context_values)
+        ]
+        center = median(residuals)
+        scale = max(
+            5.0 / 60.0,
+            1.4826 * median(abs(residual - center) for residual in residuals),
+        )
+        cutoff = 1.345 * scale
+        weights = [
+            base * min(1.0, cutoff / max(abs(residual), 1e-12))
+            for base, residual in zip(base_weights, residuals)
+        ]
+        fitted = _weighted_plane(x_values, y_values, context_values, weights)
+        if fitted is None:
+            return None
+    return fitted, weights
+
+
 def _window_trend(
     scored: list[dict[str, Any]],
     end: datetime,
     days: int,
     *,
     robust: bool = True,
+    distance_effect_min_mile_per_added_mile: float | None = None,
+    distance_effect_se_min_mile_per_added_mile: float | None = None,
 ) -> dict[str, Any] | None:
     """Fit a measurement-weighted pace trajectory inside one window.
 
@@ -104,7 +199,7 @@ def _window_trend(
     x_values = [(_date(row) - end).total_seconds() / 86400.0 for row in selected]
     if max(x_values) - min(x_values) <= 0:
         return None
-    y_values = [float(row["standardized_pace"]) for row in selected]
+    raw_y_values = [float(row["standardized_pace"]) for row in selected]
     measurement_sigmas = [
         max(
             MIN_MEASUREMENT_SIGMA_MIN_MILE,
@@ -119,6 +214,20 @@ def _window_trend(
     base_weights = [
         context / sigma**2
         for context, sigma in zip(context_weights, measurement_sigmas)
+    ]
+    distance_values = [row.get("distance_miles") for row in selected]
+    distance_adjusted = bool(
+        distance_effect_min_mile_per_added_mile is not None
+        and all(value is not None and float(value) > 0 for value in distance_values)
+    )
+    distance_slope = (
+        float(distance_effect_min_mile_per_added_mile)
+        if distance_adjusted
+        else None
+    )
+    y_values = [
+        pace - (distance_slope or 0.0) * float(distance or 0.0)
+        for pace, distance in zip(raw_y_values, distance_values)
     ]
     weights = list(base_weights)
     fitted = _weighted_line(x_values, y_values, weights)
@@ -136,21 +245,17 @@ def _window_trend(
             1.4826 * median(abs(residual - center) for residual in residuals),
         )
         cutoff = 1.345 * scale
-        huber_factors = [
-            min(1.0, cutoff / max(abs(residual), 1e-12))
-            for residual in residuals
-        ]
         weights = [
-            base * factor for base, factor in zip(base_weights, huber_factors)
+            base * min(1.0, cutoff / max(abs(residual), 1e-12))
+            for base, residual in zip(base_weights, residuals)
         ]
         fitted = _weighted_line(x_values, y_values, weights)
         if fitted is None:
             return None
-
     intercept, slope, x_mean, x_variance_sum = fitted
+    fitted_values = [intercept + slope * x for x in x_values]
     residuals = [
-        value - (intercept + slope * x_value)
-        for x_value, value in zip(x_values, y_values)
+        value - fitted_value for value, fitted_value in zip(y_values, fitted_values)
     ]
     weight_sum = sum(weights)
     effective_n = weight_sum**2 / sum(weight**2 for weight in weights)
@@ -163,13 +268,38 @@ def _window_trend(
         weighted_variance
         / max(1e-12, effective_n * normalized_x_variance)
     )
-    slope_se = sqrt(measurement_slope_se**2 + between_run_slope_se**2)
-    window_change = slope * days
-    window_change_se = slope_se * days
-    directional = _directional_evidence(window_change, window_change_se)
+    distance_calibration_slope_se = 0.0
+    if distance_adjusted and distance_effect_se_min_mile_per_added_mile:
+        distance_line = _weighted_line(
+            x_values,
+            [float(value) for value in distance_values],
+            weights,
+        )
+        if distance_line is not None:
+            distance_per_day = distance_line[1]
+            distance_calibration_slope_se = abs(distance_per_day) * float(
+                distance_effect_se_min_mile_per_added_mile
+            )
+    slope_se = sqrt(
+        measurement_slope_se**2
+        + between_run_slope_se**2
+        + distance_calibration_slope_se**2
+    )
+    # Describe change only across the span actually supported by observations.
+    # Multiplying a 17-day evidence span by a nominal 28-day window exaggerates
+    # the displayed magnitude and creates a hard-window boundary jump after a
+    # break in training. Scaling the estimate and its uncertainty together
+    # preserves the directional probability without extrapolating beyond data.
     coverage_span_days = max(x_values) - min(x_values)
+    window_change = slope * coverage_span_days
+    window_change_se = slope_se * coverage_span_days
+    directional = _directional_evidence(window_change, window_change_se)
     return {
-        "basis": f"weighted slope within the last {days} days",
+        "basis": (
+            f"weighted slope across the observed {coverage_span_days:.1f}-day "
+            f"span within the last {days} days"
+            + (", controlling for run distance" if distance_adjusted else "")
+        ),
         "pace_change_min_mile": window_change,
         "pace_change_seconds_per_mile": window_change * 60.0,
         "uncertainty_95_seconds_per_mile": (
@@ -186,6 +316,18 @@ def _window_trend(
         "coverage_span_days": coverage_span_days,
         "coverage_fraction": min(1.0, coverage_span_days / float(days)),
         "slope_seconds_per_mile_per_day": slope * 60.0,
+        "distance_adjusted": distance_adjusted,
+        "distance_effect_seconds_per_mile_per_added_mile": (
+            distance_slope * 60.0 if distance_slope is not None else None
+        ),
+        "distance_effect_uncertainty_95_seconds_per_mile_per_added_mile": (
+            CLEAR_DIRECTION_Z
+            * float(distance_effect_se_min_mile_per_added_mile)
+            * 60.0
+            if distance_adjusted
+            and distance_effect_se_min_mile_per_added_mile is not None
+            else None
+        ),
         "centered_at_utc": (
             end + timedelta(days=x_mean)
         ).isoformat(),
@@ -302,6 +444,170 @@ def _comparison(
     }
 
 
+def _distance_adjusted_comparison(
+    scored: list[dict[str, Any]],
+    *,
+    current_end: datetime,
+    prior_end: datetime,
+    days: int,
+    current: dict[str, Any],
+    prior: dict[str, Any] | None,
+    label: str,
+    robust: bool,
+) -> dict[str, Any] | None:
+    """Compare two periods while estimating their run-distance effect jointly.
+
+    This is an ANCOVA-style comparison. The period coefficient answers how the
+    two periods differ at the same run distance. If distance and period are
+    inseparable, the fit is rank deficient and no directional claim is made.
+    """
+
+    if prior is None:
+        return None
+    current_start = current_end - timedelta(days=days)
+    prior_start = prior_end - timedelta(days=days)
+    current_rows = [
+        row for row in scored if current_start < _date(row) <= current_end
+    ]
+    prior_rows = [row for row in scored if prior_start < _date(row) <= prior_end]
+    combined = prior_rows + current_rows
+    if (
+        len(current_rows) < 2
+        or len(prior_rows) < 2
+        or not all(
+            row.get("distance_miles") is not None
+            and float(row["distance_miles"]) > 0
+            for row in combined
+        )
+    ):
+        # Legacy/tooling rows may not carry distance. Preserve their existing
+        # aggregate while production data graduate to the stronger comparison.
+        return _comparison(current, prior, label)
+
+    period_values = [0.0] * len(prior_rows) + [1.0] * len(current_rows)
+    pace_values = [float(row["standardized_pace"]) for row in combined]
+    distance_values = [float(row["distance_miles"]) for row in combined]
+    measurement_sigmas = [
+        max(
+            MIN_MEASUREMENT_SIGMA_MIN_MILE,
+            float(row["uncertainty_95"] or 0.0) / CLEAR_DIRECTION_Z,
+        )
+        for row in combined
+    ]
+    context_weights = [
+        max(0.0, min(1.0, float(row.get("trend_weight", 1.0))))
+        for row in combined
+    ]
+    base_weights = [
+        context / sigma**2
+        for context, sigma in zip(context_weights, measurement_sigmas)
+    ]
+    plane = _robust_plane(
+        period_values,
+        pace_values,
+        distance_values,
+        base_weights,
+        robust=robust,
+    )
+    if plane is None:
+        return None
+    fitted, weights = plane
+    intercept, period_change, distance_slope, _, period_variance_sum = fitted
+    residuals = [
+        pace - (intercept + period_change * period + distance_slope * distance)
+        for pace, period, distance in zip(
+            pace_values, period_values, distance_values
+        )
+    ]
+    weight_sum = sum(weights)
+    effective_n = weight_sum**2 / sum(weight**2 for weight in weights)
+    weighted_variance = sum(
+        weight * residual**2 for weight, residual in zip(weights, residuals)
+    ) / weight_sum
+    normalized_period_variance = period_variance_sum / weight_sum
+    measurement_se = sqrt(1.0 / period_variance_sum)
+    between_run_se = sqrt(
+        weighted_variance
+        / max(1e-12, effective_n * normalized_period_variance)
+    )
+    change_se = sqrt(measurement_se**2 + between_run_se**2)
+    period_line_for_distance = _weighted_line(
+        period_values, distance_values, weights
+    )
+    distance_effect_se = None
+    if period_line_for_distance is not None:
+        distance_intercept, distance_by_period, _, _ = period_line_for_distance
+        distance_residual_variance_sum = sum(
+            weight
+            * (distance - (distance_intercept + distance_by_period * period)) ** 2
+            for weight, distance, period in zip(
+                weights, distance_values, period_values
+            )
+        )
+        if distance_residual_variance_sum > 1e-12:
+            distance_measurement_se = sqrt(1.0 / distance_residual_variance_sum)
+            normalized_distance_variance = (
+                distance_residual_variance_sum / weight_sum
+            )
+            distance_between_run_se = sqrt(
+                weighted_variance
+                / max(1e-12, effective_n * normalized_distance_variance)
+            )
+            distance_effect_se = sqrt(
+                distance_measurement_se**2 + distance_between_run_se**2
+            )
+    directional = _directional_evidence(period_change, change_se)
+    direction = (
+        directional["directional_interpretation"]
+        if directional["evidence_strength"] == "clear"
+        else "stable_or_uncertain"
+    )
+    current_weight = sum(weights[len(prior_rows) :])
+    prior_weight = sum(weights[: len(prior_rows)])
+    return {
+        "comparison": f"{label}, controlling for run distance",
+        "pace_change_min_mile": period_change,
+        "pace_change_seconds_per_mile": period_change * 60.0,
+        "uncertainty_95_seconds_per_mile": (
+            directional["uncertainty_95_min_mile"] * 60.0
+        ),
+        "probability_faster": directional["probability_faster"],
+        "direction": direction,
+        "directional_interpretation": directional[
+            "directional_interpretation"
+        ],
+        "evidence_strength": directional["evidence_strength"],
+        "prior": prior,
+        "distance_adjusted": True,
+        "distance_effect_seconds_per_mile_per_added_mile": distance_slope * 60.0,
+        "distance_effect_uncertainty_95_seconds_per_mile_per_added_mile": (
+            CLEAR_DIRECTION_Z * distance_effect_se * 60.0
+            if distance_effect_se is not None
+            else None
+        ),
+        "current_weighted_distance_miles": (
+            sum(
+                weight * distance
+                for weight, distance in zip(
+                    weights[len(prior_rows) :],
+                    distance_values[len(prior_rows) :],
+                )
+            )
+            / current_weight
+        ),
+        "prior_weighted_distance_miles": (
+            sum(
+                weight * distance
+                for weight, distance in zip(
+                    weights[: len(prior_rows)], distance_values[: len(prior_rows)]
+                )
+            )
+            / prior_weight
+        ),
+        "effective_run_count": effective_n,
+    }
+
+
 def build_fitness_analytics(
     runs: list[dict[str, Any]],
     window_days: int = 28,
@@ -335,13 +641,55 @@ def build_fitness_analytics(
     prior_90 = _window_estimate(
         scored, anchor - timedelta(days=90), window_days, minimum_runs=1, robust=robust
     )
-    change_prior = _comparison(current, prior_window, f"preceding {window_days} days")
-    change_90 = _comparison(current, prior_90, f"{window_days}-day fitness 90 days earlier")
+    change_prior = _distance_adjusted_comparison(
+        scored,
+        current_end=anchor,
+        prior_end=anchor - timedelta(days=window_days),
+        days=window_days,
+        current=current,
+        prior=prior_window,
+        label=f"preceding {window_days} days",
+        robust=robust,
+    )
+    change_90 = _distance_adjusted_comparison(
+        scored,
+        current_end=anchor,
+        prior_end=anchor - timedelta(days=90),
+        days=window_days,
+        current=current,
+        prior=prior_90,
+        label=f"{window_days}-day fitness 90 days earlier",
+        robust=robust,
+    )
     within_window_trend = _window_trend(
         scored,
         anchor,
         window_days,
         robust=robust,
+        distance_effect_min_mile_per_added_mile=(
+            float(
+                change_prior[
+                    "distance_effect_seconds_per_mile_per_added_mile"
+                ]
+            )
+            / 60.0
+            if change_prior and change_prior.get("distance_adjusted")
+            else None
+        ),
+        distance_effect_se_min_mile_per_added_mile=(
+            float(
+                change_prior[
+                    "distance_effect_uncertainty_95_seconds_per_mile_per_added_mile"
+                ]
+            )
+            / (CLEAR_DIRECTION_Z * 60.0)
+            if change_prior
+            and change_prior.get(
+                "distance_effect_uncertainty_95_seconds_per_mile_per_added_mile"
+            )
+            is not None
+            else None
+        ),
     )
 
     comparable = [

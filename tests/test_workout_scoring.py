@@ -48,6 +48,13 @@ def _laps_connection() -> sqlite3.Connection:
             distance_m REAL, average_hr_bpm REAL, maximum_hr_bpm REAL
         )"""
     )
+    connection.execute(
+        """CREATE TABLE segments(
+            activity_id INTEGER, moving_time_s REAL, average_hr_bpm REAL,
+            average_grade_percent REAL, metrics_json TEXT,
+            is_pathological INTEGER DEFAULT 0
+        )"""
+    )
     return connection
 
 
@@ -360,6 +367,59 @@ def test_prescribed_aerobic_run_with_normal_spillover_is_completed() -> None:
 
     assert analysis.execution_status == "Completed as prescribed"
     assert analysis.aerobic_intensity_adherence_percent == pytest.approx(84.44, abs=0.01)
+
+
+def test_climbing_context_adjusts_adherence_but_not_recorded_hr_load() -> None:
+    connection = _laps_connection()
+    # A 1.25 energy ratio attributes 20% of this Z3 segment to climbing.
+    connection.execute(
+        "INSERT INTO segments VALUES (1,660,160,4.0,?,0)",
+        ('{"grade_energy_ratio": 1.25}',),
+    )
+    planned_for = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.EASY,
+        title="Easy aerobic run",
+        distance_range_miles=(4.0, 4.5),
+        target_zones=["Z1", "Z2"],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.25,
+        moving_minutes=50,
+        elapsed_minutes=50,
+        stopped_minutes=0,
+        zone_load=105,
+        zone_breakdown=ZoneBreakdown(
+            easy_minutes=39,
+            moderate_minutes=11,
+            hard_minutes=0,
+        ),
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [154, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=1,
+        distance_delta_miles=0,
+        match_confidence="high",
+    )
+
+    assert analysis.aerobic_intensity_adherence_percent == pytest.approx(78)
+    assert analysis.grade_attributed_moderate_minutes == pytest.approx(2.2)
+    assert analysis.terrain_adjusted_aerobic_adherence_percent == pytest.approx(82.4)
+    assert analysis.effective_above_prescribed_intensity_minutes == pytest.approx(8.8)
+    assert analysis.execution_status == "Completed as prescribed"
+    # Recovery's recorded difficulty object is intentionally untouched.
+    assert difficulty.zone_load == 105
+    assert difficulty.zone_breakdown.moderate_minutes == 11
 
 
 def test_threshold_analysis_detects_sustained_manual_lap_without_saved_plan() -> None:

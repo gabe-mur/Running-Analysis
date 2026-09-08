@@ -458,7 +458,10 @@ class PrescriptionMatchAnalysis(ApiModel):
     target_work_minutes: float | None = Field(default=None, ge=0)
     detected_work_minutes: float | None = Field(default=None, ge=0)
     aerobic_intensity_adherence_percent: float | None = Field(default=None, ge=0, le=100)
+    terrain_adjusted_aerobic_adherence_percent: float | None = Field(default=None, ge=0, le=100)
     above_prescribed_intensity_minutes: float | None = Field(default=None, ge=0)
+    effective_above_prescribed_intensity_minutes: float | None = Field(default=None, ge=0)
+    grade_attributed_moderate_minutes: float = Field(default=0, ge=0)
     detection_source: str
 
 
@@ -547,6 +550,13 @@ class AerobicChangeEvidence(ApiModel):
     run_count: int = Field(ge=1)
     comparison_run_count: int | None = Field(default=None, ge=1)
     coverage_fraction: float = Field(ge=0, le=1)
+    distance_adjusted: bool = False
+    distance_effect_seconds_per_mile_per_added_mile: float | None = None
+    distance_effect_uncertainty_95_seconds_per_mile_per_added_mile: float | None = Field(
+        default=None, ge=0
+    )
+    current_weighted_distance_miles: float | None = Field(default=None, ge=0)
+    prior_weighted_distance_miles: float | None = Field(default=None, ge=0)
 
 
 class FitnessBenchmarkSummary(ApiModel):

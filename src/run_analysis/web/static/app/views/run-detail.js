@@ -26,7 +26,7 @@ function renderWorkoutAnalysis(analysis) {
   if (!analysis) return "";
   const prescribed = analysis.prescription_match;
   const prescriptionDose = prescribed && Number.isFinite(prescribed.aerobic_intensity_adherence_percent)
-    ? `<li><span>Intensity execution</span><strong>${number(prescribed.aerobic_intensity_adherence_percent, 0)}% at or below Z2</strong><small>${number(prescribed.above_prescribed_intensity_minutes, 1)} min above the prescribed aerobic intensity</small></li>`
+    ? `<li><span>Intensity execution</span><strong>${number(prescribed.aerobic_intensity_adherence_percent, 0)}% raw aerobic HR time</strong><small>${Number.isFinite(prescribed.terrain_adjusted_aerobic_adherence_percent) && prescribed.grade_attributed_moderate_minutes > 0 ? `${number(prescribed.terrain_adjusted_aerobic_adherence_percent, 1)}% after terrain context · ${number(prescribed.grade_attributed_moderate_minutes, 1)} min attributed to climbing · ` : ""}${number(prescribed.above_prescribed_intensity_minutes, 1)} raw min above Z2; all recorded HR load counts toward recovery</small></li>`
     : prescribed
       ? `<li><span>Quality work</span><strong>${Number.isFinite(prescribed.detected_work_minutes) ? `${number(prescribed.detected_work_minutes, 1)} min detected` : "Not isolated"}</strong><small>${Number.isFinite(prescribed.target_work_minutes) ? `${number(prescribed.target_work_minutes, 0)} min prescribed · ` : ""}${escapeHtml(prescribed.detection_source.replaceAll("_", " "))}</small></li>`
       : "";

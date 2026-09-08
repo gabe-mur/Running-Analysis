@@ -11,6 +11,7 @@ from .easy_baseline import recency_weighted_easy_distance
 from .progress import PreparedProgressData, build_progress
 from .recovery import athlete_relative_session_load, cumulative_recovery_load
 from .run_feedback import get_run_feedback, list_runs
+from .terrain_intensity import terrain_moderate_context
 from .web.schemas import (
     ConfidenceLevel,
     ContextEvidence,
@@ -105,7 +106,12 @@ def _performance_anomaly(points) -> str:
     return "within_recent_range"
 
 
-def _unplanned_moderate_context(runs, as_of: datetime) -> tuple[float | None, int]:
+def _unplanned_moderate_context(
+    connection: sqlite3.Connection,
+    runs,
+    as_of: datetime,
+    config: dict,
+) -> tuple[float | None, int]:
     """Z3 share from normal-health, non-quality running only.
 
     Planned quality is not "leakage," and illness-affected HR elevation is
@@ -128,7 +134,15 @@ def _unplanned_moderate_context(runs, as_of: datetime) -> tuple[float | None, in
             continue
         zones = run.session_difficulty.zone_breakdown.zone_seconds
         evidence_runs += 1
-        moderate += float(zones.get("z3", 0) or 0)
+        raw_moderate_minutes = float(zones.get("z3", 0) or 0) / 60.0
+        terrain = terrain_moderate_context(
+            connection,
+            run.activity_id,
+            z3_low_bpm=float(config["zones"]["z3"][0]),
+            z3_high_bpm=float(config["zones"]["z3"][1]),
+            raw_moderate_minutes=raw_moderate_minutes,
+        )
+        moderate += terrain.effective_moderate_minutes * 60.0
         known += sum(
             float(zones.get(name, 0) or 0)
             for name in ("below_z1", "z1", "z2", "z3", "z4", "z5", "above_z5")
@@ -378,7 +392,7 @@ def build_fitness_state(
     if health_status == CurrentHealthStatus.NORMAL:
         blind_spots.append("A 'normal' check-in is not medical clearance and does not reveal unreported pain or shortness of breath.")
     unplanned_moderate, unplanned_moderate_runs = _unplanned_moderate_context(
-        runs, evaluation_time
+        connection, runs, evaluation_time, config
     )
     weather_exposure = _weather_exposure_baseline(
         connection, runs, evaluation_time

@@ -16,27 +16,16 @@ export async function renderDashboard() {
   const weekly = dashboard.weekly_schedule;
   const planningMode = weekly?.target_evidence?.planning_mode ?? "established";
   const directional = (value) => ["improving", "declining"].includes(value?.direction);
-  const horizonChange = (horizon) => {
-    const period = horizon?.period_change;
-    const slope = horizon?.within_window_trend;
-    if (directional(period) && directional(slope) && period.direction !== slope.direction) return null;
-    return directional(period) ? period : directional(slope) ? slope : period;
-  };
+  const horizonChange = (horizon) => [horizon?.period_change, horizon?.within_window_trend]
+    .find((value) => value?.direction === horizon?.trend) ?? null;
   const shortHorizon = interpretation.short_term;
   const longHorizon = interpretation.long_term;
-  const shortChange = horizonChange(shortHorizon);
-  const longChange = horizonChange(longHorizon);
-  const horizonConflict = directional(shortChange)
-    && directional(longChange)
-    && shortChange.direction !== longChange.direction;
-  const displayChange = horizonConflict
-    ? null
-    : directional(shortChange)
-      ? shortChange
-      : directional(longChange)
-        ? longChange
-        : shortChange;
-  const displayTrend = horizonConflict ? "uncertain" : displayChange?.direction ?? shortHorizon.trend;
+  const aerobicSignal = interpretation.signals.find((signal) => signal.label === "Aerobic efficiency");
+  const displayTrend = aerobicSignal?.trend ?? shortHorizon.trend;
+  const displayChange = directional({ direction: displayTrend })
+    ? [horizonChange(shortHorizon), horizonChange(longHorizon)]
+      .find((value) => value?.direction === displayTrend) ?? null
+    : null;
   const change = displayChange?.pace_change_seconds_per_mile;
   const dashboardTrend = displayChange?.evidence === "likely" && displayTrend === "improving"
     ? "Likely improving"
