@@ -55,7 +55,7 @@ RULE_CATALOG: tuple[RuleDefinition, ...] = (
     RuleDefinition("recent_recovery_load", "Athlete-relative session load decays continuously; easy and taxing workouts use different readiness levels."),
     RuleDefinition("high_recent_load", "High recent load combines retained mileage capacity with confidence-weighted HR-load evidence."),
     RuleDefinition("moderate_leakage", "Recent Z3 time contributes graded evidence based on its excess and sample size."),
-    RuleDefinition("recent_costly_response", "Corroborated response cost scales workout load instead of creating a binary penalty."),
+    RuleDefinition("recent_costly_response", "Execution drift or high perceived effort scales the next prescription; pace-at-HR response is already counted in recovery."),
     RuleDefinition("recent_drift_caution", "Only drift above the reference contributes, and contradictory strong performance discounts it."),
     RuleDefinition("recent_high_rpe", "A high reported effort adds recovery caution without replacing recorded HR load."),
     RuleDefinition("mechanical_load", "Available elevation data can identify hilly or downhill-heavy mechanical stress."),
@@ -1132,19 +1132,28 @@ def recommend_next_run(
     # it sharply discounts the claim that drift alone proves a costly run.
     drift_strength = raw_drift_strength * (
         0.25
-        if state.recent_performance_anomaly == "unusually_strong"
+        if state.recent_performance_response == "stronger_than_recent"
         else 1.0
     )
-    anomaly_strength = (
+    response_applies_to_last = (
+        state.recent_performance_response_activity_id is None
+        or state.last_run_activity_id is None
+        or state.recent_performance_response_activity_id
+        == state.last_run_activity_id
+    )
+    performance_response_strength = (
         0.75
-        if state.recent_performance_anomaly == "unusually_costly"
+        if state.recent_performance_response == "higher_cost_than_recent"
+        and response_applies_to_last
         else 0.0
     )
     rpe_strength = 1.0 if high_rpe else 0.0
-    # Independent evidence combines without double-counting to more than one.
+    # Pace-at-HR response already changes the transient recovery residue. It is
+    # intentionally absent here: applying it again to distance would make one
+    # observation delay the next run and independently shrink it. Drift and RPE
+    # remain direct execution evidence and can shape the next prescription.
     response_stress = 1.0 - (
         (1.0 - drift_strength)
-        * (1.0 - anomaly_strength)
         * (1.0 - rpe_strength)
     )
     costly = response_stress >= 0.5
@@ -1154,10 +1163,18 @@ def recommend_next_run(
         _trace(
             rule,
             costly,
-            performance_anomaly=state.recent_performance_anomaly,
+            performance_response=state.recent_performance_response,
+            performance_response_activity_id=(
+                state.recent_performance_response_activity_id
+            ),
+            last_run_activity_id=state.last_run_activity_id,
+            response_applies_to_last=response_applies_to_last,
+            performance_response_accounted_in_recovery=(
+                performance_response_strength > 0
+            ),
             drift_percent=drift_percent,
             drift_excess_strength=round(drift_strength, 3),
-            performance_strength=anomaly_strength,
+            performance_strength=performance_response_strength,
             rpe_strength=rpe_strength,
             response_stress=round(response_stress, 3),
             maximum_volume_reduction=(
@@ -1170,7 +1187,7 @@ def recommend_next_run(
             RULES["recent_drift_caution"],
             drift_caution,
             drift_percent=drift_percent,
-            performance_anomaly=state.recent_performance_anomaly,
+            performance_response=state.recent_performance_response,
             response_stress=round(response_stress, 3),
             quality_penalty_points=round(3.0 * response_stress, 2),
             volume_reduction_fraction=round(
@@ -1459,7 +1476,7 @@ def recommend_next_run(
         -3.0 + 4.0 * quality_need,
         "continuous quality recency and recent-dose need",
     )
-    if state.recent_performance_anomaly == "within_recent_range":
+    if state.recent_performance_response == "within_recent_range":
         add("long", 0.5, "normal recent response")
         add("quality", 1, "normal recent response")
     if state.fitness_trend.value == "improving" and state.trend_confidence in {

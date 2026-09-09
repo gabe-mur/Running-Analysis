@@ -76,8 +76,8 @@ def _random_state(rng: Random):
         running_days_28d=rng.randint(1, 24),
         moderate_fraction_14d=rng.uniform(0, 0.4),
         moderate_evidence_runs_14d=rng.randint(0, 8),
-        recent_performance_anomaly=rng.choice(
-            ["within_recent_range", "unusually_costly", "unknown"]
+        recent_performance_response=rng.choice(
+            ["within_recent_range", "higher_cost_than_recent", "unknown"]
         ),
     )
 

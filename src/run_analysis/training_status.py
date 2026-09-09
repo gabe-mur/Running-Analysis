@@ -21,7 +21,7 @@ The states answer "what is my training doing right now", not "how fit am I":
     Current health status or recent responses indicate recovery.
 ``strained``
     Acute load is high, or independent response signals agree that the most
-    recent effort was unusually costly.
+    recent effort had a higher cost than comparable recent running.
 ``underloaded``
     Sustained running materially below retained capacity for long enough to
     matter.
@@ -58,7 +58,7 @@ class StatusRule:
 STATUS_RULES: tuple[StatusRule, ...] = (
     StatusRule("status_insufficient_evidence", "Too few recent runs or no demonstrated capacity to classify training."),
     StatusRule("status_recovering", "Current health status, or a health-tagged run not yet followed by normal running, indicates recovery."),
-    StatusRule("status_strained", "Acute load is high relative to demonstrated capacity, or an unusually costly effort is corroborated by high drift."),
+    StatusRule("status_strained", "Acute load is high relative to demonstrated capacity, or a higher-cost recent response is corroborated by high drift."),
     StatusRule("status_rebuilding", "Sustained running is below retained capacity after a gap, while continuously decayed training load is rebuilding."),
     StatusRule("status_underloaded", "Sustained running has been materially below retained capacity long enough to matter."),
     StatusRule("status_building", "Load sits near demonstrated capacity with quality exposure and no recovery or strain flags."),
@@ -126,7 +126,7 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
     acute_ratio, sustained_ratio, capacity = _ratios(state)
     trace: list[RuleTrace] = []
 
-    costly = state.recent_performance_anomaly == "unusually_costly"
+    costly = state.recent_performance_response == "higher_cost_than_recent"
     high_drift = (
         state.last_run_drift_percent is not None
         and state.last_run_drift_percent > HIGH_DRIFT_PERCENT
@@ -201,7 +201,7 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
                 round(acute_ratio, 2) if acute_ratio is not None else None
             ),
             high_load_ratio=high_load_ratio,
-            recent_performance_anomaly=state.recent_performance_anomaly,
+            recent_performance_response=state.recent_performance_response,
             last_run_drift_percent=state.last_run_drift_percent,
             costly_response_corroborated=response_strain,
         )

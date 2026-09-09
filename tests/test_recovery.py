@@ -12,7 +12,9 @@ from run_analysis.recovery import (
     athlete_relative_session_load,
     cumulative_recovery_load,
     estimate_recovery,
+    ordinary_session_reference,
     prior_typical_load,
+    projected_recovery_reference_miles,
 )
 from run_analysis.web.schemas import LoadWindow
 from run_analysis.web.schemas import WorkoutType
@@ -64,6 +66,40 @@ def test_fitness_state_recovery_residue_keeps_more_than_latest_run() -> None:
     )
 
     assert combined > latest_only
+
+
+def test_performance_response_stays_attached_to_its_source_run() -> None:
+    state = _state()
+    costly_source = SimpleNamespace(
+        activity_id=101,
+        start_time=state.as_of - timedelta(hours=36),
+        session_difficulty=_difficulty(miles=8, long=True),
+        workout_type=WorkoutType.LONG,
+    )
+    prescribed_quality = SimpleNamespace(
+        activity_id=102,
+        start_time=state.as_of - timedelta(hours=1),
+        session_difficulty=_difficulty(miles=3.2, quality=True),
+        workout_type=WorkoutType.INTERVALS,
+    )
+
+    attributed = _cumulative_recovery_residual(
+        [costly_source, prescribed_quality],
+        state.as_of,
+        state.recent_load.trailing_28d,
+        latest_run=prescribed_quality,
+        latest_performance_response="higher_cost_than_recent",
+        performance_response_activity_id=costly_source.activity_id,
+    )
+    expected = _cumulative_recovery_residual(
+        [costly_source, prescribed_quality],
+        state.as_of,
+        state.recent_load.trailing_28d,
+        latest_run=costly_source,
+        latest_performance_response="higher_cost_than_recent",
+    )
+
+    assert attributed == pytest.approx(expected)
 
 
 def test_session_load_scales_with_athlete_relative_work() -> None:
@@ -118,6 +154,33 @@ def test_observed_hr_load_changes_recovery_even_when_run_is_labeled_easy() -> No
     assert costly > ordinary
 
 
+def test_completed_short_rep_prescription_sets_recovery_floor_on_actual_volume() -> None:
+    state = _state()
+    short_reps = _difficulty(miles=3.2, quality=True).model_copy(
+        update={
+            "moving_minutes": 35,
+            "elapsed_minutes": 35,
+            # Short-rep HR lag makes this look cheaper than the planned work.
+            "zone_load": 50,
+        }
+    )
+    observed, _ = athlete_relative_session_load(
+        short_reps, state.recent_load.trailing_28d
+    )
+    prescribed, evidence = athlete_relative_session_load(
+        short_reps,
+        state.recent_load.trailing_28d,
+        prescribed_intensity_factor=1.12,
+    )
+
+    assert prescribed > observed
+    assert evidence["prescribed_load_floor"] is not None
+    window = state.recent_load.trailing_28d
+    assert evidence["distance_ratio"] == pytest.approx(
+        3.2 / (window.distance_miles / window.activity_count)
+    )
+
+
 def test_actual_duration_changes_recovery_at_equal_distance_and_hr_load() -> None:
     state = _state()
     ordinary_session = _difficulty(miles=5)
@@ -146,6 +209,56 @@ def test_recovery_baseline_excludes_the_session_being_evaluated() -> None:
     assert prior.activity_count == state.recent_load.trailing_28d.activity_count - 1
     assert prior.distance_miles == state.recent_load.trailing_28d.distance_miles - 8
     assert prior.moving_minutes == state.recent_load.trailing_28d.moving_minutes - 88
+
+
+def test_projected_and_uploaded_recovery_use_same_pre_session_distance_reference() -> None:
+    before = _state()
+    session = _difficulty(miles=5)
+    prior = before.recent_load.trailing_28d
+    after = _state(
+        days_since_last_run=0,
+        last_run=session,
+        recent_load=before.recent_load.model_copy(
+            update={
+                "trailing_28d": prior.model_copy(
+                    update={
+                        "distance_miles": prior.distance_miles + session.distance_miles,
+                        "moving_minutes": prior.moving_minutes + session.moving_minutes,
+                        "zone_load": (prior.zone_load or 0) + (session.zone_load or 0),
+                        "activity_count": prior.activity_count + 1,
+                        "zone_load_activity_count": (
+                            (prior.zone_load_activity_count or 0) + 1
+                        ),
+                    }
+                )
+            }
+        ),
+    )
+
+    projected = projected_recovery_reference_miles(before)
+    uploaded_prior = prior_typical_load(after)
+    observed = uploaded_prior.distance_miles / uploaded_prior.activity_count
+
+    assert projected == pytest.approx(observed)
+
+
+def test_long_runs_do_not_inflate_the_ordinary_recovery_unit() -> None:
+    aggregate = LoadWindow(
+        days=28,
+        distance_miles=48,
+        moving_minutes=528,
+        zone_load=1056,
+        hard_minutes=12,
+        activity_count=10,
+        zone_load_activity_count=10,
+    )
+
+    reference = ordinary_session_reference(aggregate, 3.6)
+
+    assert reference.activity_count == 1
+    assert reference.distance_miles == pytest.approx(3.6)
+    assert reference.moving_minutes == pytest.approx(39.6)
+    assert reference.zone_load == pytest.approx(79.2)
 
 
 def test_zone_load_ratio_uses_only_runs_with_known_hr_load() -> None:
@@ -203,7 +316,7 @@ def test_strong_whole_run_response_discounts_drift_recovery_cost() -> None:
             days_since_last_run=0,
             last_run=_difficulty(miles=5),
             last_run_drift_percent=10,
-            recent_performance_anomaly="unusually_strong",
+            recent_performance_response="stronger_than_recent",
         )
     )
 

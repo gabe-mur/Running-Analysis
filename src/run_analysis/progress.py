@@ -121,7 +121,8 @@ def _sessions(
         """
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.calculated_moving_time_s,
                m.device_timer_time_s,m.session_zone_load,m.hard_minutes,m.hr_zone_seconds_json,
-               m.exclusion_reason,COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag
+               m.exclusion_reason,m.detected_workout_type,
+               COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
@@ -144,6 +145,7 @@ def _sessions(
         distance_miles = float(row["total_distance_m"] or 0) / METERS_PER_MILE
         workout = _infer_workout_type(
             row["workout_type"],
+            row["detected_workout_type"],
             distance_miles,
             moving_s / 60,
             zones,
@@ -436,6 +438,7 @@ def _activity_coverage(
         """
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.exclusion_reason,
                m.calculated_moving_time_s,m.device_timer_time_s,m.hr_zone_seconds_json,
+               m.detected_workout_type,
                COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag,mr.result_json
         FROM activities a
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
@@ -458,6 +461,7 @@ def _activity_coverage(
         )
         workout = _infer_workout_type(
             row["workout_type"],
+            row["detected_workout_type"],
             distance_miles,
             moving_s / 60,
             json.loads(row["hr_zone_seconds_json"] or "{}"),

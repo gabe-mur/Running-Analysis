@@ -174,7 +174,7 @@ def _state(as_of: datetime) -> FitnessState:
         running_days_28d=10,
         moderate_fraction_14d=0.1,
         moderate_evidence_runs_14d=3,
-        recent_performance_anomaly="within_recent_range",
+        recent_performance_response="within_recent_range",
     )
 
 

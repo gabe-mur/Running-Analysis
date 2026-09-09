@@ -14,6 +14,7 @@ import sqlite3
 
 from .movement import MovementInterval
 from .processing import _load_points
+from .prescription_load import prescribed_intensity_factor
 from .quality_phases import detect_continuous_quality_phase
 from .segmentation import METERS_PER_MILE
 from .web.schemas import (
@@ -32,6 +33,12 @@ from .web.schemas import (
     WorkoutType,
 )
 from .terrain_intensity import terrain_moderate_context
+from .workout_detection import (
+    inferred_work_groups,
+    recorded_interval_work_positions,
+    recorded_laps,
+    usable_recorded_laps,
+)
 
 
 def _pace(seconds: float, distance_m: float) -> float | None:
@@ -135,25 +142,8 @@ def _recorded_lap_analysis(
     intervals: list[MovementInterval],
     z4_floor: float,
 ) -> IntervalAnalysis | None:
-    rows = connection.execute(
-        """
-        SELECT lap_index,total_time_s,distance_m,average_hr_bpm,maximum_hr_bpm
-        FROM laps WHERE activity_id=? ORDER BY lap_index
-        """,
-        (activity_id,),
-    ).fetchall()
-    usable = [row for row in rows if float(row["total_time_s"] or 0) > 0 and float(row["distance_m"] or 0) > 0]
-    if len(usable) < 4:
-        return None
-    speeds = [float(row["distance_m"]) / float(row["total_time_s"]) for row in usable]
-    work_positions = {
-        position
-        for position in range(1, len(usable) - 1)
-        if speeds[position] >= speeds[position - 1] * 1.10
-        and speeds[position] >= speeds[position + 1] * 1.10
-        and float(usable[position]["total_time_s"]) >= 30
-        and float(usable[position]["distance_m"]) >= 100
-    }
+    usable = usable_recorded_laps(recorded_laps(connection, activity_id))
+    work_positions = recorded_interval_work_positions(usable)
     if len(work_positions) < 2:
         return None
     first_work, last_work = min(work_positions), max(work_positions)
@@ -182,25 +172,6 @@ def _recorded_lap_analysis(
     return _summarize_intervals(repetitions, "recorded_laps", ConfidenceLevel.HIGH, intervals, z4_floor)
 
 
-def _smoothed_speeds(intervals: list[MovementInterval]) -> list[float]:
-    raw = [item.distance_m / item.moving_time_s if item.moving_time_s > 0 and item.distance_m > 0 else 0.0 for item in intervals]
-    return [median(raw[max(0, i - 2):i + 3]) for i in range(len(raw))]
-
-
-def _speed_clusters(values: list[float]) -> tuple[float, float]:
-    positive = sorted(value for value in values if value > 0)
-    if len(positive) < 10:
-        return 0.0, 0.0
-    low, high = positive[len(positive) // 4], positive[(len(positive) * 3) // 4]
-    for _ in range(12):
-        low_group = [value for value in positive if abs(value - low) <= abs(value - high)]
-        high_group = [value for value in positive if abs(value - low) > abs(value - high)]
-        if not low_group or not high_group:
-            break
-        low, high = mean(low_group), mean(high_group)
-    return min(low, high), max(low, high)
-
-
 def _inferred_interval_analysis(
     intervals: list[MovementInterval], z4_floor: float
 ) -> IntervalAnalysis:
@@ -210,32 +181,7 @@ def _inferred_interval_analysis(
     )
     if len(intervals) < 20:
         return unavailable("Too little raw movement data to infer repetitions.")
-    smooth = _smoothed_speeds(intervals)
-    low, high = _speed_clusters(smooth)
-    if low <= 0 or high / low < 1.12:
-        return unavailable("The pace stream does not contain a sufficiently separated fast/recovery pattern.")
-    threshold = (low + high) / 2
-    raw_groups: list[tuple[int, int]] = []
-    start: int | None = None
-    for index, speed in enumerate(smooth + [0.0]):
-        fast = index < len(smooth) and speed >= threshold
-        if fast and start is None:
-            start = index
-        elif not fast and start is not None:
-            raw_groups.append((start, index))
-            start = None
-    merged: list[tuple[int, int]] = []
-    for group in raw_groups:
-        gap = sum(item.elapsed_s for item in intervals[merged[-1][1]:group[0]]) if merged else None
-        if merged and gap is not None and gap <= 15:
-            merged[-1] = (merged[-1][0], group[1])
-        else:
-            merged.append(group)
-    work_groups = [
-        group for group in merged
-        if 30 <= sum(item.elapsed_s for item in intervals[group[0]:group[1]]) <= 600
-        and sum(item.distance_m for item in intervals[group[0]:group[1]]) >= 100
-    ]
+    work_groups = inferred_work_groups(intervals)
     if len(work_groups) < 2:
         return unavailable("Fast running was detected, but not enough repeatable work bouts were found.", len(work_groups))
     repetitions: list[IntervalRepetition] = []
@@ -782,6 +728,15 @@ def _prescription_analysis(
         summary=summary,
         target_work_minutes=target_work,
         detected_work_minutes=detected_work,
+        prescribed_intensity_factor=(
+            prescribed_intensity_factor(
+                prescription,
+                max(difficulty.moving_minutes, target_work or 0.0),
+            )
+            if requires_work_detection and work_close
+            else None
+        ),
+        prescribed_quality_completed=requires_work_detection and work_close,
         aerobic_intensity_adherence_percent=(
             aerobic_intensity_adherence * 100
             if aerobic_intensity_adherence is not None

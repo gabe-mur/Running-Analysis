@@ -52,7 +52,7 @@ def _state(**changes) -> FitnessState:
         trend_confidence=ConfidenceLevel.MODERATE,
         recent_load=_load(),
         quality_sessions_14d=1,
-        recent_performance_anomaly="within_recent_range",
+        recent_performance_response="within_recent_range",
         recent_illness_or_recovery=False,
         normal_runs_since_health_event=0,
         current_health_status=CurrentHealthStatus.NORMAL,
@@ -133,8 +133,8 @@ def test_continuous_fatigue_prevents_a_boxcar_boundary_strain_label() -> None:
     assert summary.status != TrainingStatus.STRAINED
 
 
-def test_one_unusually_costly_response_does_not_label_normal_load_strained() -> None:
-    summary = build_training_status(_state(recent_performance_anomaly="unusually_costly"))
+def test_one_higher_cost_response_does_not_label_normal_load_strained() -> None:
+    summary = build_training_status(_state(recent_performance_response="higher_cost_than_recent"))
     assert summary.status != TrainingStatus.STRAINED
 
 
@@ -146,7 +146,7 @@ def test_one_high_drift_response_does_not_label_normal_load_strained() -> None:
 def test_costly_response_and_high_drift_together_are_strained() -> None:
     summary = build_training_status(
         _state(
-            recent_performance_anomaly="unusually_costly",
+            recent_performance_response="higher_cost_than_recent",
             last_run_drift_percent=12.0,
         )
     )

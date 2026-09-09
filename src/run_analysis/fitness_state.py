@@ -7,9 +7,17 @@ import sqlite3
 from statistics import median
 
 from .durability import supported_long_run_capacity
-from .easy_baseline import recency_weighted_easy_distance
+from .easy_baseline import (
+    ordinary_easy_sample_distance,
+    recency_weighted_easy_distance,
+)
 from .progress import PreparedProgressData, build_progress
-from .recovery import athlete_relative_session_load, cumulative_recovery_load
+from .recovery import (
+    athlete_relative_session_load,
+    cumulative_recovery_load,
+    load_window_before_session,
+    ordinary_session_reference,
+)
 from .run_feedback import get_run_feedback, list_runs
 from .terrain_intensity import terrain_moderate_context
 from .web.schemas import (
@@ -31,8 +39,10 @@ def _cumulative_recovery_residual(
     typical_load: LoadWindow,
     *,
     latest_run=None,
-    latest_performance_anomaly: str = "within_recent_range",
+    latest_performance_response: str = "within_recent_range",
+    performance_response_activity_id: int | None = None,
     latest_drift_percent: float | None = None,
+    latest_prescribed_intensity_factor: float | None = None,
 ) -> float:
     """Accumulate independently decayed recovery load from recorded runs."""
 
@@ -46,15 +56,23 @@ def _cumulative_recovery_residual(
         ):
             continue
         is_latest = latest_run is not None and run is latest_run
+        response_applies = (
+            run.activity_id == performance_response_activity_id
+            if performance_response_activity_id is not None
+            else is_latest
+        )
         initial, _ = athlete_relative_session_load(
             run.session_difficulty,
             typical_load,
-            performance_anomaly=(
-                latest_performance_anomaly
-                if is_latest
+            performance_response=(
+                latest_performance_response
+                if response_applies
                 else "within_recent_range"
             ),
             drift_percent=latest_drift_percent if is_latest else None,
+            prescribed_intensity_factor=(
+                latest_prescribed_intensity_factor if is_latest else None
+            ),
         )
         elapsed_hours = max(
             0.0,
@@ -75,7 +93,11 @@ def _change(progress, days: int) -> PaceChange | None:
     )
 
 
-def _performance_anomaly(points) -> str:
+def _performance_response(points) -> str:
+    return _performance_response_evidence(points)[0]
+
+
+def _performance_response_evidence(points):
     # Graph-only context points deliberately have no standardized pace and
     # zero trend influence. Performance response must use the same evidence
     # set as the aerobic trend rather than treating the newest visible marker
@@ -88,7 +110,7 @@ def _performance_anomaly(points) -> str:
         and point.standardized_pace_min_mile is not None
     ]
     if len(evidence) < 4:
-        return "unknown"
+        return "unknown", None
     latest = evidence[-1]
     prior = [
         point.standardized_pace_min_mile
@@ -96,14 +118,14 @@ def _performance_anomaly(points) -> str:
         if latest.start_time - timedelta(days=56) < point.start_time < latest.start_time
     ][-8:]
     if len(prior) < 3:
-        return "unknown"
+        return "unknown", None
     difference = latest.standardized_pace_min_mile - median(prior)
     threshold = max(0.4, latest.uncertainty_95_min_mile)
     if difference > threshold:
-        return "unusually_costly"
+        return "higher_cost_than_recent", latest
     if difference < -threshold:
-        return "unusually_strong"
-    return "within_recent_range"
+        return "stronger_than_recent", latest
+    return "within_recent_range", latest
 
 
 def _unplanned_moderate_context(
@@ -345,15 +367,23 @@ def build_fitness_state(
         if most_recent_abnormal and most_recent_abnormal.start_time
         else 0
     )
-    ordinary_easy_samples = [
-        (run.start_time.astimezone(timezone.utc), run.distance_miles)
-        for run in runs
-        if run.start_time
-        and run.health_tag.value == "normal"
-        and run.workout_type == WorkoutType.EASY
-        and run.prescribed_planning_role != "support_easy"
-        and run.distance_miles > 0
-    ]
+    ordinary_easy_samples = []
+    for run in runs:
+        if (
+            not run.start_time
+            or run.health_tag.value != "normal"
+            or run.workout_type != WorkoutType.EASY
+        ):
+            continue
+        sample_distance = ordinary_easy_sample_distance(
+            run.distance_miles,
+            run.prescribed_planning_role,
+            run.prescribed_distance_range_miles,
+        )
+        if sample_distance is not None:
+            ordinary_easy_samples.append(
+                (run.start_time.astimezone(timezone.utc), sample_distance)
+            )
     typical_easy_run_miles = recency_weighted_easy_distance(
         ordinary_easy_samples,
         evaluation_time,
@@ -423,19 +453,47 @@ def build_fitness_state(
             ),
         )
     )
-    performance_anomaly = _performance_anomaly(progress.series)
+    performance_response, performance_response_point = _performance_response_evidence(
+        progress.series
+    )
     latest_drift_percent = (
         latest_feedback.cardiac_drift.decoupling_percent
         if latest_feedback and latest_feedback.cardiac_drift.valid
         else None
     )
+    latest_prescription_match = (
+        latest_feedback.workout_analysis.prescription_match
+        if latest_feedback
+        and latest_feedback.workout_analysis
+        and latest_feedback.workout_analysis.prescription_match
+        else None
+    )
+    latest_prescribed_intensity_factor = (
+        latest_prescription_match.prescribed_intensity_factor
+        if latest_prescription_match
+        and latest_prescription_match.prescribed_quality_completed
+        else None
+    )
+    recovery_reference = ordinary_session_reference(
+        load_window_before_session(
+            progress.current_load.trailing_28d,
+            latest.session_difficulty if latest else None,
+        ),
+        typical_easy_run_miles,
+    )
     recovery_residual_load = _cumulative_recovery_residual(
         runs,
         evaluation_time,
-        progress.current_load.trailing_28d,
+        recovery_reference,
         latest_run=latest,
-        latest_performance_anomaly=performance_anomaly,
+        latest_performance_response=performance_response,
+        performance_response_activity_id=(
+            performance_response_point.activity_id
+            if performance_response_point is not None
+            else None
+        ),
         latest_drift_percent=latest_drift_percent,
+        latest_prescribed_intensity_factor=latest_prescribed_intensity_factor,
     )
     return FitnessState(
         as_of=as_of,
@@ -450,8 +508,27 @@ def build_fitness_state(
         days_since_quality_run=days_since_quality,
         days_since_long_run=days_since_long,
         last_run=latest.session_difficulty if latest else None,
+        last_run_activity_id=latest.activity_id if latest else None,
         last_run_workout_type=latest.workout_type if latest else None,
+        last_run_prescribed_workout_type=(
+            latest.prescribed_workout_type if latest else None
+        ),
+        last_run_prescribed_distance_range_miles=(
+            latest.prescribed_distance_range_miles if latest else None
+        ),
+        last_run_completed_prescribed_workout=(
+            latest_prescription_match.prescribed_quality_completed
+            if latest_prescription_match
+            and latest_prescription_match.workout_type
+            in {
+                WorkoutType.INTERVALS,
+                WorkoutType.TEMPO_THRESHOLD,
+                WorkoutType.RACE,
+            }
+            else None
+        ),
         last_run_drift_percent=latest_drift_percent,
+        last_run_prescribed_intensity_factor=latest_prescribed_intensity_factor,
         recovery_residual_load=recovery_residual_load,
         longest_run_30d_miles=recent_long_capacity,
         retained_long_run_capacity_miles=retained_long_capacity,
@@ -463,11 +540,21 @@ def build_fitness_state(
         moderate_fraction_14d=unplanned_moderate,
         moderate_evidence_runs_14d=unplanned_moderate_runs,
         hard_fraction_14d=(progress_14.intensity.hard_percent / 100 if progress_14.intensity.hard_percent is not None else None),
-        recent_performance_anomaly=performance_anomaly,
+        recent_performance_response=performance_response,
+        recent_performance_response_activity_id=(
+            performance_response_point.activity_id
+            if performance_response_point is not None
+            else None
+        ),
+        recent_performance_response_at=(
+            performance_response_point.start_time
+            if performance_response_point is not None
+            else None
+        ),
         recent_illness_or_recovery=recent_illness,
         normal_runs_since_health_event=normal_since_health_event,
         current_health_status=health_status,
-        anomaly_flags=[performance_anomaly] if performance_anomaly not in {"unknown", "within_recent_range"} else [],
+        response_flags=[performance_response] if performance_response not in {"unknown", "within_recent_range"} else [],
         data_quality_flags=(
             list(progress.current_load.flags)
             + (["latest_run_pace_quality_low"] if latest and latest.data_quality.value != "good" else [])

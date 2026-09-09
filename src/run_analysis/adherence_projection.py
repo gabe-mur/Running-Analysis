@@ -8,8 +8,15 @@ from enum import Enum
 from random import Random
 
 from .durability import supported_long_run_capacity
-from .easy_baseline import recency_weighted_easy_distance
-from .recovery import athlete_relative_session_load, cumulative_recovery_load
+from .easy_baseline import (
+    ordinary_easy_sample_distance,
+    recency_weighted_easy_distance,
+)
+from .recovery import (
+    athlete_relative_session_load,
+    cumulative_recovery_load,
+    ordinary_session_reference,
+)
 from .training_load import (
     TrainingSession,
     acute_to_prior_weekly_ratio,
@@ -50,6 +57,43 @@ QUALITY_TYPES = {
 }
 
 
+def _completed_planning_role(
+    recommendation: RecommendationResponse,
+    actual_type: WorkoutType,
+) -> str | None:
+    """Preserve the purpose of a completed projected aerobic session.
+
+    A medium-long or support run is still that kind of evidence after it is
+    completed. Relabeling every easy completion as ``ordinary_easy`` lets
+    those deliberately short or long sessions move the ordinary-run baseline
+    and creates a false feedback loop in daily replanning.
+    """
+
+    if actual_type in QUALITY_TYPES:
+        return "quality"
+    if actual_type == WorkoutType.EASY:
+        return recommendation.planning_role or "ordinary_easy"
+    return recommendation.planning_role
+
+
+def _consecutive_date_streaks(run_dates: set[date]) -> list[set[date]]:
+    """Group continuous run dates without treating the forecast edge as rest."""
+
+    streaks: list[set[date]] = []
+    current_streak: set[date] = set()
+    previous_date: date | None = None
+    for run_date in sorted(run_dates):
+        if previous_date is None or run_date != previous_date + timedelta(days=1):
+            if current_streak:
+                streaks.append(current_streak)
+            current_streak = set()
+        current_streak.add(run_date)
+        previous_date = run_date
+    if current_streak:
+        streaks.append(current_streak)
+    return streaks
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionRun:
     start_time: datetime
@@ -59,6 +103,8 @@ class ProjectionRun:
     difficulty: SessionDifficulty
     projected: bool = False
     planning_role: str | None = None
+    prescribed_workout_type: WorkoutType | None = None
+    completed_prescribed_workout: bool | None = None
     prescribed_low_miles: float | None = None
     prescribed_high_miles: float | None = None
     prescription_title: str | None = None
@@ -211,6 +257,7 @@ def runs_from_summaries(values: list[RunSummary]) -> list[ProjectionRun]:
                 workout_type=workout,
                 difficulty=difficulty,
                 planning_role=run.prescribed_planning_role,
+                prescribed_workout_type=run.prescribed_workout_type,
                 prescribed_low_miles=(
                     run.prescribed_distance_range_miles[0]
                     if run.prescribed_distance_range_miles is not None
@@ -304,19 +351,50 @@ def _state_at(
         half_life_days=fatigue_half_life_days,
     )
     last = completed[-1] if completed else None
+    ordinary_easy_samples = []
+    for run in completed:
+        if run.workout_type != WorkoutType.EASY:
+            continue
+        prescribed_range = (
+            (run.prescribed_low_miles, run.prescribed_high_miles)
+            if run.prescribed_low_miles is not None
+            and run.prescribed_high_miles is not None
+            else None
+        )
+        sample_distance = ordinary_easy_sample_distance(
+            run.distance_miles,
+            run.planning_role,
+            prescribed_range,
+        )
+        if sample_distance is not None:
+            ordinary_easy_samples.append((run.start_time, sample_distance))
+    typical_easy_run_miles = recency_weighted_easy_distance(
+        ordinary_easy_samples,
+        as_of,
+        half_life_days=easy_baseline_half_life_days,
+    )
+    recovery_reference = ordinary_session_reference(
+        recent_28,
+        typical_easy_run_miles,
+    )
     recovery_residual_load = cumulative_recovery_load(
         (
             (
                 athlete_relative_session_load(
                     run.difficulty,
-                    recent_28,
-                    performance_anomaly=(
-                        template.recent_performance_anomaly
+                    recovery_reference,
+                    performance_response=(
+                        template.recent_performance_response
                         if run is last and not run.projected
                         else "within_recent_range"
                     ),
                     drift_percent=(
                         template.last_run_drift_percent
+                        if run is last and not run.projected
+                        else None
+                    ),
+                    prescribed_intensity_factor=(
+                        template.last_run_prescribed_intensity_factor
                         if run is last and not run.projected
                         else None
                     ),
@@ -370,18 +448,6 @@ def _state_at(
         run for run in completed
         if as_of - timedelta(days=28) < run.start_time <= as_of
     ]
-    ordinary_easy_samples = [
-        (run.start_time, run.distance_miles)
-        for run in completed
-        if run.workout_type == WorkoutType.EASY
-        and run.planning_role != "support_easy"
-        and run.distance_miles > 0
-    ]
-    typical_easy_run_miles = recency_weighted_easy_distance(
-        ordinary_easy_samples,
-        as_of,
-        half_life_days=easy_baseline_half_life_days,
-    )
     prior_28 = [
         run for run in completed
         if as_of - timedelta(days=35) < run.start_time <= as_of - timedelta(days=7)
@@ -441,7 +507,35 @@ def _state_at(
             ),
             "last_run": last.difficulty if last else None,
             "last_run_workout_type": last.workout_type if last else None,
+            "last_run_prescribed_workout_type": (
+                (
+                    last.prescribed_workout_type
+                    if last.prescribed_workout_type is not None
+                    else template.last_run_prescribed_workout_type
+                )
+                if last and not last.projected
+                else last.prescribed_workout_type if last else None
+            ),
+            "last_run_prescribed_distance_range_miles": (
+                (last.prescribed_low_miles, last.prescribed_high_miles)
+                if last
+                and last.prescribed_low_miles is not None
+                and last.prescribed_high_miles is not None
+                else template.last_run_prescribed_distance_range_miles
+                if last and not last.projected
+                else None
+            ),
+            "last_run_completed_prescribed_workout": (
+                (
+                    last.completed_prescribed_workout
+                    if last.completed_prescribed_workout is not None
+                    else template.last_run_completed_prescribed_workout
+                )
+                if last and not last.projected
+                else last.completed_prescribed_workout if last else None
+            ),
             "last_run_drift_percent": None,
+            "last_run_prescribed_intensity_factor": None,
             "recovery_residual_load": recovery_residual_load,
             "longest_run_30d_miles": supported_long_run_capacity(
                 (
@@ -484,11 +578,11 @@ def _state_at(
             "hard_fraction_14d": (
                 hard_minutes / known_minutes if known_minutes > 0 else None
             ),
-            "recent_performance_anomaly": "within_recent_range",
+            "recent_performance_response": "within_recent_range",
             "recent_illness_or_recovery": False,
             "normal_runs_since_health_event": 0,
             "current_health_status": CurrentHealthStatus.NORMAL,
-            "anomaly_flags": [],
+            "response_flags": [],
             "planned_weather": None,
         }
     )
@@ -1047,12 +1141,14 @@ def simulate_adherence(
                         else _projected_difficulty(item, miles, pace)
                     ),
                     projected=True,
-                    planning_role=(
-                        "quality"
-                        if actual_type in QUALITY_TYPES
-                        else "ordinary_easy"
-                        if actual_type == WorkoutType.EASY
-                        else item.planning_role
+                    planning_role=_completed_planning_role(item, actual_type),
+                    prescribed_workout_type=item.workout_type,
+                    completed_prescribed_workout=(
+                        actual_type == item.workout_type
+                        or (
+                            actual_type in QUALITY_TYPES
+                            and item.workout_type in QUALITY_TYPES
+                        )
                     ),
                     prescribed_low_miles=item.distance_range_miles[0],
                     prescribed_high_miles=item.distance_range_miles[1],
@@ -1120,7 +1216,19 @@ def simulate_adherence(
                 ),
                 None,
             )
-            if unscheduled_at < commit_end and active_break is None:
+            already_running_that_day = any(
+                run.start_time.date() == unscheduled_at.date()
+                for run in history
+            ) or any(
+                item.planned_for
+                and item.planned_for.date() == unscheduled_at.date()
+                for item in committed
+            )
+            if (
+                unscheduled_at < commit_end
+                and active_break is None
+                and not already_running_that_day
+            ):
                 ordinary = (
                     _state_at(
                         template,
@@ -1202,28 +1310,18 @@ def simulate_adherence(
                 )
         history.sort(key=lambda item: item.start_time)
 
-    projected_dates = sorted(
+    # Include recorded history when measuring streaks so a run on projection
+    # day one is not treated as isolated merely because the preceding run sits
+    # just outside the forecast boundary. Older streaks do not affect a row
+    # unless they intersect that row's dates.
+    streaks = _consecutive_date_streaks(
         {
             run.start_time.date()
             for run in history
-            if run.projected
-            and simulation_start_date
-            <= run.start_time.date()
+            if run.start_time.date()
             < simulation_start_date + timedelta(days=total_days)
         }
     )
-    streaks: list[set[date]] = []
-    current_streak: set[date] = set()
-    previous_date: date | None = None
-    for run_date in projected_dates:
-        if previous_date is None or run_date != previous_date + timedelta(days=1):
-            if current_streak:
-                streaks.append(current_streak)
-            current_streak = set()
-        current_streak.add(run_date)
-        previous_date = run_date
-    if current_streak:
-        streaks.append(current_streak)
 
     results: list[ProjectionWeek] = []
     for week_index in range(weeks):

@@ -115,8 +115,8 @@ def test_drift_rejects_a_material_finishing_surge() -> None:
 
 
 def test_unlabeled_long_run_classification_is_athlete_relative() -> None:
-    assert _infer_workout_type(None, 7.0, 70, {}, 9.0) == WorkoutType.EASY
-    assert _infer_workout_type(None, 9.5, 95, {}, 9.0) == WorkoutType.LONG
+    assert _infer_workout_type(None, None, 7.0, 70, {}, 9.0) == WorkoutType.EASY
+    assert _infer_workout_type(None, None, 9.5, 95, {}, 9.0) == WorkoutType.LONG
 
 
 def test_run_feedback_keeps_quality_out_of_the_steady_aerobic_trend() -> None:

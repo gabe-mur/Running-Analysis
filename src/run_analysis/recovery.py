@@ -48,8 +48,9 @@ def athlete_relative_session_load(
     session: SessionDifficulty,
     typical: LoadWindow,
     *,
-    performance_anomaly: str = "unknown",
+    performance_response: str = "unknown",
     drift_percent: float | None = None,
+    prescribed_intensity_factor: float | None = None,
 ) -> tuple[float, dict[str, float | None]]:
     """Measure a completed session against this athlete's ordinary run.
 
@@ -99,6 +100,9 @@ def athlete_relative_session_load(
     )
     if relative_work is None:
         relative_work = 1.0
+    actual_volume_work = _weighted_mean(
+        [(distance_ratio, 0.60), (duration_ratio, 0.40)]
+    )
 
     known_zone_minutes = (
         session.zone_breakdown.easy_minutes
@@ -133,17 +137,27 @@ def athlete_relative_session_load(
         if drift_percent is not None
         else 0.0
     )
-    if performance_anomaly == "unusually_strong":
+    if performance_response == "stronger_than_recent":
         drift_strength *= 0.25
     response_strength = max(
         drift_strength,
-        0.75 if performance_anomaly == "unusually_costly" else 0.0,
+        0.75 if performance_response == "higher_cost_than_recent" else 0.0,
     )
     response_factor = 1.0 + 0.20 * response_strength
 
+    observed_load = relative_work * zone_factor
+    # Short reps can complete the prescribed muscular/metabolic dose before HR
+    # catches up. Preserve that planned intensity on the *actual* distance and
+    # duration; observed surplus remains free to raise load above this floor.
+    prescribed_load_floor = (
+        actual_volume_work * prescribed_intensity_factor
+        if actual_volume_work is not None
+        and prescribed_intensity_factor is not None
+        and prescribed_intensity_factor > 1.0
+        else None
+    )
     load = (
-        relative_work
-        * zone_factor
+        max(observed_load, prescribed_load_floor or 0.0)
         * rpe_factor
         * mechanical_factor
         * response_factor
@@ -155,6 +169,8 @@ def athlete_relative_session_load(
         "rpe_factor": rpe_factor,
         "mechanical_factor": mechanical_factor,
         "response_factor": response_factor,
+        "prescribed_intensity_factor": prescribed_intensity_factor,
+        "prescribed_load_floor": prescribed_load_floor,
     }
 
 
@@ -193,21 +209,14 @@ def cumulative_recovery_load(
     )
 
 
-def prior_typical_load(state: FitnessState) -> LoadWindow:
-    """Return the 28-day baseline immediately before the latest session.
+def load_window_before_session(
+    window: LoadWindow,
+    session: SessionDifficulty | None,
+) -> LoadWindow:
+    """Remove one evaluated session from an aggregate reference window."""
 
-    The rolling window stored on ``FitnessState`` includes the run whose
-    recovery cost is being evaluated. Leaving it in both numerator and
-    denominator makes an unusually large or hard session look more ordinary
-    than it was.
-    """
-
-    window = state.recent_load.trailing_28d
-    session = state.last_run
     if (
         session is None
-        or state.days_since_last_run is None
-        or state.days_since_last_run > window.days
         or window.activity_count <= 1
     ):
         return window
@@ -231,6 +240,89 @@ def prior_typical_load(state: FitnessState) -> LoadWindow:
     )
 
 
+def ordinary_session_reference(
+    window: LoadWindow,
+    ordinary_distance_miles: float | None,
+) -> LoadWindow:
+    """Express aggregate training evidence as one ordinary aerobic session.
+
+    Long and quality runs belong in the load history, but they must not make
+    the unit used to price the next ordinary run larger merely because those
+    sessions are longer.  Distance is anchored to the robust easy-run
+    baseline; duration and HR load retain the athlete's observed per-mile
+    relationships.  The same conversion is used before and after upload.
+    """
+
+    if (
+        ordinary_distance_miles is None
+        or ordinary_distance_miles <= 0
+        or window.activity_count <= 0
+        or window.distance_miles <= 0
+    ):
+        return window
+    distance = float(ordinary_distance_miles)
+    moving_per_mile = window.moving_minutes / window.distance_miles
+    zone_load_per_mile = (
+        window.zone_load / window.distance_miles
+        if window.zone_load is not None and window.zone_load > 0
+        else None
+    )
+    hard_minutes_per_mile = window.hard_minutes / window.distance_miles
+    return LoadWindow(
+        days=window.days,
+        distance_miles=distance,
+        moving_minutes=distance * moving_per_mile,
+        zone_load=(
+            distance * zone_load_per_mile
+            if zone_load_per_mile is not None
+            else None
+        ),
+        hard_minutes=distance * hard_minutes_per_mile,
+        activity_count=1,
+        zone_load_activity_count=(
+            1 if zone_load_per_mile is not None else 0
+        ),
+    )
+
+
+def prior_typical_load(state: FitnessState) -> LoadWindow:
+    """Return the 28-day baseline immediately before the latest session.
+
+    The rolling window stored on ``FitnessState`` includes the run whose
+    recovery cost is being evaluated. Leaving it in both numerator and
+    denominator makes an unusually large or hard session look more ordinary
+    than it was.
+    """
+
+    window = state.recent_load.trailing_28d
+    if (
+        state.last_run is None
+        or state.days_since_last_run is None
+        or state.days_since_last_run > window.days
+    ):
+        prior = window
+    else:
+        prior = load_window_before_session(window, state.last_run)
+    return ordinary_session_reference(prior, state.typical_easy_run_miles)
+
+
+def projected_recovery_reference_miles(state: FitnessState) -> float:
+    """Return the ordinary-session distance used on both sides of upload.
+
+    The robust ordinary-easy baseline keeps long and quality sessions from
+    enlarging the unit used to price recovery. Before upload, the current
+    trailing history precedes the proposed run; afterward, ``prior_typical_load``
+    removes that run and reconstructs the same evidence at this distance.
+    """
+
+    if state.typical_easy_run_miles is not None:
+        return state.typical_easy_run_miles
+    window = state.recent_load.trailing_28d
+    if window.activity_count > 0 and window.distance_miles > 0:
+        return window.distance_miles / window.activity_count
+    return 1.0
+
+
 def _hours_to_limit(
     residual_load: float,
     limit: float,
@@ -246,11 +338,22 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
 
     if state.last_run is None or state.days_since_last_run is None:
         return None
+    response_applies_to_last = (
+        state.recent_performance_response_activity_id is None
+        or state.last_run_activity_id is None
+        or state.recent_performance_response_activity_id
+        == state.last_run_activity_id
+    )
     initial, evidence = athlete_relative_session_load(
         state.last_run,
         prior_typical_load(state),
-        performance_anomaly=state.recent_performance_anomaly,
+        performance_response=(
+            state.recent_performance_response
+            if response_applies_to_last
+            else "within_recent_range"
+        ),
         drift_percent=state.last_run_drift_percent,
+        prescribed_intensity_factor=state.last_run_prescribed_intensity_factor,
     )
     elapsed_hours = max(0.0, state.days_since_last_run * 24.0)
     residual = (

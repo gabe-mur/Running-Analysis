@@ -14,8 +14,9 @@ from .movement import attach_elevation_deltas, classify_movement
 from .segmentation import METERS_PER_MILE, Segment, build_segments
 from .workload import update_workloads
 from .training_load import calculate_session_load
+from .workout_detection import detect_structured_workout
 
-PROCESSOR_VERSION = "phase3-v8-duration-eligibility"
+PROCESSOR_VERSION = "phase3-v9-lap-workout-detection"
 
 
 @dataclass(slots=True)
@@ -406,6 +407,12 @@ def process_activities(
         )
         zone_seconds = _hr_zone_seconds(movement.intervals, config["zones"])
         session_load = calculate_session_load(zone_seconds, moving)
+        workout_detection = detect_structured_workout(
+            connection,
+            int(row["id"]),
+            movement.intervals,
+            z3_floor=float(config["zones"]["z3"][0]),
+        )
         moving_average_hr, moving_maximum_hr, moving_hr_coverage = _moving_hr(movement.intervals)
         diagnostics["moving_hr_coverage"] = moving_hr_coverage
         if row["average_hr_bpm"] is not None and row["average_hr_bpm"] > config["max_hr"] + 10:
@@ -432,8 +439,10 @@ def process_activities(
                     analysis_distance_m, distance_coverage_fraction, segment_count,
                     pathological_segment_count, model_eligible, exclusion_reason,
                     hr_zone_seconds_json, diagnostics_json, session_zone_load,
-                    easy_minutes, moderate_minutes, hard_minutes, hr_load_coverage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    easy_minutes, moderate_minutes, hard_minutes, hr_load_coverage,
+                    detected_workout_type,workout_detection_source,
+                    workout_detection_confidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row["id"],
@@ -464,6 +473,17 @@ def process_activities(
                     session_load.moderate_minutes,
                     session_load.hard_minutes,
                     session_load.hr_coverage,
+                    (
+                        workout_detection.workout_type.value
+                        if workout_detection is not None
+                        else None
+                    ),
+                    workout_detection.source if workout_detection is not None else None,
+                    (
+                        workout_detection.confidence.value
+                        if workout_detection is not None
+                        else None
+                    ),
                 ),
             )
         summary.processed_activities += 1

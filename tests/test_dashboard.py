@@ -137,7 +137,7 @@ def _state(**changes):
     values = dict(
         recent_illness_or_recovery=False,
         normal_runs_since_health_event=0,
-        recent_performance_anomaly="within_recent_range",
+        recent_performance_response="within_recent_range",
         trend_confidence=ConfidenceLevel.MODERATE,
     )
     values.update(changes)

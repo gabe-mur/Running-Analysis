@@ -337,19 +337,19 @@ def _recent_form(state) -> tuple[FitnessTrend, str, str]:
         if state.recent_illness_or_recovery
         else ""
     )
-    if state.recent_performance_anomaly == "unusually_costly":
+    if state.recent_performance_response == "higher_cost_than_recent":
         return (
             FitnessTrend.DECLINING,
             "Suppressed",
             "The latest comparable run took more effort than usual." + suffix,
         )
-    if state.recent_performance_anomaly == "within_recent_range":
+    if state.recent_performance_response == "within_recent_range":
         return (
             FitnessTrend.STABLE,
             "Within recent range",
             "The latest comparable run was within your recent range." + suffix,
         )
-    if state.recent_performance_anomaly == "unusually_strong":
+    if state.recent_performance_response == "stronger_than_recent":
         return (
             FitnessTrend.IMPROVING,
             "Responding well",
@@ -478,7 +478,7 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
             "The latest run was less efficient at the comparison heart rate, but one "
             "fatigue-sensitive response does not establish a fitness decline; the "
             "broader period comparison remains essentially unchanged."
-            if state.recent_performance_anomaly == "unusually_costly"
+            if state.recent_performance_response == "higher_cost_than_recent"
             else "Recent runs vary too much, or there are too few comparable runs, to call the trend up or down."
         )
     else:

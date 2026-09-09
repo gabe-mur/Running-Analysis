@@ -7,7 +7,7 @@ import json
 import pytest
 
 from run_analysis.db import connect, initialize
-from run_analysis.fitness_state import _performance_anomaly
+from run_analysis.fitness_state import _performance_response
 from run_analysis.progress import _trend_evidence_weight, build_progress
 from run_analysis.web.schemas import FitnessPoint, WorkoutType
 
@@ -232,7 +232,7 @@ def test_progress_uses_run_analysis_fallback_workout_types(tmp_path: Path) -> No
     assert series_types[long_id] == WorkoutType.LONG
 
 
-def test_graph_only_context_point_cannot_break_performance_anomaly() -> None:
+def test_graph_only_context_point_cannot_break_performance_response() -> None:
     anchor = datetime.now(timezone.utc)
     scored = [
         FitnessPoint(
@@ -259,7 +259,7 @@ def test_graph_only_context_point_cannot_break_performance_anomaly() -> None:
         trend_weight=0.0,
     )
 
-    assert _performance_anomaly([*scored, context]) == "within_recent_range"
+    assert _performance_response([*scored, context]) == "within_recent_range"
 
 
 def test_progress_keeps_pace_volume_and_intensity_as_separate_dimensions(tmp_path: Path) -> None:

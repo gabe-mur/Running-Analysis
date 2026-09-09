@@ -30,6 +30,11 @@ from .race_goals import (
     configured_race_goal,
     required_compound_progression,
 )
+from .prescription_load import (
+    prescribed_intensity_factor,
+    prescribed_zone_minutes,
+    structured_duration_minutes,
+)
 from .recovery import (
     EASY_RUN_RESIDUAL_LIMIT,
     RECOVERY_HALF_LIFE_HOURS,
@@ -38,6 +43,7 @@ from .recovery import (
     decay_recovery_load,
     estimate_recovery,
     prior_typical_load,
+    projected_recovery_reference_miles,
 )
 from .training_load import (
     TrainingSession,
@@ -65,18 +71,17 @@ from .web.schemas import (
 
 VISIBLE_HORIZON_DAYS = 7
 PLANNING_HORIZON_DAYS = 21
-WEEKLY_PLANNER_VERSION = 89
+WEEKLY_PLANNER_VERSION = 92
 MAX_ADAPTIVE_CANDIDATES = 64
 MAX_HORIZON_COUNT_OPTIONS = 14
 ALLOCATION_ASSIGNMENTS_PER_TOTAL = 16
 JOINT_DATE_FINALISTS = 3
 DISTANCE_DP_SCALE = 1000
 BASELINE_MINIMUM_AEROBIC_MINUTES = 10.0
-# Optimizer objectives use one common program-fit unit: the cost of exceeding
-# the recoverable two-session envelope by one athlete-relative load unit. This
-# makes a one-ordinary-session mileage miss, a fully collapsed support session,
-# and one extra endurance-role violation comparable without separate 20/12/6
-# multipliers drifting independently.
+# Optimizer objectives use one common program-fit unit. A completely
+# overlapping ordinary session, one missing ordinary session of mileage, a
+# fully collapsed support session, and one extra endurance-role violation are
+# therefore comparable without separate 20/12/6 multipliers drifting apart.
 PROGRAM_FIT_UNIT = 20.0
 # A shortened support run still supplies aerobic load, so a complete support
 # shortfall is less consequential than missing an entire ordinary session.
@@ -384,6 +389,101 @@ def _plan_continuity_cost(
         (PROGRAM_FIT_UNIT / 2.0) * 0.5 ** (offset / 7.0)
         for offset in set(offsets) ^ prior_run_offsets
     )
+
+
+def _latest_run_completed_prior_prescription(
+    state: FitnessState,
+    prior_plan_days: list[WeeklyScheduleDay],
+) -> bool:
+    """Return whether the latest run supplied the work the prior plan expected.
+
+    This is used only for same-day plan continuity. A completed prescription
+    is evidence the prior conditional branch occurred, not new evidence that
+    an expected rest day should suddenly become another run. Missed, shifted,
+    short, long, or differently typed work remains free to trigger a full
+    immediate replan.
+    """
+
+    if (
+        state.last_run is None
+        or state.last_run_workout_type is None
+        or state.days_since_last_run is None
+        or not prior_plan_days
+    ):
+        return False
+    latest_date = (
+        state.as_of - timedelta(days=state.days_since_last_run)
+    ).date()
+    prior = next(
+        (
+            day.recommendation
+            for day in prior_plan_days
+            if day.date == latest_date
+            and day.recommendation is not None
+            and day.recommendation.workout_type != WorkoutType.REST
+        ),
+        None,
+    )
+    prescribed_type = (
+        prior.workout_type
+        if prior is not None
+        else state.last_run_prescribed_workout_type
+    )
+    prescribed_range = (
+        prior.distance_range_miles
+        if prior is not None
+        else state.last_run_prescribed_distance_range_miles
+    )
+    if prescribed_type is None or prescribed_range is None:
+        return False
+    actual_type = state.last_run_workout_type
+    type_matches = (
+        actual_type == prescribed_type
+        or (
+            actual_type in QUALITY_WORKOUT_TYPES
+            and prescribed_type in QUALITY_WORKOUT_TYPES
+        )
+    )
+    low, high = prescribed_range
+    prescribed_quality_completed = (
+        prescribed_type in QUALITY_WORKOUT_TYPES
+        and state.last_run_completed_prescribed_workout is True
+    )
+    return type_matches and (
+        prescribed_quality_completed
+        or low <= state.last_run.distance_miles <= high
+    )
+
+
+def _post_adherence_rest_offset(
+    state: FitnessState,
+    prior_plan_days: list[WeeklyScheduleDay],
+    horizon_days: int,
+) -> int | None:
+    """Keep the prior plan's immediate post-workout rest date stable."""
+
+    if not _latest_run_completed_prior_prescription(state, prior_plan_days):
+        return None
+    latest_date = (
+        state.as_of - timedelta(days=state.days_since_last_run or 0.0)
+    ).date()
+    next_date = latest_date + timedelta(days=1)
+    offset = (next_date - state.as_of.date()).days
+    if not 0 <= offset < horizon_days:
+        return None
+    prior_next_day = next(
+        (day for day in prior_plan_days if day.date == next_date),
+        None,
+    )
+    if (
+        prior_next_day is None
+        or (
+            prior_next_day.recommendation is not None
+            and prior_next_day.recommendation.workout_type != WorkoutType.REST
+        )
+    ):
+        return None
+    return offset
 
 
 def derive_weekly_target(
@@ -946,6 +1046,75 @@ def _ordinary_easy_expansion_reference(state: FitnessState) -> float:
     )
 
 
+def _price_future_easy_at_useful_size(
+    state: FitnessState,
+    result: RecommendationResponse,
+    offset: int,
+    *,
+    observed_state: FitnessState | None = None,
+) -> RecommendationResponse:
+    """Make calendar search price the easy session the allocator can deliver.
+
+    A future date whose provisional recommendation is recovery-shortened is a
+    signal to compare a later date, not permission for the frequency search to
+    count a tiny workout and let the distance allocator enlarge it afterward.
+    Today's recommendation remains untouched because recorded recovery—not a
+    hypothetical candidate prefix—may genuinely support only a short run.
+    """
+
+    if (
+        offset <= 0
+        or result.workout_type != WorkoutType.EASY
+        or result.distance_range_miles is None
+        or _observed_easy_safety_cap(observed_state or state, result)
+    ):
+        return result
+    useful_midpoint = _established_easy_midpoint_floor(state)
+    if useful_midpoint <= 0 or _midpoint(result) >= useful_midpoint - 1e-9:
+        return result
+    return result.model_copy(
+        update={
+            "distance_range_miles": (
+                round(max(0.1, useful_midpoint - 0.25), 2),
+                round(useful_midpoint + 0.25, 2),
+            )
+        }
+    )
+
+
+def _observed_easy_safety_cap(
+    state: FitnessState,
+    result: RecommendationResponse,
+) -> bool:
+    """Identify a shortened easy range justified before candidate planning.
+
+    Caution produced by completed load, incomplete recovery, health, a recent
+    costly response, or meaningful weather stress is a real safety constraint.
+    Caution that exists only after hypothetical prefix sessions is instead an
+    interaction for the joint calendar model to price; preserving it as a tiny
+    fixed run lets the optimizer create the very density that caused it.
+    """
+
+    if result.readiness.value == "ready":
+        return False
+    if "includes_planned_sessions" in state.recent_load.flags:
+        return False
+    recovery = estimate_recovery(state)
+    weather = assess_training_weather(
+        state.planned_weather,
+        state.weather_exposure_baseline,
+    )
+    load_ratio = effective_load_ratio(state.recent_load)
+    return bool(
+        state.current_health_status != CurrentHealthStatus.NORMAL
+        or (recovery is not None and recovery.hours_until_easy > 0)
+        or (load_ratio is not None and load_ratio > 1.0)
+        or state.recent_performance_response
+        not in {"unknown", "within_recent_range", "stronger_than_recent"}
+        or weather.caution
+    )
+
+
 def _session_load_units(
     distance_miles: float,
     easy_reference_miles: float,
@@ -978,39 +1147,7 @@ def _prescribed_zone_minutes(
     total_minutes: float,
 ) -> tuple[float, float]:
     """Estimate moderate/hard minutes from the actual workout structure."""
-
-    moderate = 0.0
-    hard = 0.0
-    for step in result.structure:
-        zones = " ".join(step.target_zones).casefold()
-        if step.repetitions and step.work_duration_minutes:
-            work = step.repetitions * step.work_duration_minutes
-        elif step.repetitions and step.work_duration_range_minutes:
-            low, high = step.work_duration_range_minutes
-            work = step.repetitions * ((low + high) / 2)
-        elif step.phase == "work" and step.duration_minutes:
-            work = step.duration_minutes
-        elif step.phase == "work":
-            # Distance-defined progressions reserve their final quarter for
-            # controlled work; their opening portion remains aerobic.
-            work = total_minutes * 0.25
-        else:
-            continue
-        if any(marker in zones for marker in ("z4", "z5", "strong")):
-            if "z3" in zones or "threshold" in zones:
-                moderate += work * 0.60
-                hard += work * 0.40
-            else:
-                hard += work
-        elif "z3" in zones or "threshold" in zones:
-            moderate += work
-
-    quality_minutes = moderate + hard
-    if quality_minutes > total_minutes > 0:
-        scale = total_minutes / quality_minutes
-        moderate *= scale
-        hard *= scale
-    return moderate, hard
+    return prescribed_zone_minutes(result, total_minutes)
 
 
 def _prescribed_intensity_factor(
@@ -1019,37 +1156,12 @@ def _prescribed_intensity_factor(
 ) -> float:
     """Price only the prescribed non-aerobic share, never the workout name."""
 
-    if total_minutes <= 0:
-        return 1.0
-    moderate, hard = _prescribed_zone_minutes(result, total_minutes)
-    return 1.0 + 0.15 * (moderate / total_minutes) + 0.50 * (
-        hard / total_minutes
-    )
+    return prescribed_intensity_factor(result, total_minutes)
 
 
 def _structured_duration_minutes(result: RecommendationResponse) -> float | None:
     """Return the clock duration explicitly represented by workout steps."""
-
-    total = 0.0
-    known = False
-    for step in result.structure:
-        if step.duration_minutes is not None:
-            total += step.duration_minutes
-            known = True
-            continue
-        if step.repetitions and step.work_duration_minutes:
-            total += step.repetitions * step.work_duration_minutes
-            if step.recovery_duration_minutes:
-                total += max(0, step.repetitions - 1) * step.recovery_duration_minutes
-            known = True
-            continue
-        if step.repetitions and step.work_duration_range_minutes:
-            low, high = step.work_duration_range_minutes
-            total += step.repetitions * ((low + high) / 2)
-            if step.recovery_duration_minutes:
-                total += max(0, step.repetitions - 1) * step.recovery_duration_minutes
-            known = True
-    return total if known and total > 0 else None
+    return structured_duration_minutes(result)
 
 
 def _recommendation_load_units(
@@ -1107,7 +1219,7 @@ def _recovery_spacing_cost(
     proposed_load = (
         _recommendation_load_units(
             result,
-            sum(typical_easy_distance(state)) / 2,
+            projected_recovery_reference_miles(state),
         )
         if result is not None
         else 1.0
@@ -1159,8 +1271,11 @@ def _decayed_recovery_load(
         completed_units, _ = athlete_relative_session_load(
             raw_state.last_run,
             prior_typical_load(raw_state),
-            performance_anomaly=raw_state.recent_performance_anomaly,
+            performance_response=raw_state.recent_performance_response,
             drift_percent=raw_state.last_run_drift_percent,
+            prescribed_intensity_factor=(
+                raw_state.last_run_prescribed_intensity_factor
+            ),
         )
         residual += decay_recovery_load(
             completed_units,
@@ -1196,10 +1311,24 @@ def _recovery_interaction_cost(
     residual_load: float,
     proposed_load: float,
 ) -> float:
-    """Price accumulated and proposed athlete-relative session load."""
+    """Price only recovery overlap added by the unresolved prior load.
 
+    Load units are normalized so an ordinary easy run is approximately one.
+    The two-unit corridor therefore represents the proposed ordinary session
+    plus one session's recoverable envelope.  Subtracting the proposed
+    session's own overflow gives the interaction a real zero point: a long
+    run is not expensive merely because it is long, but becomes progressively
+    less attractive when it is placed on top of unresolved work.
+    """
+
+    proposed = max(0.0, proposed_load)
+    overflow_without_residual = max(0.0, proposed - 2.0)
+    overflow_with_residual = max(
+        0.0,
+        max(0.0, residual_load) + proposed - 2.0,
+    )
     return (
-        max(0.0, residual_load + proposed_load - 2.0)
+        max(0.0, overflow_with_residual - overflow_without_residual)
         * PROGRAM_FIT_UNIT
     )
 
@@ -1221,6 +1350,26 @@ def _elapsed_cadence_idle_cost(
     )
 
 
+def _cadence_underfill_pressure(
+    candidate_miles: float,
+    target_distance_range: tuple[float, float],
+    horizon_days: int,
+    ordinary_easy_miles: float,
+) -> float:
+    """Return cadence urgency only for genuinely unfunded training load."""
+
+    horizon_target_low = (
+        target_distance_range[0]
+        * max(0, horizon_days)
+        / VISIBLE_HORIZON_DAYS
+    )
+    return min(
+        1.0,
+        max(0.0, horizon_target_low - max(0.0, candidate_miles))
+        / max(0.1, ordinary_easy_miles),
+    )
+
+
 def _finalized_program_recovery_cost(
     days: list[WeeklyScheduleDay],
     daily_states: list[FitnessState],
@@ -1239,7 +1388,7 @@ def _finalized_program_recovery_cost(
 
     if not daily_states:
         return 0.0
-    easy_reference_miles = sum(typical_easy_distance(daily_states[0])) / 2
+    easy_reference_miles = projected_recovery_reference_miles(daily_states[0])
     planned: list[RecommendationResponse] = []
     planned_loads: list[float] = []
     cost = 0.0
@@ -1255,35 +1404,73 @@ def _finalized_program_recovery_cost(
         slow_half_life,
         recovery_half_life_hours=RECOVERY_HALF_LIFE_HOURS,
     )
-    for index, day in enumerate(days):
-        result = day.recommendation
-        if (
-            result is None
-            or result.workout_type == WorkoutType.REST
-            or result.planned_for is None
-        ):
-            continue
+    scheduled = [
+        (index, day.recommendation)
+        for index, day in enumerate(days)
+        if day.recommendation is not None
+        and day.recommendation.workout_type != WorkoutType.REST
+        and day.recommendation.planned_for is not None
+    ]
+    scheduled_loads = [
+        _recommendation_load_units(result, easy_reference_miles)
+        for _, result in scheduled
+    ]
+    # Bridge density is frequency-neutral. Each candidate supplies its own
+    # evenly distributed reference cadence and average session load, so this
+    # term prices clustering—not the mere existence of another useful run.
+    # This preserves the stabilizing effect of recovery spacing without
+    # recreating a hidden target run count.
+    reference_gap_hours = (
+        len(days) * 24.0 / len(scheduled) if scheduled else 0.0
+    )
+    reference_load = (
+        sum(scheduled_loads) / len(scheduled_loads)
+        if scheduled_loads
+        else 0.0
+    )
+    reference_short_decay = (
+        decay_recovery_load(
+            1.0,
+            reference_gap_hours,
+            half_life_hours=short_half_life * 24.0,
+        )
+        if reference_gap_hours > 0
+        else 0.0
+    )
+    reference_immediate_decay = (
+        decay_recovery_load(
+            1.0,
+            reference_gap_hours,
+            half_life_hours=RECOVERY_HALF_LIFE_HOURS,
+        )
+        if reference_gap_hours > 0
+        else 0.0
+    )
+    steady_reference_bridge = reference_load * max(
+        0.0,
+        reference_short_decay / max(1e-9, 1.0 - reference_short_decay)
+        - reference_immediate_decay
+        / max(1e-9, 1.0 - reference_immediate_decay),
+    )
+    for position, ((index, result), proposed_load) in enumerate(
+        zip(scheduled, scheduled_loads)
+    ):
         residual_load = _decayed_recovery_load(
             daily_states[index],
             planned,
             result.planned_for,
             easy_reference_miles,
         )
-        proposed_load = _recommendation_load_units(
-            result, easy_reference_miles
-        )
         immediate_recovery_cost = _recovery_interaction_cost(
             residual_load, proposed_load
         )
         cost += immediate_recovery_cost
-        # Immediate recovery decays on the existing 12-hour half-life. Add
-        # only the residual interaction between that curve and the continuous
-        # bridge-density curve, using the same athlete-relative load units.
-        # Because the immediate portion has already been subtracted, the
-        # remaining mechanical-density interaction receives one full shared
-        # program-fit unit rather than a second overlap discount. This gives
-        # consecutive easy days a real cumulative cost without a categorical
-        # streak penalty or double-counting immediate recovery.
+        # Immediate recovery answers whether the next individual run fits.
+        # A slower bridge signal separately represents mechanical density that
+        # can accumulate across several otherwise-tolerable sessions. Squaring
+        # only that accumulated residue leaves an ordinary two-day pair legal,
+        # while a third or fourth close session becomes progressively more
+        # expensive without a calendar-based streak rule.
         bridge_only_residual = sum(
             load_units
             * max(
@@ -1305,17 +1492,60 @@ def _finalized_program_recovery_cost(
             if prior.planned_for is not None
             and prior.planned_for < result.planned_for
         )
-        # Immediate and bridge recovery share one two-session envelope. Charge
-        # only the incremental breach introduced by the slower bridge signal;
-        # pricing every nonzero pair made distant ordinary runs accumulate an
-        # unbounded frequency tax and duplicated the density objective below.
-        cost += max(
-            0.0,
-            _recovery_interaction_cost(
-                residual_load + bridge_only_residual,
-                proposed_load,
+        short_distance_rate = daily_states[
+            index
+        ].recent_load.continuous_short_term_distance_miles
+        if short_distance_rate is not None:
+            short_rate_normalization = (
+                log(2.0) * 7.0 / short_half_life
             )
-            - immediate_recovery_cost,
+            completed_short_residual = (
+                short_distance_rate
+                / max(1e-9, short_rate_normalization)
+                / max(0.1, easy_reference_miles)
+            )
+            completed_immediate_residual = _decayed_recovery_load(
+                daily_states[index],
+                [],
+                result.planned_for,
+                easy_reference_miles,
+            )
+            completed_bridge_residual = max(
+                0.0,
+                completed_short_residual - completed_immediate_residual,
+            )
+            reference_bridge_residual = steady_reference_bridge
+        else:
+            # Sparse/test states without a persisted short-term signal start
+            # from an empty history, so their equally-spaced reference grows
+            # only as many prior opportunities as actually exist.
+            completed_bridge_residual = 0.0
+            reference_bridge_residual = reference_load * sum(
+                max(
+                    0.0,
+                    decay_recovery_load(
+                        1.0,
+                        lag * reference_gap_hours,
+                        half_life_hours=short_half_life * 24.0,
+                    )
+                    - decay_recovery_load(
+                        1.0,
+                        lag * reference_gap_hours,
+                        half_life_hours=RECOVERY_HALF_LIFE_HOURS,
+                    ),
+                )
+                for lag in range(1, position + 1)
+            )
+        bridge_excess = max(
+            0.0,
+            completed_bridge_residual
+            + bridge_only_residual
+            - reference_bridge_residual,
+        )
+        cost += (
+            bridge_excess**2
+            * max(0.0, proposed_load)
+            * PROGRAM_FIT_UNIT
         )
         planned.append(result)
         planned_loads.append(proposed_load)
@@ -1389,16 +1619,9 @@ def _finalized_program_recovery_cost(
             miles * log(2.0) * 7.0 / short_half_life
         )
         # A discretely scheduled run necessarily creates an instantaneous
-        # pulse above a smooth mileage-rate target.  Permit the exact pulse
-        # produced by one athlete-typical easy session at each timescale;
-        # otherwise the short curve mistakes every ordinary run for excess
-        # density and suppresses total training.  Residual load from earlier
-        # sessions still stacks above this dynamic corridor and is charged.
-        # The full path prices the whole conditional plan; this additional
-        # term prices the portion likely to survive a fresh replan. Its weight
-        # fades on the existing bridge-density timescale, so near-term work
-        # cannot repeatedly spend the same headroom while the modular tail is
-        # still free to change.
+        # pulse above a smooth mileage-rate target. Permit one athlete-typical
+        # session at each timescale; accumulated residue from prior sessions
+        # still stacks above this corridor and is charged.
         cost += incremental_excess_cost(
             slow_rate,
             next_slow_rate,
@@ -1557,7 +1780,7 @@ def _project_state(
         state,
         prior_runs,
         state.as_of,
-        sum(typical_easy_distance(state)) / 2,
+        projected_recovery_reference_miles(state),
         recommendation_load_cache=recommendation_load_cache,
     )
     fatigue_half_life_days = float(
@@ -1567,7 +1790,7 @@ def _project_state(
     )
     projected_fatigue_miles = state.recent_load.continuous_fatigue_miles
     if projected_fatigue_miles is not None:
-        easy_reference = sum(typical_easy_distance(state)) / 2
+        easy_reference = projected_recovery_reference_miles(state)
         projected_fatigue_miles += sum(
             log(2.0)
             * _cached_recommendation_load_units(
@@ -1698,6 +1921,7 @@ def _project_state(
                 if long_runs else state.days_since_long_run
             ),
             "last_run": difficulty,
+            "last_run_activity_id": None,
             "last_run_workout_type": last.workout_type,
             "typical_easy_run_miles": stable_typical_easy_miles,
             "recovery_residual_load": projected_recovery_residual,
@@ -1708,7 +1932,10 @@ def _project_state(
             # therefore conditional on the intervening workout going as
             # prescribed, rather than assumed to inherit stale evidence.
             "last_run_drift_percent": None,
-            "recent_performance_anomaly": "unknown",
+            "last_run_prescribed_intensity_factor": None,
+            "recent_performance_response": "unknown",
+            "recent_performance_response_activity_id": None,
+            "recent_performance_response_at": None,
             "longest_run_30d_miles": max(
                 state.longest_run_30d_miles,
                 *(_midpoint(item) for item in prior_runs),
@@ -1977,7 +2204,7 @@ def _select_budgeted_timed_recommendation(
         )
         taxing_residual = 0.0
         if result.planned_for and latest_taxing and latest_taxing.planned_for:
-            easy_reference = sum(typical_easy_distance(state)) / 2
+            easy_reference = projected_recovery_reference_miles(state)
             latest_taxing_load = _recommendation_load_units(
                 latest_taxing, easy_reference
             )
@@ -2118,6 +2345,12 @@ def _materialize_candidate_sessions(
             recommendation_load_cache=recommendation_load_cache,
             projected_state_cache=projected_state_cache,
         )
+        result = _price_future_easy_at_useful_size(
+            state,
+            result,
+            offset,
+            observed_state=daily_states[offset],
+        )
         sessions.append(_CandidateSession(offset, state, result))
         if result.workout_type == WorkoutType.REST:
             if prefix_cache is not None:
@@ -2145,6 +2378,7 @@ def _adaptive_candidate_cost(
     role_loop_penalty: bool = True,
     include_mileage_path: bool = True,
     include_recovery_interactions: bool = True,
+    include_cadence_pressure: bool = True,
     prefix_cache: _CandidatePrefixCache | None = None,
     recommendation_load_cache: _RecommendationLoadCache | None = None,
     projected_state_cache: _ProjectedStateCache | None = None,
@@ -2220,7 +2454,7 @@ def _adaptive_candidate_cost(
         # horizon. Recomputing it from every future raw state lets an older run
         # rolling out of the lookback make the exact same proposed workout
         # abruptly more expensive one day later, which is not recovery decay.
-        easy_reference_miles = sum(typical_easy_distance(daily_states[0])) / 2
+        easy_reference_miles = projected_recovery_reference_miles(daily_states[0])
         residual_load = _decayed_recovery_load(
             selected_raw_state,
             planned[:-1],
@@ -2299,15 +2533,28 @@ def _adaptive_candidate_cost(
         for item in planned
         if item.planned_for is not None
     ]
-    # Cadence is a soft elapsed-time preference, not a count of blank dates.
-    # Recovery and continuous density above decide whether a shorter gap is
-    # affordable. This term only prices time *beyond* the preferred recovered
-    # cadence, so a 72-hour gap is not silently equivalent to a 48-hour gap
-    # when both programs otherwise fit. No seven-day slice is inspected.
-    cost += _elapsed_cadence_idle_cost(
-        planned_times,
-        preferred_gap_hours,
+    # Cadence pressure exists only while the candidate is genuinely short of
+    # the full-horizon mileage need. Once two calendars both fund the target,
+    # a shorter gap receives no independent reward: recovery and accumulated
+    # density decide which distribution is better. This keeps sparse plans
+    # from winning through procrastination without turning 48 hours into a
+    # frequency target that manufactures consecutive days.
+    candidate_miles = sum(minimum_density_miles_by_offset.values())
+    ordinary_easy_miles = max(
+        0.1,
+        sum(typical_easy_distance(daily_states[0])) / 2,
     )
+    cadence_need = _cadence_underfill_pressure(
+        candidate_miles,
+        target_distance_range,
+        len(daily_states),
+        ordinary_easy_miles,
+    )
+    if include_cadence_pressure and cadence_need > 0:
+        cost += cadence_need * _elapsed_cadence_idle_cost(
+            planned_times,
+            preferred_gap_hours,
+        )
 
     # There is deliberately no calendar cost for a consecutive date or a
     # three-day block. Each proposed session has already been charged against
@@ -2835,6 +3082,7 @@ def _adaptive_run_day_offsets_for_frequency(
                 completed_miles_by_offset=completed_miles_by_offset,
                 include_mileage_path=False,
                 include_recovery_interactions=False,
+                include_cadence_pressure=False,
                 prefix_cache=prefix_cache,
                 recommendation_load_cache=recommendation_load_cache,
                 projected_state_cache=projected_state_cache,
@@ -3033,6 +3281,38 @@ def _joint_candidate_program_cost(
         and day.recommendation.workout_type == WorkoutType.LONG
     ]
     shape_violation = 0.0
+    # Retained long-run durability is soft but meaningful. A candidate may
+    # shorten the long run to preserve recovery or whole-program load, but it
+    # may not make a higher-frequency calendar look artificially cheap by
+    # collapsing that run toward ordinary-easy distance. Normalize the loss
+    # across the athlete's own easy-to-long distinction: losing the entire
+    # distinction is one role-shape violation, while a small step-back remains
+    # inexpensive and fully available to the optimizer.
+    for index in long_offsets:
+        original = by_offset.get(index)
+        allocated_result = allocated[index].recommendation
+        if original is None or allocated_result is None:
+            continue
+        preferred_long = max(
+            _midpoint(original.recommendation),
+            single_session_progression_reference_miles(
+                daily_states[index]
+            ),
+        )
+        easy_midpoint = sum(typical_easy_distance(daily_states[index])) / 2
+        meaningful_long = easy_midpoint + max(
+            0.1,
+            round(easy_midpoint * 0.15, 1),
+        )
+        preservation_span = max(
+            0.25,
+            preferred_long - meaningful_long,
+        )
+        lost_distinction = max(
+            0.0,
+            preferred_long - _midpoint(allocated_result),
+        ) / preservation_span
+        shape_violation += lost_distinction * lost_distinction
     # Price the *amount* of secondary-endurance expansion rather than charging
     # a flat fee for the label. A small, useful extension should not make an
     # extra run day cheaper, while an easy run approaching long-run territory
@@ -3239,6 +3519,7 @@ def adaptive_run_day_offsets(
             role_loop_penalty=False,
             include_mileage_path=False,
             include_recovery_interactions=False,
+            include_cadence_pressure=False,
             prefix_cache=prefix_cache,
             recommendation_load_cache=recommendation_load_cache,
             projected_state_cache=projected_state_cache,
@@ -3479,17 +3760,13 @@ def _allocate_visible_distance_ranges(
                     ),
                 ),
             )
-            # Do not let successful adherence make the next long run shorter
-            # merely because the allocator can make a tidier sum that way.
-            # Retain the athlete's current single-run reference when the
-            # recovery and single-session progression ceilings can support it.
-            minimum = max(
-                minimum,
-                min(
-                    maximum,
-                    maintained_reference,
-                ),
-            )
+            # Demonstrated durability is a preferred target, not a hard floor.
+            # Making every completed progression the next long run's minimum
+            # creates a ratchet: long distance compounds faster than total
+            # program load and eventually deletes useful aerobic days. The
+            # joint allocator may step below the newest maximum when recovery
+            # or whole-program balance warrants it; retained capacity remains
+            # available as the preferred target and future ceiling.
             preferred = min(
                 maximum,
                 max(
@@ -3517,22 +3794,20 @@ def _allocate_visible_distance_ranges(
             maximum = preferred
             weight = 1.05
         else:
-            # Ordinary easy distance is a default, not a floor. When weekly
-            # mileage is better distributed across more run days, allow a
-            # shorter recovery-aware session instead of forcing every slot to
-            # carry the full standalone template. The ten-minute evidence
-            # minimum belongs to baseline acquisition, however; using it for
-            # established training created filler runs that then dragged the
-            # simulated typical-run baseline downward. Anchor the smallest
-            # allocatable midpoint to the standalone prescription for this
-            # date. A run already shortened by recovery can stay short, while
-            # a normal easy opportunity cannot be converted into a beginner
-            # calibration outing merely to increase frequency.
+            # A selected established-athlete run day must support an ordinary
+            # aerobic session. Otherwise splitting the same mileage across
+            # more dates lowers modeled recovery and lets a dense calendar of
+            # tiny runs defeat fewer useful sessions. This is athlete-relative,
+            # not a global mileage floor. A first session already shortened by
+            # recorded recovery remains eligible below the baseline; future
+            # candidate-created recovery pressure must instead choose a later
+            # date rather than manufacture another support slot.
             original_midpoint = (lower + upper) / 2
-            minimum = min(
-                original_midpoint,
-                easy_reference[0] + 0.25,
+            established_midpoint = easy_reference[0] + min(
+                0.25,
+                max(0.0, easy_reference[1] - easy_reference[0]) / 2,
             )
+            minimum = established_midpoint
             maximum = max(upper, aerobic_maximum)
             preferred = min(
                 maximum,
@@ -3549,29 +3824,30 @@ def _allocate_visible_distance_ranges(
             # every earlier session and applies the actual sequential limit.
             # Keeping both caps made the optimizer add many tiny runs instead
             # of considering one intentional medium-long aerobic session.
-            # The first planned session is different: its recommendation has
-            # already priced the athlete's *recorded* preceding run, which is
-            # outside this candidate calendar and cannot be recomputed below.
-            # Preserve that ceiling when recovery shortened the opening run;
-            # only later sessions may replace their provisional cap with the
-            # sequential projection of finalized workouts.
-            observed_load_ratio = effective_load_ratio(
-                daily_states[index].recent_load
-            )
-            observed_over_capacity = bool(
-                observed_load_ratio is not None
-                and observed_load_ratio > 1.0
-                and "includes_planned_sessions"
-                not in daily_states[index].recent_load.flags
-            )
+            # Today's session is different: its recommendation has already
+            # priced the athlete's *recorded* preceding run, which is outside
+            # this candidate calendar and cannot be recomputed below. Preserve
+            # that ceiling when recovery shortened a same-day run. Explicit
+            # future caution/not-ready ranges are safety caps too; calendar
+            # search prices those smaller sessions and can prefer a later
+            # ready date. A merely provisional future *ready* range is not a
+            # cap: treating every first selected date as "today" let daily
+            # replanning manufacture a new tiny support run after each
+            # completion and eventually build dense run streaks.
             if (
                 upper < easy_reference[1] - 1e-9
-                and (previous_run_index is None or observed_over_capacity)
+                and (
+                    index == 0
+                    or _observed_easy_safety_cap(
+                        daily_states[index], result
+                    )
+                )
             ):
                 # Options are prescription midpoints, whereas ``upper`` is
                 # the top of the executable range. Cap the midpoint at the
                 # midpoint already approved by recovery.
                 maximum = (lower + upper) / 2
+                minimum = min(minimum, maximum)
                 preferred = min(preferred, maximum)
         # Every option represents the prescription midpoint. Quarter-mile
         # centers support ordinary half-mile-wide route ranges without moving
@@ -3703,7 +3979,7 @@ def _allocate_visible_distance_ranges(
             ranges[record["index"]] = (lower, upper)
         return ranges
 
-    stable_easy_reference = sum(typical_easy_distance(daily_states[0])) / 2
+    stable_easy_reference = projected_recovery_reference_miles(daily_states[0])
     records_by_index = {record["index"]: record for record in records}
     base_load_units_by_index = {
         record["index"]: _recommendation_load_units(
@@ -4869,6 +5145,19 @@ def build_weekly_schedule(
     }
     prior_run_offsets -= forced_rest_offsets
     prior_run_offsets -= completed_run_offsets
+    # If the latest run completed the prior prescription, the immediately
+    # following day stays rest when that is what the prior plan showed. This
+    # covers both an upload later on run day (offset 1) and the next day's
+    # refresh (offset 0). The rest is optimizer-only, not user-forced.
+    continuity_rest_offsets: set[int] = set()
+    next_day_offset = _post_adherence_rest_offset(
+        daily_states[0], prior_plan_days, planning_horizon_days
+    )
+    if (
+        next_day_offset is not None
+        and next_day_offset not in completed_run_offsets
+    ):
+        continuity_rest_offsets.add(next_day_offset)
     if (
         target_evidence is not None
         and target_evidence.planning_mode
@@ -4910,7 +5199,9 @@ def build_weekly_schedule(
             int(target_run_count or 0),
             target_distance_range,
             daily_state_options=daily_state_options,
-            forced_rest_offsets=forced_rest_offsets,
+            forced_rest_offsets=(
+                forced_rest_offsets | continuity_rest_offsets
+            ),
             completed_run_offsets=completed_run_offsets,
             completed_miles_by_offset=completed_miles_by_offset,
             prior_run_offsets=prior_run_offsets,

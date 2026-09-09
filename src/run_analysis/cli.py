@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 import json
@@ -19,6 +20,40 @@ from .processing import process_activities
 from .project_setup import initialize_project
 from .reporting import write_report
 from .weather import update_weather
+
+
+@contextmanager
+def _server_instance_lock(database: Path):
+    """Allow one web-server parent to own a coaching database at a time."""
+
+    database.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = database.with_name(f"{database.name}.server.lock")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - exercised by Windows users
+            import msvcrt
+
+            handle.seek(0, 2)
+            if handle.tell() == 0:
+                handle.write("\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise BlockingIOError(
+                    f"database server lock is already held: {lock_path}"
+                ) from error
+            unlock = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            unlock()
 
 
 def _project_and_config(args: Namespace) -> tuple[Path, dict]:
@@ -172,23 +207,41 @@ def command_serve(args: Namespace) -> int:
 
     from .web.app import CONFIG_PATH_ENV, PROJECT_ROOT_ENV, create_app
 
-    initialize_project(args.project_root, args.config)
-    if args.no_reload:
-        uvicorn.run(create_app(args.project_root, args.config), host=args.host, port=args.port)
-        return 0
+    root, config = _project_and_config(args)
+    database = resolve_project_path(root, config["paths"]["database"])
+    try:
+        with _server_instance_lock(database):
+            # Project setup is harmlessly idempotent, but keeping it inside the
+            # ownership window also prevents two launchers from racing through
+            # any future database initialization added to that routine.
+            initialize_project(args.project_root, args.config)
+            if args.no_reload:
+                uvicorn.run(
+                    create_app(args.project_root, args.config),
+                    host=args.host,
+                    port=args.port,
+                )
+                return 0
 
-    # The reloader re-imports in a fresh worker, so the target has to be an
-    # import string and its arguments have to travel by environment.
-    os.environ[PROJECT_ROOT_ENV] = str(Path(args.project_root).resolve())
-    os.environ[CONFIG_PATH_ENV] = str(args.config)
-    uvicorn.run(
-        "run_analysis.web.app:create_app_from_env",
-        factory=True,
-        host=args.host,
-        port=args.port,
-        reload=True,
-        reload_dirs=[str(Path(__file__).resolve().parent)],
-    )
+            # The reloader re-imports in a fresh worker, so the target has to be
+            # an import string and its arguments have to travel by environment.
+            # The parent retains this database lock across worker reloads.
+            os.environ[PROJECT_ROOT_ENV] = str(root)
+            os.environ[CONFIG_PATH_ENV] = str(args.config)
+            uvicorn.run(
+                "run_analysis.web.app:create_app_from_env",
+                factory=True,
+                host=args.host,
+                port=args.port,
+                reload=True,
+                reload_dirs=[str(Path(__file__).resolve().parent)],
+            )
+    except BlockingIOError:
+        print(
+            f"Another Running Coach server already owns {database}. "
+            "Stop that server before starting a second instance."
+        )
+        return 1
     return 0
 
 

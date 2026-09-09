@@ -37,6 +37,7 @@ from .web.schemas import (
     RecommendationResponse,
     WeeklyScheduleRequest,
     WeeklyScheduleResponse,
+    WeeklyTargetEvidence,
     WeeklyScheduleDay,
     TrailingCalendarDay,
     TrailingDayActivity,
@@ -457,6 +458,7 @@ def generate_weekly_schedule(
         and run.start_time.astimezone(local_zone).date() == start_date
         and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
     ]
+    completed_by_offset = {0: completed_today} if completed_today else {}
     result = build_weekly_schedule(
         daily_states,
         shared_request,
@@ -464,7 +466,7 @@ def generate_weekly_schedule(
         target_run_count=target_runs,
         target_distance_range=target_distance,
         target_evidence=target_evidence,
-        completed_activities_by_offset=({0: completed_today} if completed_today else None),
+        completed_activities_by_offset=completed_by_offset,
         daily_state_options=daily_state_options,
         forced_rest_offsets=forced_rest_offsets,
         prior_schedule=prior_schedule,
@@ -520,6 +522,46 @@ def generate_weekly_schedule(
         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at_utc=excluded.updated_at_utc
         """,
         (result.model_dump_json(), datetime.now(timezone.utc).isoformat()),
+    )
+    connection.execute(
+        """
+        INSERT INTO app_state(key,value_json,updated_at_utc)
+        VALUES ('weekly_planner_snapshot',?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            value_json=excluded.value_json,
+            updated_at_utc=excluded.updated_at_utc
+        """,
+        (
+            json.dumps(
+                {
+                    "planner_version": WEEKLY_PLANNER_VERSION,
+                    "generated_at": result.generated_at.isoformat(),
+                    "request": shared_request.model_dump(mode="json"),
+                    "config": config,
+                    "daily_state_options": [
+                        [state.model_dump(mode="json") for state in options]
+                        for options in daily_state_options
+                    ],
+                    "target_run_count": target_runs,
+                    "target_distance_range": list(target_distance),
+                    "target_evidence": target_evidence.model_dump(mode="json"),
+                    "completed_activities_by_offset": {
+                        str(offset): [item.model_dump(mode="json") for item in items]
+                        for offset, items in completed_by_offset.items()
+                    },
+                    "forced_rest_offsets": sorted(forced_rest_offsets),
+                    "prior_schedule": (
+                        prior_schedule.model_dump(mode="json")
+                        if prior_schedule is not None
+                        else None
+                    ),
+                    "result": result.model_dump(mode="json"),
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            datetime.now(timezone.utc).isoformat(),
+        ),
     )
     connection.execute(
         """
@@ -592,6 +634,94 @@ def load_latest_weekly_planning_days(
         WeeklyScheduleDay.model_validate(day)
         for day in payload.get("days", [])
     ]
+
+
+def replay_latest_weekly_schedule(
+    connection: sqlite3.Connection,
+) -> tuple[WeeklyScheduleResponse, WeeklyScheduleResponse] | None:
+    """Re-run the optimizer from its exact persisted inputs.
+
+    The first item is the saved result and the second is the replay. Callers
+    can compare every coaching decision while deliberately ignoring the wall
+    clock timestamp attached to the newly materialized response.
+    """
+
+    row = connection.execute(
+        "SELECT value_json FROM app_state WHERE key='weekly_planner_snapshot'"
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row[0])
+    if payload.get("planner_version") != WEEKLY_PLANNER_VERSION:
+        return None
+    options = [
+        [FitnessState.model_validate(state) for state in states]
+        for states in payload["daily_state_options"]
+    ]
+    completed = {
+        int(offset): [TrailingDayActivity.model_validate(item) for item in items]
+        for offset, items in payload.get("completed_activities_by_offset", {}).items()
+    }
+    prior_payload = payload.get("prior_schedule")
+    replay = build_weekly_schedule(
+        [states[0] for states in options],
+        RecommendationRequest.model_validate(payload["request"]),
+        payload["config"],
+        target_run_count=payload["target_run_count"],
+        target_distance_range=tuple(payload["target_distance_range"]),
+        target_evidence=WeeklyTargetEvidence.model_validate(
+            payload["target_evidence"]
+        ),
+        completed_activities_by_offset=completed,
+        daily_state_options=options,
+        forced_rest_offsets=set(payload.get("forced_rest_offsets", [])),
+        prior_schedule=(
+            WeeklyScheduleResponse.model_validate(prior_payload)
+            if prior_payload is not None
+            else None
+        ),
+    )
+    saved = WeeklyScheduleResponse.model_validate(payload["result"])
+
+    def preserve_materialization_times(
+        replay_days: list[WeeklyScheduleDay],
+        saved_days: list[WeeklyScheduleDay],
+    ) -> list[WeeklyScheduleDay]:
+        saved_by_date = {day.date: day for day in saved_days}
+        output: list[WeeklyScheduleDay] = []
+        for day in replay_days:
+            saved_day = saved_by_date.get(day.date)
+            if (
+                day.recommendation is not None
+                and saved_day is not None
+                and saved_day.recommendation is not None
+            ):
+                day = day.model_copy(
+                    update={
+                        "recommendation": day.recommendation.model_copy(
+                            update={
+                                "generated_at": (
+                                    saved_day.recommendation.generated_at
+                                )
+                            }
+                        )
+                    }
+                )
+            output.append(day)
+        return output
+
+    replay = replay.model_copy(
+        update={
+            "generated_at": saved.generated_at,
+            "emergency_alerts_checked_at": saved.emergency_alerts_checked_at,
+            "trailing_days": saved.trailing_days,
+            "days": preserve_materialization_times(replay.days, saved.days),
+            "planning_days": preserve_materialization_times(
+                replay.planning_days, saved.planning_days
+            ),
+        }
+    )
+    return saved, replay
 
 
 def _enrich_saved_schedule_load_context(

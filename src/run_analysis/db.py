@@ -10,7 +10,7 @@ import sqlite3
 from .privacy import private_directory, private_file
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -226,6 +226,7 @@ def initialize(connection: sqlite3.Connection) -> None:
         _migrate_v13(connection)
         _migrate_v14(connection)
         _migrate_v15(connection)
+        _migrate_v16(connection)
         # The marker describes a completed migration, never an attempted one.
         connection.execute(
             "INSERT INTO schema_metadata(key, value) VALUES('schema_version', ?) "
@@ -627,4 +628,18 @@ def _migrate_v15(connection: sqlite3.Connection) -> None:
         connection,
         "activity_plan_matches",
         ["duration_delta_minutes REAL NOT NULL DEFAULT 0"],
+    )
+
+
+def _migrate_v16(connection: sqlite3.Connection) -> None:
+    """Persist one workout-structure decision for every downstream view."""
+
+    _add_columns(
+        connection,
+        "activity_metrics",
+        [
+            "detected_workout_type TEXT",
+            "workout_detection_source TEXT",
+            "workout_detection_confidence TEXT",
+        ],
     )

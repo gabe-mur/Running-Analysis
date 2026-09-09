@@ -11,6 +11,8 @@ from run_analysis.adherence_projection import (
     OverloadScenario,
     ProjectionRun,
     _completed_activities_on_plan_date,
+    _completed_planning_role,
+    _consecutive_date_streaks,
     _human_breaks,
     _observed_human_difficulty,
     _projected_difficulty,
@@ -69,6 +71,48 @@ def test_human_intensity_drift_becomes_observed_load_evidence() -> None:
     assert normal.zone_load is not None
     assert drifted.zone_load > normal.zone_load
     assert drifted.zone_breakdown.hard_minutes > 0
+
+
+@pytest.mark.parametrize(
+    ("planned_role", "actual_type", "expected_role"),
+    [
+        ("ordinary_easy", WorkoutType.EASY, "ordinary_easy"),
+        ("support_easy", WorkoutType.EASY, "support_easy"),
+        ("medium_long", WorkoutType.EASY, "medium_long"),
+        (None, WorkoutType.EASY, "ordinary_easy"),
+        ("ordinary_easy", WorkoutType.TEMPO_THRESHOLD, "quality"),
+    ],
+)
+def test_projection_preserves_completed_session_purpose(
+    planned_role: str | None,
+    actual_type: WorkoutType,
+    expected_role: str,
+) -> None:
+    planned_for = _state().as_of
+    recommendation = RecommendationResponse(
+        generated_at=planned_for,
+        fitness_state_as_of=planned_for,
+        planned_for=planned_for,
+        workout_type=WorkoutType.EASY,
+        title="Role fixture",
+        distance_range_miles=(3.5, 4.0),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+        planning_role=planned_role,
+    )
+
+    assert _completed_planning_role(recommendation, actual_type) == expected_role
+
+
+def test_streak_accounting_crosses_the_recorded_to_projected_boundary() -> None:
+    tuesday = datetime(2026, 9, 8, tzinfo=timezone.utc).date()
+    wednesday = tuesday + timedelta(days=1)
+    friday = tuesday + timedelta(days=3)
+
+    assert _consecutive_date_streaks({tuesday, wednesday, friday}) == [
+        {tuesday, wednesday},
+        {friday},
+    ]
 
 
 def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> None:
@@ -349,6 +393,45 @@ def test_human_projection_can_add_an_unscheduled_rest_day_run(monkeypatch) -> No
 
     assert projection[0].planned_run_count == 0
     assert projection[0].unscheduled_run_count == 7
+    assert projection[0].run_count == 7
+
+
+def test_human_unscheduled_run_does_not_duplicate_morning_completion(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        human_profile=HumanAdherenceProfile(
+            seed=11,
+            skip_probability=0.0,
+            distance_variation_probability=0.0,
+            intensity_drift_probability=0.0,
+            substitution_probability=0.0,
+            unscheduled_easy_probability_per_day=1.0,
+            short_break_count_min=0,
+            short_break_count_max=0,
+            vacation_probability=0.0,
+        ),
+    )
+
+    # The scheduled Thursday morning run was committed on Wednesday's replan.
+    # Thursday's reload must see it in history before considering an
+    # unscheduled Thursday-evening run.
+    assert projection[0].planned_run_count == 1
+    assert projection[0].unscheduled_run_count == 6
     assert projection[0].run_count == 7
 
 
@@ -650,6 +733,34 @@ def test_short_support_runs_do_not_redefine_ordinary_easy_distance() -> None:
     )
 
     assert projected.typical_easy_run_miles == 4.0
+
+
+def test_first_projection_reload_preserves_latest_recorded_prescription_match() -> None:
+    template = _state().model_copy(
+        update={
+            "last_run_prescribed_workout_type": WorkoutType.INTERVALS,
+            "last_run_prescribed_distance_range_miles": (3.5, 4.0),
+            "last_run_completed_prescribed_workout": True,
+        }
+    )
+    latest_recorded = ProjectionRun(
+        start_time=template.as_of - timedelta(hours=12),
+        distance_miles=3.2,
+        moving_minutes=38.0,
+        workout_type=WorkoutType.INTERVALS,
+        difficulty=_difficulty(miles=3.2, quality=True),
+    )
+
+    projected = _state_at(
+        template,
+        [latest_recorded],
+        template.as_of,
+        capacity_reference=16.0,
+    )
+
+    assert projected.last_run_prescribed_workout_type == WorkoutType.INTERVALS
+    assert projected.last_run_prescribed_distance_range_miles == (3.5, 4.0)
+    assert projected.last_run_completed_prescribed_workout is True
 
 
 def test_projection_uses_prescribed_quality_dose_not_a_fixed_fraction() -> None:

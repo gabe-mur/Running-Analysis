@@ -23,6 +23,7 @@ from run_analysis.workout_scoring import (
     _recorded_continuous_quality_lap,
     analyze_intervals,
 )
+from run_analysis.workout_detection import detect_structured_workout
 
 
 def _interval(index: int, lap: int, speed: float, seconds: float, hr: int) -> MovementInterval:
@@ -85,6 +86,28 @@ def test_recorded_laps_reconstruct_work_recovery_and_hr_kinetics() -> None:
     assert first_work.end_hr_bpm is not None
     assert first_work.recovery_hr_drop_bpm is not None
     assert first_work.average_cadence_spm == 170
+
+
+def test_recorded_laps_classify_unlabelled_structured_workout_before_signals() -> None:
+    connection = _laps_connection()
+    speeds = [2.3, 3.5, 1.8, 3.45, 1.8, 3.6, 2.2]
+    intervals = []
+    for lap, speed in enumerate(speeds):
+        seconds = 300 if lap in {0, 6} else 90
+        connection.execute(
+            "INSERT INTO laps VALUES (1,?,?,?,?,?)",
+            (lap, seconds, speed * seconds, 140, 170),
+        )
+        intervals.append(_interval(lap, lap, speed, seconds, 140))
+
+    detected = detect_structured_workout(
+        connection, 1, intervals, z3_floor=154
+    )
+
+    assert detected is not None
+    assert detected.workout_type == WorkoutType.INTERVALS
+    assert detected.source == "recorded_lap_structure"
+    assert detected.confidence == ConfidenceLevel.HIGH
 
 
 def test_raw_pace_stream_infers_repetitions_when_manual_laps_are_absent() -> None:

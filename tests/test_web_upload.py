@@ -15,13 +15,19 @@ from run_analysis.recommendation_service import (
     _today_plan_time_is_stale,
     _weekly_emergency_alerts_are_stale,
     _weekly_plan_shape_is_stale,
+    generate_weekly_schedule,
+    replay_latest_weekly_schedule,
 )
+from run_analysis.prescription_matching import archive_weekly_prescriptions
+from run_analysis.run_feedback import get_run_feedback
+from run_analysis.web.schemas import WeeklyScheduleRequest
 from run_analysis.weekly_schedule import WEEKLY_PLANNER_VERSION
 from run_analysis.web.schemas import WorkoutType
 from run_analysis.web.app import create_app
 from run_analysis.web.upload_service import UploadPayload, run_upload_pipeline
 from test_tcx import TCX_TEMPLATE
 from test_web_phase1 import _write_config
+from test_prescription_matching import _schedule, _threshold
 
 
 def _tcx_bytes(
@@ -43,6 +49,52 @@ def _tcx_bytes(
         notes="upload test",
         position=position,
         hr="<HeartRateBpm><Value>145</Value></HeartRateBpm>",
+    ).encode()
+
+
+def _structured_threshold_tcx(start: datetime) -> bytes:
+    laps = []
+    elapsed = 0.0
+    cumulative_distance = 0.0
+    for duration, distance, hr in (
+        (600.0, 1800.0, 145),
+        (1080.0, 3600.0, 168),
+        (600.0, 1800.0, 148),
+    ):
+        lap_start = start + timedelta(seconds=elapsed)
+        lap_end = lap_start + timedelta(seconds=duration)
+        next_distance = cumulative_distance + distance
+        laps.append(
+            f"""
+            <Lap StartTime="{lap_start.isoformat().replace('+00:00', 'Z')}">
+              <TotalTimeSeconds>{duration}</TotalTimeSeconds>
+              <DistanceMeters>{distance}</DistanceMeters>
+              <Calories>100</Calories>
+              <AverageHeartRateBpm><Value>{hr}</Value></AverageHeartRateBpm>
+              <MaximumHeartRateBpm><Value>{hr + 5}</Value></MaximumHeartRateBpm>
+              <Intensity>Active</Intensity><TriggerMethod>Manual</TriggerMethod>
+              <Track>
+                <Trackpoint><Time>{lap_start.isoformat().replace('+00:00', 'Z')}</Time>
+                  <DistanceMeters>{cumulative_distance}</DistanceMeters>
+                  <HeartRateBpm><Value>{hr}</Value></HeartRateBpm>
+                  <Cadence>82</Cadence></Trackpoint>
+                <Trackpoint><Time>{lap_end.isoformat().replace('+00:00', 'Z')}</Time>
+                  <DistanceMeters>{next_distance}</DistanceMeters>
+                  <HeartRateBpm><Value>{hr}</Value></HeartRateBpm>
+                  <Cadence>82</Cadence></Trackpoint>
+              </Track>
+            </Lap>
+            """
+        )
+        elapsed += duration
+        cumulative_distance = next_distance
+    activity_id = start.isoformat().replace("+00:00", "Z")
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<TrainingCenterDatabase xmlns='http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'>"
+        f"<Activities><Activity Sport='Running'><Id>{activity_id}</Id>"
+        + "".join(laps)
+        + "</Activity></Activities></TrainingCenterDatabase>"
     ).encode()
 
 
@@ -174,6 +226,92 @@ def test_uploading_todays_run_refreshes_today_forward_schedule(tmp_path: Path) -
         local_today - timedelta(days=1)
     ).isoformat()
     assert all(day["date"] != local_today.isoformat() for day in schedule["trailing_days"])
+
+
+def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "config.example.yaml").read_text()
+    )
+    config["paths"].update(
+        {
+            "database": "data/test.sqlite",
+            "report": "output/report.html",
+            "weather_cache": "data/weather_cache",
+            "overrides": "run_overrides.csv",
+        }
+    )
+    config["weather"]["estimated_location_sources"] = {}
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(config), encoding="utf-8"
+    )
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=5)
+    prescribed = _threshold(start)
+    prescribed.distance_range_miles = (4.4, 4.6)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        from run_analysis.db import initialize
+
+        initialize(connection)
+        archive_weekly_prescriptions(
+            connection,
+            _schedule(start - timedelta(hours=1), prescribed),
+        )
+        connection.commit()
+
+    uploaded = run_upload_pipeline(
+        tmp_path,
+        "config.yaml",
+        [UploadPayload("structured-threshold.tcx", _structured_threshold_tcx(start))],
+    )
+    assert next(
+        stage for stage in uploaded.stages if stage.name == "prescription_match"
+    ).status == "complete"
+
+    with connect(database) as connection:
+        activity_id = uploaded.primary_activity_id
+        assert activity_id is not None
+        metric = connection.execute(
+            """
+            SELECT detected_workout_type,workout_detection_source
+            FROM activity_metrics WHERE activity_id=?
+            """,
+            (activity_id,),
+        ).fetchone()
+        assert metric["detected_workout_type"] == "tempo_threshold"
+        assert metric["workout_detection_source"] == "recorded_lap_structure"
+        feedback = get_run_feedback(connection, config, activity_id)
+        assert feedback is not None
+        match = feedback.workout_analysis.prescription_match
+        assert match is not None and match.prescribed_quality_completed
+        assert match.detection_source.startswith("recorded_lap")
+        replayed = replay_latest_weekly_schedule(connection)
+        assert replayed is not None
+        saved, replay = replayed
+        assert replay.model_dump() == saved.model_dump()
+
+        import run_analysis.recommendation_service as service
+
+        real_datetime = service.datetime
+
+        class NextDayDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = start + timedelta(days=1)
+                return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+        monkeypatch.setattr(service, "datetime", NextDayDateTime)
+        next_day = generate_weekly_schedule(
+            connection,
+            config,
+            WeeklyScheduleRequest(health_status="normal"),
+            tmp_path,
+        )
+        assert next_day.start_date == (start + timedelta(days=1)).astimezone(
+            ZoneInfo(config["timezone_default"])
+        ).date()
 
 
 def test_passed_early_slot_refreshes_but_evening_slot_lasts_until_midnight() -> None:

@@ -88,6 +88,7 @@ def _health_tag(row: sqlite3.Row) -> ActivityHealthTag:
 
 def _infer_workout_type(
     explicit: str | None,
+    detected: str | None,
     distance_miles: float,
     moving_minutes: float,
     zone_seconds: dict[str, float],
@@ -95,6 +96,9 @@ def _infer_workout_type(
 ) -> WorkoutType:
     selected = _enum_workout(explicit)
     if selected != WorkoutType.UNKNOWN:
+        return selected
+    selected = _enum_workout(detected)
+    if selected in {WorkoutType.INTERVALS, WorkoutType.TEMPO_THRESHOLD}:
         return selected
     if distance_miles >= long_threshold_miles:
         return WorkoutType.LONG
@@ -581,6 +585,8 @@ def _feedback_text(
 RUN_SELECT = """
     SELECT a.*,m.*,
            COALESCE(o.workout_type,ph.workout_type) AS workout_type,
+           m.detected_workout_type,m.workout_detection_source,
+           m.workout_detection_confidence,
            o.include_in_model,o.illness,o.notes AS override_notes,o.health_tag,o.perceived_exertion,
            ph.recommendation_json AS prescribed_recommendation_json,
            ap.timing_delta_hours AS prescription_timing_delta_hours,
@@ -654,6 +660,7 @@ def _row_summary(row: sqlite3.Row, long_threshold_miles: float = 7.0) -> RunSumm
     miles = float(row["total_distance_m"] or row["analysis_distance_m"] or 0) / METERS_PER_MILE
     workout = _infer_workout_type(
         row["workout_type"],
+        row["detected_workout_type"],
         miles,
         moving_s / 60,
         zones,
@@ -689,6 +696,9 @@ def _row_summary(row: sqlite3.Row, long_threshold_miles: float = 7.0) -> RunSumm
         data_quality=_data_quality(row, load.hr_coverage),
         fitness_observation=_fitness_observation(row, workout, health),
         session_difficulty=_difficulty(row, workout, zones),
+        prescribed_workout_type=(
+            prescription.workout_type if prescription else None
+        ),
         prescribed_planning_role=(
             prescription.planning_role if prescription else None
         ),

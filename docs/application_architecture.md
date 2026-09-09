@@ -37,9 +37,9 @@ model commands.
 | Existing source | Useful fields | Application job |
 |---|---|---|
 | `activities` | date, distance, elapsed time, summary HR, GPS/HR/elevation/cadence quality, source | Progress, feedback, upload quality |
-| `laps` | recorded time/distance/HR/intensity | Feedback |
+| `laps` | recorded time/distance/HR/intensity/trigger | Primary structured-workout detection and feedback |
 | `trackpoints` | raw time, GPS, altitude, distance, HR, cadence, speed | Moving time, mile splits, model windows |
-| `activity_metrics` | moving/device/elapsed time and pace, stops, moving HR, zones, eligibility, prior 7/28-day load, standardized result | All three jobs |
+| `activity_metrics` | moving/device/elapsed time and pace, stops, moving HR, zones, detected workout/source/confidence, eligibility, prior 7/28-day load, standardized result | All three jobs |
 | `activity_weather` / `weather_cache` | run-time weather, route-relative wind, cached raw response | Progress, feedback |
 | `model_runs` | raw pace at the comparison HR (with the `target_hr_bpm` it was scored at), atomic adjustments, standardized pace, uncertainty, per-adjustment evidence | Progress, feedback |
 | `model_metadata` | HR calibration, heat prior/personal likelihood/posterior, window diagnostics | Progress/method transparency |
@@ -99,7 +99,11 @@ The application will use the following explicit separation:
    configured. High-load, long-run-fatigue, low-quality, and noncomparable
    sessions remain visible but receive lower trend confidence rather than an
    arbitrary favorable pace correction.
-5. **Coaching decisions:** distance, session load, load ratio, long-run history,
+5. **Workout structure:** recorded TCX/FIT lap boundaries are the primary
+   evidence for interval or continuous threshold structure. Pace-stream
+   clusters are used only when usable lap structure is absent; heart rate can
+   corroborate a work lap but does not invent short-repetition boundaries.
+6. **Coaching decisions:** distance, session load, load ratio, long-run history,
    intensity leakage, response, consistency, and health status directly drive
    the Python recommendation rules.
 
@@ -112,7 +116,7 @@ distance/intensity/durability informs feedback and the next-run decision.
 - approximately one-mile splits built from raw movement intervals;
 - session zone load and hard/moderate/easy minutes;
 - current 7/14/28/30-day load, longest run, quality count, consistency, gaps;
-- comparable-window fitness evidence flags and load-confounded anomaly flags;
+- comparable-window fitness evidence flags and load-confounded response flags;
 - interpretable drift validity classification;
 - similar-run selection by workout type, HR, duration, and weather;
 - deterministic run assessment and feedback rules;

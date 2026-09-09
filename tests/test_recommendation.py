@@ -91,7 +91,7 @@ def _state(**changes) -> FitnessState:
         moderate_fraction_14d=0.10,
         moderate_evidence_runs_14d=3,
         hard_fraction_14d=0.08,
-        recent_performance_anomaly="within_recent_range",
+        recent_performance_response="within_recent_range",
     )
     values.update(changes)
     return FitnessState(**values)
@@ -361,15 +361,24 @@ def test_marginal_z3_excess_does_not_trigger_full_caution() -> None:
     assert "above the 17%" not in (result.readiness_reason or "")
 
 
-def test_recent_illness_and_poor_response_reduce_easy_volume() -> None:
-    result = _recommend(_state(recent_illness_or_recovery=True, normal_runs_since_health_event=1, recent_performance_anomaly="unusually_costly"))
-    assert result.workout_type == WorkoutType.EASY
-    assert result.distance_range_miles[1] < 5
+def test_higher_cost_response_is_not_a_second_direct_distance_penalty() -> None:
+    baseline = _recommend(_state(recent_performance_response="within_recent_range"))
+    result = _recommend(
+        _state(recent_performance_response="higher_cost_than_recent")
+    )
+    trace = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_costly_response"
+    )
+
+    assert trace.facts["performance_response_accounted_in_recovery"] is True
+    assert trace.facts["response_stress"] == 0
+    assert result.distance_range_miles == baseline.distance_range_miles
 
 
 def test_strong_response_is_not_overridden_by_modest_drift() -> None:
     state = _state(
-        recent_performance_anomaly="unusually_strong",
+        recent_performance_response="stronger_than_recent",
         last_run_drift_percent=7.1,
         days_since_quality_run=3,
         quality_sessions_14d=1,
@@ -398,7 +407,7 @@ def test_strong_response_is_not_overridden_by_modest_drift() -> None:
 
 def test_moderate_standalone_drift_scales_volume_instead_of_using_full_penalty() -> None:
     state = _state(
-        recent_performance_anomaly="within_recent_range",
+        recent_performance_response="within_recent_range",
         last_run_drift_percent=7.1,
         days_since_quality_run=3,
         quality_sessions_14d=1,
@@ -415,6 +424,35 @@ def test_moderate_standalone_drift_scales_volume_instead_of_using_full_penalty()
     assert result.workout_type == WorkoutType.EASY
     assert result.distance_range_miles[0] < typical_easy_distance(state)[0]
     assert result.distance_range_miles[1] < typical_easy_distance(state)[1]
+
+
+def test_older_comparable_anomaly_does_not_penalize_completed_quality_run_again() -> None:
+    state = _state(
+        last_run=_difficulty(miles=3.2, quality=True),
+        last_run_workout_type=WorkoutType.INTERVALS,
+        last_run_activity_id=102,
+        recent_performance_response="higher_cost_than_recent",
+        recent_performance_response_activity_id=101,
+        last_run_drift_percent=None,
+        days_since_last_run=1.5,
+        days_since_quality_run=1.5,
+    )
+    baseline = _recommend(
+        state.model_copy(
+            update={
+                "recent_performance_response": "within_recent_range",
+                "recent_performance_response_activity_id": None,
+            }
+        )
+    )
+    result = _recommend(state)
+    response = next(
+        item for item in result.rule_trace
+        if item.rule_id == "recent_costly_response"
+    )
+
+    assert response.facts["response_stress"] == 0
+    assert result.distance_range_miles == baseline.distance_range_miles
 
 
 def test_several_normal_runs_after_illness_can_restore_normal_eligibility() -> None:

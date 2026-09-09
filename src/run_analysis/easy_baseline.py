@@ -7,6 +7,30 @@ from math import exp, log
 from typing import Iterable
 
 
+def ordinary_easy_sample_distance(
+    actual_distance_miles: float,
+    planning_role: str | None,
+    prescribed_range_miles: tuple[float, float] | None,
+) -> float | None:
+    """Return the distance allowed to teach the ordinary easy baseline.
+
+    Support and medium-long sessions serve different purposes and are not
+    ordinary-run evidence. For a matched ordinary prescription, clamp modest
+    execution noise to the prescribed range: the coach may progress that
+    range, but going short or long once must not silently redefine a normal
+    session and feed a self-reinforcing frequency loop.
+    """
+
+    if actual_distance_miles <= 0:
+        return None
+    if planning_role not in {None, "ordinary_easy"}:
+        return None
+    if planning_role == "ordinary_easy" and prescribed_range_miles is not None:
+        low, high = prescribed_range_miles
+        return min(max(actual_distance_miles, low), high)
+    return actual_distance_miles
+
+
 def recency_weighted_easy_distance(
     samples: Iterable[tuple[datetime, float]],
     as_of: datetime,

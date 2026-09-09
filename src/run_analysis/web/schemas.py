@@ -312,6 +312,7 @@ class RunSummary(ApiModel):
     data_quality: DataQuality
     fitness_observation: FitnessObservation | None = None
     session_difficulty: SessionDifficulty | None = None
+    prescribed_workout_type: WorkoutType | None = None
     prescribed_planning_role: str | None = None
     prescribed_distance_range_miles: tuple[float, float] | None = None
 
@@ -457,6 +458,8 @@ class PrescriptionMatchAnalysis(ApiModel):
     summary: str
     target_work_minutes: float | None = Field(default=None, ge=0)
     detected_work_minutes: float | None = Field(default=None, ge=0)
+    prescribed_intensity_factor: float | None = Field(default=None, ge=1)
+    prescribed_quality_completed: bool = False
     aerobic_intensity_adherence_percent: float | None = Field(default=None, ge=0, le=100)
     terrain_adjusted_aerobic_adherence_percent: float | None = Field(default=None, ge=0, le=100)
     above_prescribed_intensity_minutes: float | None = Field(default=None, ge=0)
@@ -761,8 +764,13 @@ class FitnessState(ApiModel):
     days_since_quality_run: float | None = Field(default=None, ge=0)
     days_since_long_run: float | None = Field(default=None, ge=0)
     last_run: SessionDifficulty | None = None
+    last_run_activity_id: int | None = Field(default=None, ge=1)
     last_run_workout_type: WorkoutType | None = None
+    last_run_prescribed_workout_type: WorkoutType | None = None
+    last_run_prescribed_distance_range_miles: tuple[float, float] | None = None
+    last_run_completed_prescribed_workout: bool | None = None
     last_run_drift_percent: float | None = None
+    last_run_prescribed_intensity_factor: float | None = Field(default=None, ge=1)
     recovery_residual_load: float | None = Field(
         default=None,
         ge=0,
@@ -781,11 +789,13 @@ class FitnessState(ApiModel):
     moderate_fraction_14d: float | None = Field(default=None, ge=0, le=1)
     moderate_evidence_runs_14d: int = Field(default=0, ge=0)
     hard_fraction_14d: float | None = Field(default=None, ge=0, le=1)
-    recent_performance_anomaly: str = "unknown"
+    recent_performance_response: str = "unknown"
+    recent_performance_response_activity_id: int | None = Field(default=None, ge=1)
+    recent_performance_response_at: datetime | None = None
     recent_illness_or_recovery: bool = False
     normal_runs_since_health_event: int = Field(default=0, ge=0)
     current_health_status: CurrentHealthStatus = CurrentHealthStatus.NORMAL
-    anomaly_flags: list[str] = Field(default_factory=list)
+    response_flags: list[str] = Field(default_factory=list)
     data_quality_flags: list[str] = Field(default_factory=list)
     context_evidence: list[ContextEvidence] = Field(default_factory=list)
     known_blind_spots: list[str] = Field(default_factory=list)

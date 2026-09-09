@@ -110,8 +110,9 @@ signals.
 
 1. **Interpret each run.** The importer reconstructs moving time, distance,
    heart-rate zones, terrain, weather, stops, and workout structure. Explicit
-   corrections and matched prescriptions take priority. Otherwise a shared
-   fallback classifier identifies easy and long runs. Runs tagged for illness,
+   corrections and matched prescriptions take priority. Otherwise recorded
+   lap boundaries identify structured workouts first, with pace patterns used
+   only as a fallback; a shared classifier identifies easy and long runs. Runs tagged for illness,
    injury, or fitness-model exclusion remain in the training history.
 2. **Estimate aerobic progress.** Comparable runs estimate pace at the user's
    selected heart rate and reference point in the run. Weather, grade, cardiac
@@ -136,6 +137,9 @@ signals.
    evidence. The app reevaluates the plan as runs are completed, missed, or
    changed, and when rest-day or health information changes. Actual distance,
    duration, and intensity determine how completed work affects later sessions.
+   Each generated plan stores the full optimizer input so the exact decision can
+   be replayed during regression testing rather than approximated from today's
+   state.
 
 With no usable running history, a separate calibration plan begins with a
 10–30-minute conversational Zone 2 run or run/walk. Regular mileage, long runs,
