@@ -479,6 +479,14 @@ def test_rest_day_constraint_persists_replans_and_can_be_removed(tmp_path: Path)
     assert forced_day["forced_rest"] is True
     assert forced_day["day_role"] == "forced_rest_day"
     assert forced_day["recommendation"] is None
+    with connect(tmp_path / "data" / "test.sqlite") as connection:
+        snapshot = json.loads(
+            connection.execute(
+                "SELECT value_json FROM app_state "
+                "WHERE key='weekly_planner_snapshot'"
+            ).fetchone()[0]
+        )
+    assert snapshot["prior_schedule"] is None
     assert forced_plan["run_count"] == forced_plan["target_run_count"]
     assert {
         day["date"]
@@ -500,6 +508,16 @@ def test_rest_day_constraint_persists_replans_and_can_be_removed(tmp_path: Path)
     )
 
     assert removed.status_code == 200
-    assert next(
+    restored_day = next(
         day for day in removed.json()["days"] if day["date"] == selected["date"]
-    )["forced_rest"] is False
+    )
+    assert restored_day["forced_rest"] is False
+    assert restored_day["recommendation"] is not None
+    assert (
+        restored_day["recommendation"]["workout_type"]
+        == selected["recommendation"]["workout_type"]
+    )
+    assert (
+        restored_day["recommendation"]["distance_range_miles"]
+        == selected["recommendation"]["distance_range_miles"]
+    )

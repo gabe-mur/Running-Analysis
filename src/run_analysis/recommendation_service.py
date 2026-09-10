@@ -158,9 +158,17 @@ def generate_weekly_schedule(
     config: dict,
     request: WeeklyScheduleRequest,
     project_root: str | Path,
+    *,
+    discard_prior_schedule: bool = False,
 ) -> WeeklyScheduleResponse:
     """Create and persist an automatic seven-day schedule starting today."""
     prior_schedule = load_latest_weekly_schedule(connection)
+    if discard_prior_schedule:
+        # A forced-rest schedule is a temporary constrained solution, not a
+        # valid continuity baseline after the user removes that constraint.
+        # Re-run the normal optimizer from current evidence so its empty slot
+        # cannot perpetuate itself through candidate seeding or soft costs.
+        prior_schedule = None
     if (
         prior_schedule is not None
         and prior_schedule.planner_version != WEEKLY_PLANNER_VERSION

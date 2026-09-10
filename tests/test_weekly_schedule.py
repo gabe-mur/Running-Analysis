@@ -19,6 +19,7 @@ from run_analysis.weekly_schedule import (
     _rest_day_rationale,
     _select_joint_finalists,
     _select_timed_recommendation,
+    _target_derived_bridge_reference,
     adaptive_run_day_offsets,
     automatic_run_day_offsets,
     build_weekly_schedule,
@@ -3546,6 +3547,43 @@ def test_finalized_program_prices_committed_short_term_density() -> None:
     # reference. Clustering is costly, while an adequately spaced sequence may
     # legitimately reach the interaction's zero point.
     assert clustered_short_recovery > isolated_short_recovery >= 0
+
+
+def test_bridge_density_reference_is_derived_from_target_and_session_evidence() -> None:
+    base = _state(typical_easy_run_miles=4.0, running_days_28d=12)
+    base = base.model_copy(
+        update={
+            "recent_load": base.recent_load.model_copy(
+                update={
+                    "trailing_28d": base.recent_load.trailing_28d.model_copy(
+                        update={"distance_miles": 64.0, "activity_count": 16}
+                    )
+                }
+            )
+        }
+    )
+
+    reference_gap_hours, reference_load = _target_derived_bridge_reference(
+        base, (18.0, 20.0), 4.0
+    )
+    short_history = base.model_copy(
+        update={
+            "recent_load": base.recent_load.model_copy(
+                update={
+                    "trailing_28d": base.recent_load.trailing_28d.model_copy(
+                        update={"distance_miles": 16.0, "activity_count": 16}
+                    )
+                }
+            )
+        }
+    )
+    assert reference_gap_hours == pytest.approx(4.0 * 7.0 * 24.0 / 19.0)
+    assert reference_load == pytest.approx(1.0)
+    # Incidental short runs cannot shrink the protected ordinary-session unit
+    # and thereby manufacture permission for a denser calendar.
+    assert _target_derived_bridge_reference(
+        short_history, (18.0, 20.0), 4.0
+    ) == pytest.approx((reference_gap_hours, reference_load))
 
 
 def test_post_long_catch_up_keeps_the_immediate_slot_aerobic() -> None:

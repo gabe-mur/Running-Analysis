@@ -783,6 +783,7 @@ def simulate_adherence(
     human_profile: HumanAdherenceProfile | None = None,
     overload_profile: OverloadAdherenceProfile | None = None,
     initial_schedule: WeeklyScheduleResponse | None = None,
+    simulation_days: int | None = None,
 ) -> list[ProjectionWeek]:
     """Roll the real planner forward under controlled adherence behavior.
 
@@ -797,6 +798,8 @@ def simulate_adherence(
 
     if not 1 <= replan_interval_days <= 7:
         raise ValueError("replan_interval_days must be between 1 and 7")
+    if simulation_days is not None and simulation_days < 1:
+        raise ValueError("simulation_days must be at least one")
     if human_profile is not None and overload_profile is not None:
         raise ValueError(
             "Human and deterministic overload profiles are mutually exclusive"
@@ -824,7 +827,11 @@ def simulate_adherence(
         )
     )
     default_hour = candidate_hours[0] if candidate_hours else 7
-    total_days = max(1, weeks) * 7
+    total_days = (
+        int(simulation_days)
+        if simulation_days is not None
+        else max(1, weeks) * 7
+    )
     simulation_start_date = start_at.date()
     breaks = (
         _human_breaks(human_profile, simulation_start_date, total_days)

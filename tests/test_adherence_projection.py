@@ -115,6 +115,46 @@ def test_streak_accounting_crosses_the_recorded_to_projected_boundary() -> None:
     ]
 
 
+def test_projection_can_limit_exact_daily_replans_to_scenario_boundary(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def empty_schedule(daily_states, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        generated_at = daily_states[0].as_of
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=0,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=0,
+            projected_distance_range_miles=(0.0, 0.0),
+            summary="Short replay fixture.",
+            days=[],
+            planning_days=[],
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        empty_schedule,
+    )
+    projection = simulate_adherence(
+        _state(),
+        [],
+        CONFIG,
+        _state().as_of,
+        weeks=1,
+        simulation_days=3,
+    )
+
+    assert calls == 3
+    assert len(projection) == 1
+
+
 def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> None:
     template = _state()
     morning = template.as_of.replace(hour=7)

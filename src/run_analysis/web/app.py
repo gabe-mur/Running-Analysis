@@ -482,6 +482,11 @@ def create_app(
                 config,
                 WeeklyScheduleRequest(health_status=status.health_status),
                 root,
+                # Changing availability invalidates the constrained calendar
+                # in either direction. The normal 21-day optimizer must solve
+                # the new problem instead of treating the old dates as a
+                # continuity baseline.
+                discard_prior_schedule=True,
             )
 
     @api.get(

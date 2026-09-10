@@ -71,7 +71,7 @@ from .web.schemas import (
 
 VISIBLE_HORIZON_DAYS = 7
 PLANNING_HORIZON_DAYS = 21
-WEEKLY_PLANNER_VERSION = 92
+WEEKLY_PLANNER_VERSION = 95
 MAX_ADAPTIVE_CANDIDATES = 64
 MAX_HORIZON_COUNT_OPTIONS = 14
 ALLOCATION_ASSIGNMENTS_PER_TOTAL = 16
@@ -1370,6 +1370,52 @@ def _cadence_underfill_pressure(
     )
 
 
+def _target_derived_bridge_reference(
+    state: FitnessState,
+    target_distance_range: tuple[float, float],
+    easy_reference_miles: float,
+) -> tuple[float, float]:
+    """Return one candidate-independent density reference for this replan.
+
+    The target supplies the weekly amount of work.  Demonstrated session size
+    supplies a plausible size for each exposure, without turning the resulting
+    cadence into a run-count requirement.  The protected ordinary-easy
+    baseline is a lower bound so incidental short sessions cannot teach the
+    planner that increasingly tiny runs are normal.
+
+    Both values are fixed from the opening state.  A candidate therefore
+    cannot make a dense calendar look safer merely by adding run days and then
+    using its own frequency as the recovery zero point.
+    """
+
+    target_miles_per_week = sum(target_distance_range) / 2.0
+    recent = state.recent_load.trailing_28d
+    demonstrated_session_miles = (
+        recent.distance_miles / recent.activity_count
+        if recent.activity_count > 0 and recent.distance_miles > 0
+        else 0.0
+    )
+    reference_session_miles = max(
+        0.1,
+        easy_reference_miles,
+        demonstrated_session_miles,
+    )
+    reference_sessions_per_week = (
+        target_miles_per_week / reference_session_miles
+        if target_miles_per_week > 0
+        else 0.0
+    )
+    reference_gap_hours = (
+        VISIBLE_HORIZON_DAYS * 24.0 / reference_sessions_per_week
+        if reference_sessions_per_week > 0
+        else 0.0
+    )
+    reference_load = reference_session_miles / max(
+        0.1, easy_reference_miles
+    )
+    return reference_gap_hours, reference_load
+
+
 def _finalized_program_recovery_cost(
     days: list[WeeklyScheduleDay],
     daily_states: list[FitnessState],
@@ -1415,19 +1461,27 @@ def _finalized_program_recovery_cost(
         _recommendation_load_units(result, easy_reference_miles)
         for _, result in scheduled
     ]
-    # Bridge density is frequency-neutral. Each candidate supplies its own
-    # evenly distributed reference cadence and average session load, so this
-    # term prices clustering—not the mere existence of another useful run.
-    # This preserves the stabilizing effect of recovery spacing without
-    # recreating a hidden target run count.
-    reference_gap_hours = (
-        len(days) * 24.0 / len(scheduled) if scheduled else 0.0
-    )
-    reference_load = (
-        sum(scheduled_loads) / len(scheduled_loads)
-        if scheduled_loads
-        else 0.0
-    )
+    # Every candidate must be compared with the same recovery-density zero
+    # point.  When a funded mileage target is available, derive that reference
+    # from target load and demonstrated session size.  The fallback preserves
+    # direct recovery-only callers that have no program target to compare.
+    if target_distance_range is not None:
+        reference_gap_hours, reference_load = (
+            _target_derived_bridge_reference(
+                daily_states[0],
+                target_distance_range,
+                easy_reference_miles,
+            )
+        )
+    else:
+        reference_gap_hours = (
+            len(days) * 24.0 / len(scheduled) if scheduled else 0.0
+        )
+        reference_load = (
+            sum(scheduled_loads) / len(scheduled_loads)
+            if scheduled_loads
+            else 0.0
+        )
     reference_short_decay = (
         decay_recovery_load(
             1.0,
