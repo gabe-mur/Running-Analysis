@@ -783,6 +783,7 @@ class FitnessState(ApiModel):
     retained_long_run_capacity_miles: float = Field(default=0, ge=0)
     quality_sessions_14d: int = Field(default=0, ge=0)
     completed_quality_session_count: int = Field(default=0, ge=0)
+    last_completed_quality_session_type: QualitySessionType | None = None
     running_days_28d: int = Field(default=0, ge=0)
     typical_easy_run_miles: float | None = Field(default=None, gt=0)
     easy_fraction_14d: float | None = Field(default=None, ge=0, le=1)

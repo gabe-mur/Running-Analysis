@@ -337,6 +337,22 @@ def _weather_scaled_distance(
 def _select_quality_variant(
     state: FitnessState, settings: dict[str, Any]
 ) -> QualitySessionType:
+    def rotate(candidates: list[QualitySessionType]) -> QualitySessionType:
+        """Advance from durable completed-prescription state when available."""
+
+        previous = state.last_completed_quality_session_type
+        if previous in candidates:
+            return candidates[(candidates.index(previous) + 1) % len(candidates)]
+        if previous is not None:
+            # A prior variant outside the currently appropriate pool must not
+            # seed a reshuffle. Start at the contextual pool's explicit first
+            # preference instead.
+            return candidates[0]
+        # With no exact completed prescription, use the explicit first
+        # preference. A mutable inferred lifetime count is deliberately not a
+        # rotation seed because historical reprocessing can change it.
+        return candidates[0]
+
     configured = settings.get("quality_sessions") or {}
     ordinary_order = [
         QualitySessionType.FARTLEK,
@@ -361,9 +377,7 @@ def _select_quality_variant(
         # the same structure indefinitely.
         preferred_enabled = [item for item in preferred if item in enabled]
         if preferred_enabled:
-            return preferred_enabled[
-                state.completed_quality_session_count % len(preferred_enabled)
-            ]
+            return rotate(preferred_enabled)
     if state.days_since_quality_run is None or state.days_since_quality_run >= 21:
         adaptable = [
             item
@@ -375,10 +389,8 @@ def _select_quality_variant(
             if item in enabled
         ]
         if adaptable:
-            return adaptable[
-                state.completed_quality_session_count % len(adaptable)
-            ]
-    return enabled[state.completed_quality_session_count % len(enabled)]
+            return rotate(adaptable)
+    return rotate(enabled)
 
 
 def _quality_structure_distance(
@@ -1665,6 +1677,11 @@ def recommend_next_run(
                 selected_variant=quality_kind.value,
                 enabled_variants=", ".join(enabled_quality),
                 completed_quality_session_count=state.completed_quality_session_count,
+                last_completed_quality_session_type=(
+                    state.last_completed_quality_session_type.value
+                    if state.last_completed_quality_session_type
+                    else None
+                ),
                 days_since_quality_run=state.days_since_quality_run,
                 adaptable_return_from_quality_gap=(
                     state.days_since_quality_run is None

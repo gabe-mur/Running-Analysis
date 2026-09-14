@@ -21,6 +21,7 @@ from run_analysis.web.schemas import (
     LoadWindow,
     PaceValue,
     PlannedWeather,
+    QualitySessionType,
     RecommendationRequest,
     SessionDifficulty,
     WeatherExposureBaseline,
@@ -793,6 +794,7 @@ def test_quality_workout_recommends_one_structure_not_a_menu() -> None:
         _state(
             days_since_quality_run=8,
             completed_quality_session_count=2,
+            last_completed_quality_session_type=QualitySessionType.PROGRESSION,
             days_since_long_run=3,
         )
     )
@@ -842,6 +844,7 @@ def test_only_two_hour_quality_sessions_expand_to_multi_part_structure() -> None
         _state(
             days_since_quality_run=8,
             completed_quality_session_count=2,
+            last_completed_quality_session_type=QualitySessionType.PROGRESSION,
             days_since_long_run=3,
         )
     )
@@ -921,6 +924,7 @@ def test_general_fitness_quality_stimuli_rotate_without_random_plan_churn() -> N
         _state(
             days_since_quality_run=8,
             completed_quality_session_count=1,
+            last_completed_quality_session_type=QualitySessionType.FARTLEK,
             days_since_long_run=3,
         )
     )
@@ -934,6 +938,45 @@ def test_general_fitness_quality_stimuli_rotate_without_random_plan_churn() -> N
             days_since_long_run=3,
         )
     ).quality_session_type == first.quality_session_type
+
+
+def test_quality_rotation_advances_from_completed_variant_not_mutable_count() -> None:
+    before_backfill = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=4,
+            last_completed_quality_session_type=QualitySessionType.SHORT_INTERVALS,
+            days_since_long_run=3,
+        )
+    )
+    after_backfill = _recommend(
+        _state(
+            days_since_quality_run=8,
+            completed_quality_session_count=33,
+            last_completed_quality_session_type=QualitySessionType.SHORT_INTERVALS,
+            days_since_long_run=3,
+        )
+    )
+
+    assert before_backfill.quality_session_type == QualitySessionType.LONG_INTERVALS
+    assert after_backfill.quality_session_type == QualitySessionType.LONG_INTERVALS
+    trace = next(
+        item for item in after_backfill.rule_trace if item.rule_id == "quality_variant"
+    )
+    assert trace.facts["last_completed_quality_session_type"] == "short_intervals"
+
+
+def test_long_quality_gap_uses_adaptable_pool_before_rotation() -> None:
+    result = _recommend(
+        _state(
+            days_since_quality_run=30,
+            completed_quality_session_count=33,
+            last_completed_quality_session_type=QualitySessionType.SHORT_INTERVALS,
+            days_since_long_run=3,
+        )
+    )
+
+    assert result.quality_session_type == QualitySessionType.FARTLEK
 
 
 def test_long_run_recency_is_outweighed_by_high_load() -> None:

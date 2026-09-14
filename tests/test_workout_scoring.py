@@ -128,6 +128,13 @@ def test_raw_pace_stream_infers_repetitions_when_manual_laps_are_absent() -> Non
     assert result.work_repetition_count == 4
     assert result.confidence.value == "moderate"
 
+    # Pace contrast is useful run-detail evidence, but an ordinary run with
+    # hills, stops, or noisy speed can look clustered too. It cannot assign a
+    # whole-run quality label without recorded workout boundaries.
+    assert detect_structured_workout(
+        connection, 1, intervals, z3_floor=154
+    ) is None
+
 
 def test_workout_analysis_contract_has_four_dimensions_and_no_composite_score() -> None:
     assert "execution" in WorkoutAnalysis.model_fields

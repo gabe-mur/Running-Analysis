@@ -25,6 +25,7 @@ from .run_feedback import get_run_feedback, list_runs
 from .weekly_schedule import (
     BASELINE_MINIMUM_AEROBIC_MINUTES,
     WEEKLY_PLANNER_VERSION,
+    WEEKLY_WARM_START_MIN_VERSION,
     PLANNING_HORIZON_DAYS,
     PlanningActivity,
     _peak_projected_continuous_mileage_rate,
@@ -161,28 +162,51 @@ def generate_weekly_schedule(
     *,
     discard_prior_schedule: bool = False,
 ) -> WeeklyScheduleResponse:
-    """Create and persist an automatic seven-day schedule starting today."""
+    """Create and persist the next seven uncompleted calendar days."""
     prior_schedule = load_latest_weekly_schedule(connection)
     if discard_prior_schedule:
         # A forced-rest schedule is a temporary constrained solution, not a
-        # valid continuity baseline after the user removes that constraint.
+        # valid warm start after the user removes that constraint.
         # Re-run the normal optimizer from current evidence so its empty slot
-        # cannot perpetuate itself through candidate seeding or soft costs.
+        # cannot perpetuate itself through candidate seeding.
         prior_schedule = None
     if (
         prior_schedule is not None
-        and prior_schedule.planner_version != WEEKLY_PLANNER_VERSION
+        and prior_schedule.planner_version < WEEKLY_WARM_START_MIN_VERSION
     ):
         prior_schedule = None
     elif prior_schedule is not None:
         prior_schedule = prior_schedule.model_copy(
             update={
-                "planning_days": load_latest_weekly_planning_days(connection)
+                "planning_days": load_latest_weekly_planning_days(
+                    connection,
+                    minimum_planner_version=WEEKLY_WARM_START_MIN_VERSION,
+                )
             }
         )
     local_zone = ZoneInfo(str(config.get("timezone_default", "UTC")))
     local_now = datetime.now(timezone.utc).astimezone(local_zone)
-    start_date = local_now.date()
+    run_history = list_runs(connection, limit=5000)
+    completed_today = [
+        run
+        for run in run_history
+        if run.start_time
+        and run.start_time.astimezone(local_zone).date() == local_now.date()
+        and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
+    ]
+    # A completed run is evidence for recovery and load, not part of the
+    # forward work still to be allocated. Starting the optimizer on the next
+    # uncompleted date makes a post-upload plan use the same decision horizon
+    # as the following morning's refresh. Otherwise the completed mileage is
+    # subtracted from 21 future days for the rest of upload day and vanishes at
+    # midnight, creating an artificial whole-session demand discontinuity.
+    start_date = local_now.date() + timedelta(
+        days=1 if completed_today else 0
+    )
+    # Weekly target windows are calendar decisions. Anchor them to the same
+    # decision-boundary midnight so a post-run plan for tomorrow and the next
+    # morning's refresh do not differ merely by a few elapsed clock hours.
+    target_as_of = datetime.combine(start_date, time.min, tzinfo=local_zone)
     forced_rest_dates = {
         value for value in load_forced_rest_dates(connection) if value >= start_date
     }
@@ -191,7 +215,6 @@ def generate_weekly_schedule(
         for value in forced_rest_dates
         if 0 <= (value - start_date).days < PLANNING_HORIZON_DAYS
     }
-    run_history = list_runs(connection, limit=5000)
     prepared_progress = prepare_progress_data(connection)
     latest_feedback = (
         get_run_feedback(connection, config, run_history[0].activity_id)
@@ -236,7 +259,57 @@ def generate_weekly_schedule(
         and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
     ]
     target_runs, target_distance, target_evidence = derive_weekly_target(
-        history, local_now, config
+        history, target_as_of, config
+    )
+    # Whole-program normalization must not depend on which clock-time options
+    # remain on the current date.  Otherwise passing 07:00 removes that state,
+    # silently changes ``daily_states[0]`` to noon, and can rescore every later
+    # workout despite no new training evidence.  Keep a canonical state at the
+    # fixed decision boundary; schedulable time options below remain free to
+    # use their exact recovery and weather context.
+    reference_request = RecommendationRequest(
+        health_status=request.health_status,
+        planned_at=target_as_of,
+    )
+    planning_reference_state = current_fitness_state(
+        connection,
+        config,
+        reference_request,
+        prepared_progress=prepared_progress,
+        preloaded_runs=run_history,
+        preloaded_latest_feedback=latest_feedback,
+    )
+    reference_capacity = max(
+        planning_reference_state.recent_load.capacity_reference_miles or 0.0,
+        target_evidence.capacity_reference_miles,
+    )
+    planning_reference_state = planning_reference_state.model_copy(
+        update={
+            "recent_load": planning_reference_state.recent_load.model_copy(
+                update={
+                    "capacity_reference_miles": reference_capacity,
+                    "sustained_capacity_miles": max(
+                        planning_reference_state.recent_load.sustained_capacity_miles
+                        or 0.0,
+                        target_evidence.capacity_reference_miles,
+                    ),
+                    "acute_distance_to_capacity_ratio": (
+                        planning_reference_state.recent_load.trailing_7d.distance_miles
+                        / reference_capacity
+                        if reference_capacity > 0
+                        else None
+                    ),
+                    "continuous_fatigue_to_capacity_ratio": (
+                        planning_reference_state.recent_load.continuous_fatigue_miles
+                        / reference_capacity
+                        if planning_reference_state.recent_load.continuous_fatigue_miles
+                        is not None
+                        and reference_capacity > 0
+                        else None
+                    ),
+                }
+            )
+        }
     )
     # Every day receives timing/weather context before the planner compares
     # candidate date combinations. Date selection is therefore evidence-led,
@@ -257,7 +330,7 @@ def generate_weekly_schedule(
             for hour in candidate_hours
         ]
         candidates = configured_candidates
-        if offset == 0:
+        if offset == 0 and start_date == local_now.date():
             candidates = [item for item in candidates if item > local_now + timedelta(minutes=10)]
             # The current date remains part of the plan even after every
             # configured time has passed. Keep the final evening slot for the
@@ -447,26 +520,16 @@ def generate_weekly_schedule(
                 )
             )
         daily_state_options.append(states)
-    # Forecast options are weather-ranked. The leading state remains the
-    # neutral/default date state; the planner may select another exact time.
-    daily_states = [options[0] for options in daily_state_options]
+    # Forecast options are weather-ranked and remain the only schedulable
+    # states. The separate canonical opening state prevents elapsed time slots
+    # from changing whole-horizon normalization during an ordinary refresh.
+    daily_states = [
+        planning_reference_state,
+        *(options[0] for options in daily_state_options[1:]),
+    ]
     shared_request = RecommendationRequest(
         health_status=request.health_status,
     )
-    completed_today = [
-        TrailingDayActivity(
-            activity_id=run.activity_id,
-            start_time=run.start_time,
-            distance_miles=run.distance_miles,
-            workout_type=run.workout_type,
-            health_tag=run.health_tag,
-        )
-        for run in run_history
-        if run.start_time
-        and run.start_time.astimezone(local_zone).date() == start_date
-        and run.workout_type not in {WorkoutType.HIKE, WorkoutType.BIKE}
-    ]
-    completed_by_offset = {0: completed_today} if completed_today else {}
     result = build_weekly_schedule(
         daily_states,
         shared_request,
@@ -474,17 +537,18 @@ def generate_weekly_schedule(
         target_run_count=target_runs,
         target_distance_range=target_distance,
         target_evidence=target_evidence,
-        completed_activities_by_offset=completed_by_offset,
+        completed_activities_by_offset={},
         daily_state_options=daily_state_options,
         forced_rest_offsets=forced_rest_offsets,
         prior_schedule=prior_schedule,
     )
-    # Recent training is a completed-calendar-day lookback.  Including today
-    # before it is over makes "no activity yet" look like a completed rest day
-    # and drops the actual seventh prior day from the strip.
+    # Recent training ends immediately before the forward decision boundary.
+    # Ordinarily that excludes the still-open current day. After a run is
+    # completed today, the boundary advances to tomorrow and today correctly
+    # becomes the newest observed training day.
     trailing_days: list[TrailingCalendarDay] = []
     for offset in range(7, 0, -1):
-        calendar_date = local_now.date() - timedelta(days=offset)
+        calendar_date = start_date - timedelta(days=offset)
         activities = [
             run for run in run_history
             if run.start_time and run.start_time.astimezone(local_zone).date() == calendar_date
@@ -550,13 +614,13 @@ def generate_weekly_schedule(
                         [state.model_dump(mode="json") for state in options]
                         for options in daily_state_options
                     ],
+                    "daily_states": [
+                        state.model_dump(mode="json") for state in daily_states
+                    ],
                     "target_run_count": target_runs,
                     "target_distance_range": list(target_distance),
                     "target_evidence": target_evidence.model_dump(mode="json"),
-                    "completed_activities_by_offset": {
-                        str(offset): [item.model_dump(mode="json") for item in items]
-                        for offset, items in completed_by_offset.items()
-                    },
+                    "completed_activities_by_offset": {},
                     "forced_rest_offsets": sorted(forced_rest_offsets),
                     "prior_schedule": (
                         prior_schedule.model_dump(mode="json")
@@ -627,8 +691,10 @@ def load_latest_weekly_schedule(connection: sqlite3.Connection) -> WeeklySchedul
 
 def load_latest_weekly_planning_days(
     connection: sqlite3.Connection,
+    *,
+    minimum_planner_version: int = WEEKLY_PLANNER_VERSION,
 ) -> list[WeeklyScheduleDay]:
-    """Load the prior full horizon used only for soft plan continuity."""
+    """Load the prior horizon as an unpreferred optimizer warm start."""
 
     row = connection.execute(
         "SELECT value_json FROM app_state WHERE key='weekly_schedule_internal'"
@@ -636,7 +702,7 @@ def load_latest_weekly_planning_days(
     if not row:
         return []
     payload = json.loads(row[0])
-    if payload.get("planner_version") != WEEKLY_PLANNER_VERSION:
+    if int(payload.get("planner_version", 0)) < minimum_planner_version:
         return []
     return [
         WeeklyScheduleDay.model_validate(day)
@@ -666,13 +732,19 @@ def replay_latest_weekly_schedule(
         [FitnessState.model_validate(state) for state in states]
         for states in payload["daily_state_options"]
     ]
+    saved_daily_states = payload.get("daily_states")
+    daily_states = (
+        [FitnessState.model_validate(state) for state in saved_daily_states]
+        if saved_daily_states is not None
+        else [states[0] for states in options]
+    )
     completed = {
         int(offset): [TrailingDayActivity.model_validate(item) for item in items]
         for offset, items in payload.get("completed_activities_by_offset", {}).items()
     }
     prior_payload = payload.get("prior_schedule")
     replay = build_weekly_schedule(
-        [states[0] for states in options],
+        daily_states,
         RecommendationRequest.model_validate(payload["request"]),
         payload["config"],
         target_run_count=payload["target_run_count"],
@@ -1025,9 +1097,21 @@ def ensure_current_weekly_schedule(
     local_now = datetime.now(timezone.utc).astimezone(
         ZoneInfo(str(config.get("timezone_default", "UTC")))
     )
+    boundary_is_current = bool(
+        current is not None
+        and (
+            current.start_date == local_now.date()
+            or (
+                current.start_date == local_now.date() + timedelta(days=1)
+                and current.trailing_days
+                and current.trailing_days[-1].date == local_now.date()
+                and current.trailing_days[-1].activities
+            )
+        )
+    )
     reusable = (
         current is not None
-        and current.start_date == local_now.date()
+        and boundary_is_current
         and not _today_plan_time_is_stale(current, local_now, config)
         and not _weekly_plan_shape_is_stale(current)
     )

@@ -38,6 +38,7 @@ from .web.schemas import (
     FitnessState,
     LoadContext,
     LoadWindow,
+    QualitySessionType,
     ReadinessFlag,
     RecommendationRequest,
     RecommendationResponse,
@@ -64,9 +65,10 @@ def _completed_planning_role(
     """Preserve the purpose of a completed projected aerobic session.
 
     A medium-long or support run is still that kind of evidence after it is
-    completed. Relabeling every easy completion as ``ordinary_easy`` lets
-    those deliberately short or long sessions move the ordinary-run baseline
-    and creates a false feedback loop in daily replanning.
+    completed. Support work must stay identifiable so it cannot shrink the
+    ordinary-run reference; medium-long work retains its program semantics
+    even though its completed aerobic distance can stabilize the broader
+    session-scale baseline.
     """
 
     if actual_type in QUALITY_TYPES:
@@ -108,6 +110,7 @@ class ProjectionRun:
     prescribed_low_miles: float | None = None
     prescribed_high_miles: float | None = None
     prescription_title: str | None = None
+    quality_session_type: QualitySessionType | None = None
     adherence_note: str | None = None
 
 
@@ -555,6 +558,15 @@ def _state_at(
             "completed_quality_session_count": sum(
                 run.workout_type in QUALITY_TYPES for run in completed
             ),
+            "last_completed_quality_session_type": next(
+                (
+                    run.quality_session_type
+                    for run in reversed(completed)
+                    if run.workout_type in QUALITY_TYPES
+                    and run.quality_session_type is not None
+                ),
+                template.last_completed_quality_session_type,
+            ),
             "running_days_28d": len(
                 {run.start_time.date() for run in recent_28_runs}
             ),
@@ -854,11 +866,10 @@ def simulate_adherence(
         time.min,
         tzinfo=start_at.tzinfo,
     )
-    # The live app replans against its saved full-horizon schedule. Starting a
-    # projection from an empty prior plan makes the first simulated reload a
-    # materially different decision and can manufacture an opening-boundary
-    # move that production continuity would have priced. Tests may omit this
-    # when they intentionally want a clean-room projection.
+    # The live app supplies its saved full-horizon schedule as a beam-search
+    # warm start. It receives no scoring preference, but prevents an
+    # approximate candidate search from overlooking a still-optimal translated
+    # calendar after the horizon origin advances.
     previous_schedule = initial_schedule
     for plan_offset in range(0, total_days, replan_interval_days):
         plan_start = start_at + timedelta(days=plan_offset)
@@ -867,20 +878,38 @@ def simulate_adherence(
             simulation_end_at,
         )
         week_index = min(weeks - 1, plan_offset // 7)
+        completed_today = _completed_activities_on_plan_date(
+            history, plan_start
+        )
+        # Match the live planner's forward decision boundary. Once today's
+        # prescribed work has been completed, it belongs to load/history and
+        # the remaining-work optimizer starts tomorrow. This makes the
+        # post-completion plan directly comparable with the next reload.
+        decision_start_date = plan_start.date() + timedelta(
+            days=1 if completed_today else 0
+        )
+        target_as_of = datetime.combine(
+            decision_start_date,
+            time.min,
+            tzinfo=start_at.tzinfo,
+        )
         activities = [
             PlanningActivity(run.start_time, run.distance_miles) for run in history
         ]
         target_runs, target_range, evidence = derive_weekly_target(
-            activities, plan_start, config
+            activities, target_as_of, config
         )
         capacity = evidence.capacity_reference_miles
         daily_states: list[FitnessState] = []
         for offset in range(PLANNING_HORIZON_DAYS):
-            day = (plan_start + timedelta(days=offset)).date()
+            day = decision_start_date + timedelta(days=offset)
             hour = default_hour
-            if offset == 0 and plan_offset == 0:
-                future_hours = [value for value in candidate_hours if value > start_at.hour]
-                hour = future_hours[0] if future_hours else start_at.hour
+            if offset == 0 and decision_start_date == plan_start.date():
+                future_hours = [
+                    value for value in candidate_hours
+                    if value > plan_start.hour
+                ]
+                hour = future_hours[0] if future_hours else plan_start.hour
             planned_at = datetime.combine(day, time(hour), tzinfo=start_at.tzinfo)
             if planned_at < plan_start:
                 planned_at = plan_start
@@ -909,9 +938,7 @@ def simulate_adherence(
             target_run_count=target_runs,
             target_distance_range=target_range,
             target_evidence=evidence,
-            completed_activities_by_offset={
-                0: _completed_activities_on_plan_date(history, plan_start)
-            },
+            completed_activities_by_offset={},
             prior_schedule=previous_schedule,
         )
         previous_schedule = schedule
@@ -1160,6 +1187,11 @@ def simulate_adherence(
                     prescribed_low_miles=item.distance_range_miles[0],
                     prescribed_high_miles=item.distance_range_miles[1],
                     prescription_title=item.title,
+                    quality_session_type=(
+                        item.quality_session_type
+                        if actual_type in QUALITY_TYPES
+                        else None
+                    ),
                     adherence_note=(
                         adherence_note
                         if human_profile or overload_profile

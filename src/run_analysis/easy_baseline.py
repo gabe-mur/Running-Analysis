@@ -14,16 +14,20 @@ def ordinary_easy_sample_distance(
 ) -> float | None:
     """Return the distance allowed to teach the ordinary easy baseline.
 
-    Support and medium-long sessions serve different purposes and are not
-    ordinary-run evidence. For a matched ordinary prescription, clamp modest
-    execution noise to the prescribed range: the coach may progress that
-    range, but going short or long once must not silently redefine a normal
-    session and feed a self-reinforcing frequency loop.
+    Support sessions are deliberately shortened and must not shrink the
+    ordinary-run reference. Medium-long completions do remain evidence of the
+    athlete's aerobic session scale: the medium-long label is itself derived
+    from this baseline, so excluding those runs creates a circular downward
+    lock after ordinary sessions are promoted to that role. For a matched
+    ordinary prescription, clamp modest execution noise to the prescribed
+    range: the coach may progress that range, but going short or long once
+    must not silently redefine a normal session and feed a self-reinforcing
+    frequency loop.
     """
 
     if actual_distance_miles <= 0:
         return None
-    if planning_role not in {None, "ordinary_easy"}:
+    if planning_role not in {None, "ordinary_easy", "medium_long"}:
         return None
     if planning_role == "ordinary_easy" and prescribed_range_miles is not None:
         low, high = prescribed_range_miles

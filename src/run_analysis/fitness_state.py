@@ -28,9 +28,47 @@ from .web.schemas import (
     FitnessState,
     LoadWindow,
     PaceChange,
+    QualitySessionType,
     WeatherExposureBaseline,
     WorkoutType,
 )
+
+
+def _last_completed_quality_session_type(
+    connection: sqlite3.Connection,
+    quality_runs,
+) -> QualitySessionType | None:
+    """Return the newest completed quality variant backed by a prescription.
+
+    Reprocessing old activities can legitimately change a lifetime quality
+    count. It must not reshuffle the next prescribed stimulus. A completed,
+    matched prescription is durable evidence of the exact variant performed.
+    """
+
+    activity_ids = [run.activity_id for run in quality_runs]
+    if not activity_ids:
+        return None
+    placeholders = ",".join("?" for _ in activity_ids)
+    rows = connection.execute(
+        f"""
+        SELECT ap.activity_id, ph.quality_session_type
+        FROM activity_plan_matches ap
+        JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
+        WHERE ap.activity_id IN ({placeholders})
+          AND ph.quality_session_type IS NOT NULL
+        """,
+        activity_ids,
+    ).fetchall()
+    variants = {int(row[0]): str(row[1]) for row in rows}
+    for run in quality_runs:
+        value = variants.get(run.activity_id)
+        if value is None:
+            continue
+        try:
+            return QualitySessionType(value)
+        except ValueError:
+            continue
+    return None
 
 
 def _cumulative_recovery_residual(
@@ -285,6 +323,10 @@ def build_fitness_state(
             or (run.session_difficulty and run.session_difficulty.is_quality_session)
         )
     ]
+    last_completed_quality_type = _last_completed_quality_session_type(
+        connection,
+        quality,
+    )
     long_runs = [
         run for run in runs
         if run.start_time and run.session_difficulty and run.session_difficulty.is_long_run
@@ -534,6 +576,7 @@ def build_fitness_state(
         retained_long_run_capacity_miles=retained_long_capacity,
         quality_sessions_14d=progress_14.consistency.quality_sessions,
         completed_quality_session_count=len(quality),
+        last_completed_quality_session_type=last_completed_quality_type,
         running_days_28d=progress.consistency.running_days,
         typical_easy_run_miles=typical_easy_run_miles,
         easy_fraction_14d=(progress_14.intensity.easy_percent / 100 if progress_14.intensity.easy_percent is not None else None),

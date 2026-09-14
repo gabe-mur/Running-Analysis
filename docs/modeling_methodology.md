@@ -341,7 +341,10 @@ other positive-duration running is classified as easy. The fallback does not
 infer a quality label merely from heart-rate zones, because an unexpectedly
 hard easy run and a deliberately prescribed quality session have different
 planning meaning even though their recorded load is fully counted in both
-cases.
+cases. Pace-only repetition inference is likewise diagnostic: it can describe
+tentative work and recovery bouts in Run Analysis, but without recorded workout
+boundaries it cannot assign a quality label or remove a run from the fitness
+trend.
 
 ## VO2-max estimate
 
@@ -435,13 +438,15 @@ capacity evidence rather than a hard 28-day cutoff. An easy run intentionally
 shortened by the allocator is archived with a `support_easy` planning role. Its
 completed distance, duration, intensity, and recovery cost remain fully counted,
 but it does not teach the planner that the athlete's ordinary aerobic run has
-become that short. Medium-long aerobic work is also kept out of this baseline;
-otherwise endurance sessions would make an ordinary run progressively longer.
-For a matched `ordinary_easy` prescription, the completed sample is bounded by
-the prescribed range before it teaches the baseline. This lets the coach
-progress the range while preventing one short or long execution from creating a
-self-reinforcing change in session frequency. Unmatched easy running remains
-direct evidence because there is no prescription against which to interpret it.
+become that short. Completed medium-long aerobic work remains session-scale
+evidence because the medium-long boundary is derived from this same baseline;
+excluding it would create a circular downward lock once normal-length runs were
+labeled medium-long. For a matched `ordinary_easy` prescription, the completed
+sample is bounded by the prescribed range before it teaches the baseline. This
+lets the coach progress the range while preventing one short or long execution
+from creating a self-reinforcing change in session frequency. Unmatched easy
+running remains direct evidence because there is no prescription against which
+to interpret it.
 
 The established planner evaluates a continuous 21-day calendar before showing
 the first seven days. Dates, workout roles, and distance ranges are compared
@@ -455,18 +460,20 @@ recovery are separate eligibility checks. A negative preference score is not
 silently treated as a new hard veto.
 The finite day-21 edge is not a mileage deadline. A boundary-free load corridor
 governs when mileage can be placed, the full-horizon rate governs how much is
-funded, and a recency-decayed prior-plan preference prevents normal adherence
-from pulling the next workout forward merely because the horizon moved one day.
-When the latest run matches the prior plan's type and distance range, the day
-immediately after it remains rest if that is what the prior plan already
-showed. This works both just after an upload and on the next day's refresh. It
-is not a recovery prohibition or a cached schedule: a consecutive run already
-in the plan remains legal, later dates are regenerated, and missed, shifted,
-short, long, or differently executed work can immediately select a different
-branch. It prevents successful adherence itself from manufacturing a surprise
-workout in a rest slot. For quality sessions, completing the detected
-structured dose establishes adherence even when optional surrounding easy
-mileage leaves total distance below the displayed range.
+funded. Once a run is uploaded, the forward decision boundary advances to the
+following day: completed work remains in load and recovery history but is not
+subtracted from the mileage still to allocate across 21 future days. The saved
+plan translated onto that boundary is supplied as a search warm start and is
+guaranteed full role-aware scoring. It receives no continuity bonus and no date
+is locked; it remains only when the ordinary objective still considers it the
+better program. This prevents an approximate beam from overlooking yesterday's
+still-optimal calendar while allowing health, recovery, weather, missed work,
+or any genuinely better candidate to change it. Bounded one-day translations
+of its first three sessions receive the same full scoring so an approximate
+shortlist cannot hide a better nearby calendar. Compatible prior plans remain
+warm starts across planner-version migrations even though the displayed plan is
+regenerated. The same boundary and a calendar-midnight target anchor are used
+immediately after upload and on the next morning's refresh.
 The full lookahead still evaluates recovery, workout sequence, and overload,
 but a 4/4/3-run horizon cannot create terminal "mileage debt" that manufactures
 a fifth short run in the visible segment. Frequency candidates are compared
@@ -493,14 +500,15 @@ procrastination from erasing useful candidates without turning a provisional
 underfill estimate into an implicit frequency target that manufactures
 consecutive dates.
 
-The adherence simulator uses the same receding horizon and defaults to
-regenerating it every simulated day. Seven-day `ProjectionWeek` rows are report
-buckets only: streaks and rolling load are calculated from the continuous dated
-run history across row boundaries. A seven-day commit interval exists solely as
-an explicitly requested fast-test mode and is not production-fidelity evidence
-about schedule spacing. Its prescribed-distance column sums the recommendations
-actually committed between replans. If a run is missed and the next daily plan
-offers a replacement, both are reported as separate attempts; they were never
+The adherence simulator uses the same receding horizon, advances its forward
+boundary after same-day completed work, and defaults to regenerating it every
+simulated day. Seven-day `ProjectionWeek` rows are report buckets only: streaks
+and rolling load are calculated from the continuous dated run history across
+row boundaries. A seven-day commit interval exists solely as an explicitly
+requested fast-test mode and is not production-fidelity evidence about schedule
+spacing. Its prescribed-distance column sums the recommendations actually
+committed between replans. If a run is missed and the next daily plan offers a
+replacement, both are reported as separate attempts; they were never
 simultaneous mileage in one live plan.
 
 Its perfect mode commits every prescription at the distance midpoint. The
@@ -583,6 +591,15 @@ mileage remainder. The freed load competes for placement on aerobic and long
 days under the same recovery model. Only a genuinely extended quality day—at
 least two hours—uses the separate bounded multi-part design in which a fixed
 quality dose is embedded in a longer aerobic session.
+
+Quality variants are not selected from a mutable lifetime workout count. The
+planner first narrows the enabled variants to the contextually appropriate
+pool: race-specific stimuli for a configured race goal, or adaptable fartlek,
+progression, and threshold work after a long quality gap. Within that pool it
+advances deterministically from the most recent completed matched prescription.
+Reprocessing older activities can therefore change readiness and load evidence
+without reshuffling the next workout type. With no completed matched variant,
+the pool's explicit first preference supplies a stable starting point.
 
 Race goals add a required trajectory rather than merely changing workout
 labels. Each profile defines a preparation-level peak weekly volume and long
@@ -732,11 +749,16 @@ Only excess concentration is squared and combined with the next session, so
 the bridge prices a dense block without becoming a hidden penalty on higher
 run frequency. The completed portion is reconstructed from the persisted
 continuous short-term distance signal, so daily regeneration cannot forget a
-dense sequence that crossed the old plan boundary. It does not create a categorical
-consecutive-day rule. This prevents independent point
-multipliers for mileage, support, schedule shape, and recovery from silently
-changing their relative importance. Weather, cadence, and plan-continuity terms
-remain graded tradeoffs rather than physiological thresholds.
+dense sequence that crossed the old plan boundary. A separate smooth cadence
+term spans the completed-history/plan seam, and a load-scaled compression term
+prices the third session when two successive gaps are shorter than the
+athlete's configured preference. Neither creates a categorical consecutive-day
+rule: an intentional double remains legal, and lighter sessions cost less.
+This prevents independent point multipliers for mileage, support, schedule
+shape, and recovery from silently changing their relative importance. Weather
+and cadence terms remain graded tradeoffs rather than physiological thresholds;
+the prior calendar changes candidate coverage but contributes no objective
+cost.
 
 ## Race-goal guardrails
 

@@ -16,6 +16,7 @@ from run_analysis.recommendation_service import (
     _weekly_emergency_alerts_are_stale,
     _weekly_plan_shape_is_stale,
     generate_weekly_schedule,
+    load_latest_weekly_planning_days,
     replay_latest_weekly_schedule,
 )
 from run_analysis.prescription_matching import archive_weekly_prescriptions
@@ -176,7 +177,10 @@ def test_upload_endpoint_accepts_multiple_tcx_files(tmp_path: Path) -> None:
     assert payload["primary_activity_id"] is None
 
 
-def test_uploading_todays_run_refreshes_today_forward_schedule(tmp_path: Path) -> None:
+def test_uploading_todays_run_advances_the_forward_decision_boundary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     config = yaml.safe_load((Path(__file__).parents[1] / "config.example.yaml").read_text())
     config["paths"].update(
         {
@@ -214,18 +218,29 @@ def test_uploading_todays_run_refreshes_today_forward_schedule(tmp_path: Path) -
     local_today = datetime.now(timezone.utc).astimezone(
         ZoneInfo(config["timezone_default"])
     ).date()
-    assert date.fromisoformat(schedule["start_date"]) == local_today
+    assert date.fromisoformat(schedule["start_date"]) == local_today + timedelta(days=1)
     assert schedule["days"][0]["date"] == schedule["start_date"]
-    assert schedule["days"][0]["recommendation"] is None
-    assert schedule["days"][0]["completed_activities"]
-    assert schedule["completed_run_count"] == 1
+    assert not schedule["days"][0]["completed_activities"]
+    assert schedule["completed_run_count"] == 0
     assert schedule["trailing_days"][0]["date"] == (
-        local_today - timedelta(days=7)
+        local_today - timedelta(days=6)
     ).isoformat()
-    assert schedule["trailing_days"][-1]["date"] == (
-        local_today - timedelta(days=1)
-    ).isoformat()
-    assert all(day["date"] != local_today.isoformat() for day in schedule["trailing_days"])
+    assert schedule["trailing_days"][-1]["date"] == local_today.isoformat()
+    assert schedule["trailing_days"][-1]["activities"]
+
+    import run_analysis.recommendation_service as service
+
+    def unexpected_regeneration(*args, **kwargs):
+        raise AssertionError("post-upload forward schedule should be reusable")
+
+    monkeypatch.setattr(service, "generate_weekly_schedule", unexpected_regeneration)
+    with connect(tmp_path / "data" / "test.sqlite") as connection:
+        reused = service.ensure_current_weekly_schedule(
+            connection,
+            config,
+            tmp_path,
+        )
+    assert reused.start_date == local_today + timedelta(days=1)
 
 
 def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
@@ -291,6 +306,10 @@ def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
         assert replayed is not None
         saved, replay = replayed
         assert replay.model_dump() == saved.model_dump()
+        expected_start = (start + timedelta(days=1)).astimezone(
+            ZoneInfo(config["timezone_default"])
+        ).date()
+        assert saved.start_date == expected_start
 
         import run_analysis.recommendation_service as service
 
@@ -309,9 +328,25 @@ def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
             WeeklyScheduleRequest(health_status="normal"),
             tmp_path,
         )
-        assert next_day.start_date == (start + timedelta(days=1)).astimezone(
-            ZoneInfo(config["timezone_default"])
-        ).date()
+        assert next_day.start_date == expected_start
+        assert (
+            next_day.target_distance_range_miles
+            == saved.target_distance_range_miles
+        )
+        def planned_signature(schedule):
+            return [
+                (
+                    day.date,
+                    day.day_role,
+                    day.recommendation.workout_type,
+                    day.recommendation.quality_session_type,
+                    day.recommendation.distance_range_miles,
+                )
+                for day in schedule.days
+                if day.recommendation is not None
+            ]
+
+        assert planned_signature(next_day) == planned_signature(saved)
 
 
 def test_passed_early_slot_refreshes_but_evening_slot_lasts_until_midnight() -> None:
@@ -425,6 +460,40 @@ def test_saved_plan_from_previous_planner_version_is_stale() -> None:
     )
 
     assert _weekly_plan_shape_is_stale(schedule) is True
+
+
+def test_compatible_previous_version_horizon_can_be_a_warm_start(
+    tmp_path: Path,
+) -> None:
+    from run_analysis.db import initialize
+
+    now = datetime(2026, 9, 14, 7, tzinfo=timezone.utc)
+    day = _schedule(now, _threshold(now)).days[0]
+    with connect(tmp_path / "warm-start.sqlite") as connection:
+        initialize(connection)
+        connection.execute(
+            "INSERT INTO app_state(key,value_json,updated_at_utc) "
+            "VALUES ('weekly_schedule_internal',?,?)",
+            (
+                json.dumps(
+                    {
+                        "planner_version": WEEKLY_PLANNER_VERSION - 1,
+                        "start_date": day.date.isoformat(),
+                        "days": [day.model_dump(mode="json")],
+                    }
+                ),
+                now.isoformat(),
+            ),
+        )
+        connection.commit()
+
+        assert load_latest_weekly_planning_days(connection) == []
+        loaded = load_latest_weekly_planning_days(
+            connection,
+            minimum_planner_version=WEEKLY_PLANNER_VERSION - 3,
+        )
+
+    assert loaded == [day]
 
 
 def test_saved_plan_that_includes_today_in_recent_history_is_stale() -> None:

@@ -16,7 +16,7 @@ from .workload import update_workloads
 from .training_load import calculate_session_load
 from .workout_detection import detect_structured_workout
 
-PROCESSOR_VERSION = "phase3-v9-lap-workout-detection"
+PROCESSOR_VERSION = "phase3-v10-recorded-workout-labels"
 
 
 @dataclass(slots=True)

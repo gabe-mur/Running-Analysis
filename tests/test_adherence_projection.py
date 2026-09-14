@@ -184,6 +184,58 @@ def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> Non
     assert completed[0].distance_miles == 3.5
 
 
+def test_projection_advances_boundary_after_a_same_day_completion(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 19, tzinfo=timezone.utc)
+    )
+    completed = ProjectionRun(
+        start_time=template.as_of.replace(hour=7),
+        distance_miles=4.0,
+        moving_minutes=44.0,
+        workout_type=WorkoutType.EASY,
+        difficulty=_difficulty(miles=4.0),
+    )
+    captured: list[tuple[datetime, dict]] = []
+
+    def empty_schedule(daily_states, *args, **kwargs):
+        captured.append(
+            (daily_states[0].as_of, kwargs["completed_activities_by_offset"])
+        )
+        generated_at = daily_states[0].as_of
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=0,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=0,
+            projected_distance_range_miles=(0.0, 0.0),
+            summary="Forward-boundary fixture.",
+            days=[],
+            planning_days=[],
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        empty_schedule,
+    )
+    simulate_adherence(
+        template,
+        [completed],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=1,
+    )
+
+    assert captured == [
+        (template.as_of.replace(day=3, hour=7), {})
+    ]
+
+
 def test_projection_passes_saved_plan_to_first_replan(monkeypatch) -> None:
     template = _state()
     captured_prior_schedules = []
@@ -248,14 +300,9 @@ def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
         for offset in range(2, 30, 2)
     ]
 
-    def next_morning_schedule(daily_states, *args, **kwargs):
+    def one_run_per_boundary_schedule(daily_states, *args, **kwargs):
         generated_at = daily_states[0].as_of
-        planned_for = (generated_at + timedelta(days=1)).replace(
-            hour=7,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+        planned_for = generated_at
         recommendation = RecommendationResponse(
             generated_at=generated_at,
             fitness_state_as_of=generated_at,
@@ -290,7 +337,7 @@ def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
 
     monkeypatch.setattr(
         "run_analysis.adherence_projection.build_weekly_schedule",
-        next_morning_schedule,
+        one_run_per_boundary_schedule,
     )
 
     projection = simulate_adherence(
@@ -302,8 +349,8 @@ def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
         replan_interval_days=1,
     )
 
-    assert [week.run_count for week in projection] == [6, 7]
-    assert [week.assumed_completed_miles for week in projection] == [24.0, 28.0]
+    assert [week.run_count for week in projection] == [7, 7]
+    assert [week.assumed_completed_miles for week in projection] == [28.0, 28.0]
 
 
 def test_human_projection_feeds_skipped_commitments_back_into_replans(
@@ -801,6 +848,33 @@ def test_first_projection_reload_preserves_latest_recorded_prescription_match() 
     assert projected.last_run_prescribed_workout_type == WorkoutType.INTERVALS
     assert projected.last_run_prescribed_distance_range_miles == (3.5, 4.0)
     assert projected.last_run_completed_prescribed_workout is True
+
+
+def test_projection_advances_exact_quality_variant_state() -> None:
+    template = _state(
+        last_completed_quality_session_type=QualitySessionType.SHORT_INTERVALS,
+    )
+    completed_long_intervals = ProjectionRun(
+        start_time=template.as_of - timedelta(hours=12),
+        distance_miles=4.7,
+        moving_minutes=48.0,
+        workout_type=WorkoutType.INTERVALS,
+        difficulty=_difficulty(miles=4.7, quality=True),
+        projected=True,
+        quality_session_type=QualitySessionType.LONG_INTERVALS,
+    )
+
+    projected = _state_at(
+        template,
+        [completed_long_intervals],
+        template.as_of,
+        capacity_reference=16.0,
+    )
+
+    assert (
+        projected.last_completed_quality_session_type
+        == QualitySessionType.LONG_INTERVALS
+    )
 
 
 def test_projection_uses_prescribed_quality_dose_not_a_fixed_fraction() -> None:

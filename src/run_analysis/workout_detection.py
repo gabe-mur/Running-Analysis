@@ -1,9 +1,10 @@
 """Detect structured running from recorded workout boundaries.
 
-Recorded laps are the primary evidence because they preserve the boundaries the
-athlete or watch workout actually used.  Pace-stream inference is deliberately
-only a fallback for files without a usable lap pattern; heart rate summarizes
-the work but never sets short-repetition boundaries because it lags effort.
+Recorded laps are authoritative evidence because they preserve the boundaries
+the athlete or watch workout actually used. Pace-stream inference can still
+reconstruct tentative repetitions for run-detail analysis, but it must not
+relabel a whole run as quality by itself. Heart rate summarizes the work but
+never sets short-repetition boundaries because it lags effort.
 """
 
 from __future__ import annotations
@@ -185,7 +186,7 @@ def detect_structured_workout(
     *,
     z3_floor: float,
 ) -> StructuredWorkoutDetection | None:
-    """Classify a structured session, preferring recorded laps over signals."""
+    """Classify a structured session only from recorded workout boundaries."""
 
     laps = recorded_laps(connection, activity_id)
     if len(recorded_interval_work_positions(laps)) >= 2:
@@ -199,11 +200,5 @@ def detect_structured_workout(
             WorkoutType.TEMPO_THRESHOLD,
             "recorded_lap_structure",
             ConfidenceLevel.HIGH,
-        )
-    if len(inferred_work_groups(intervals)) >= 2:
-        return StructuredWorkoutDetection(
-            WorkoutType.INTERVALS,
-            "pace_stream_fallback",
-            ConfidenceLevel.MODERATE,
         )
     return None

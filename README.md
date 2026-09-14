@@ -111,8 +111,9 @@ signals.
 1. **Interpret each run.** The importer reconstructs moving time, distance,
    heart-rate zones, terrain, weather, stops, and workout structure. Explicit
    corrections and matched prescriptions take priority. Otherwise recorded
-   lap boundaries identify structured workouts first, with pace patterns used
-   only as a fallback; a shared classifier identifies easy and long runs. Runs tagged for illness,
+   lap boundaries identify structured workouts; pace patterns can reconstruct
+   tentative repetitions in run details but cannot relabel the whole run. A
+   shared classifier identifies easy and long runs. Runs tagged for illness,
    injury, or fitness-model exclusion remain in the training history.
 2. **Estimate aerobic progress.** Comparable runs estimate pace at the user's
    selected heart rate and reference point in the run. Weather, grade, cardiac
@@ -130,9 +131,11 @@ signals.
 4. **Build a rolling plan.** The planner compares 21-day schedules containing
    different dates, times, workout types, and distances. It considers target
    mileage, accumulated load, recovery, useful easy volume, long- and
-   quality-session timing, weather, protected rest days, and continuity with
-   the previous plan. It does not require a fixed number of runs per calendar
-   week. The interface displays the first seven days of the plan.
+   quality-session timing, weather, and protected rest days. The translated
+   prior plan is evaluated as an unpreferred search candidate so approximate
+   search cannot discard a still-better calendar. It does not require a fixed
+   number of runs per calendar week. The interface displays the first seven
+   days of the plan.
 5. **Close the loop.** Only the work actually completed becomes training
    evidence. The app reevaluates the plan as runs are completed, missed, or
    changed, and when rest-day or health information changes. Actual distance,

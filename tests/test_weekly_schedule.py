@@ -20,6 +20,8 @@ from run_analysis.weekly_schedule import (
     _select_joint_finalists,
     _select_timed_recommendation,
     _target_derived_bridge_reference,
+    _opening_session_compression_cost,
+    _three_session_compression_cost,
     adaptive_run_day_offsets,
     automatic_run_day_offsets,
     build_weekly_schedule,
@@ -340,6 +342,7 @@ def test_projected_quality_count_uses_only_the_trailing_fourteen_days() -> None:
 
     assert projected.quality_sessions_14d == 1
     assert projected.completed_quality_session_count == 2
+    assert projected.last_completed_quality_session_type == quality.quality_session_type
 
 
 def test_due_quality_role_is_scaled_instead_of_silently_replaced_by_easy() -> None:
@@ -773,130 +776,29 @@ def test_continuous_path_is_invariant_when_a_rest_day_moves_the_origin() -> None
     assert original == pytest.approx(reloaded)
 
 
-def test_prior_full_plan_is_only_a_soft_continuity_preference() -> None:
-    prior = {1, 3, 5, 8}
-
-    unchanged = weekly_schedule._plan_continuity_cost([1, 3, 5, 8], prior)
-    shifted = weekly_schedule._plan_continuity_cost([1, 4, 6, 8], prior)
-
-    assert unchanged == 0
-    assert shifted > 0
-    assert weekly_schedule._plan_continuity_cost([1, 3, 5, 20], prior) < shifted
-
-
-def test_completed_prior_prescription_preserves_same_day_rest() -> None:
-    as_of = _state().as_of
-    planned_for = as_of - timedelta(days=1)
-    prescription = RecommendationResponse(
-        generated_at=planned_for - timedelta(days=1),
-        fitness_state_as_of=planned_for - timedelta(days=1),
-        planned_for=planned_for,
-        workout_type=WorkoutType.EASY,
-        title="Easy aerobic run",
-        distance_range_miles=(3.5, 4.0),
-        confidence=ConfidenceLevel.MODERATE,
-        readiness=ReadinessFlag.READY,
-    )
-    prior_days = [
-        WeeklyScheduleDay(
-            date=planned_for.date(),
-            planned_at=planned_for,
-            recommendation=prescription,
-            day_role="easy_run",
-            rationale="Continuity fixture.",
-        ),
-        WeeklyScheduleDay(
-            date=as_of.date(),
-            planned_at=None,
-            recommendation=None,
-            day_role="rest_day",
-            rationale="Expected post-workout rest.",
-        ),
-    ]
-    matched = _state(
-        as_of=as_of,
-        days_since_last_run=1.0,
-        last_run=_difficulty(miles=3.8),
-        last_run_workout_type=WorkoutType.EASY,
-    )
-    too_long = matched.model_copy(
-        update={"last_run": _difficulty(miles=4.8)}
-    )
-
-    assert weekly_schedule._latest_run_completed_prior_prescription(
-        matched,
-        prior_days,
-    )
-    assert not weekly_schedule._latest_run_completed_prior_prescription(
-        too_long,
-        prior_days,
-    )
-    assert weekly_schedule._post_adherence_rest_offset(
-        matched,
-        prior_days,
-        21,
-    ) == 0
-    consecutive_plan = [
-        prior_days[0],
-        prior_days[1].model_copy(
-            update={
-                "planned_at": as_of,
-                "recommendation": prescription.model_copy(
-                    update={"planned_for": as_of}
-                ),
-                "day_role": "easy_run",
-            }
-        ),
-    ]
-    assert weekly_schedule._post_adherence_rest_offset(
-        matched,
-        consecutive_plan,
-        21,
-    ) is None
-    reloaded = matched.model_copy(
-        update={
-            "last_run_prescribed_workout_type": WorkoutType.EASY,
-            "last_run_prescribed_distance_range_miles": (3.5, 4.0),
-        }
-    )
-    assert weekly_schedule._post_adherence_rest_offset(
-        reloaded,
-        [prior_days[1]],
-        21,
-    ) == 0
-    completed_quality_dose = reloaded.model_copy(
-        update={
-            "last_run": _difficulty(miles=3.2, quality=True),
-            "last_run_workout_type": WorkoutType.INTERVALS,
-            "last_run_prescribed_workout_type": WorkoutType.INTERVALS,
-            "last_run_prescribed_distance_range_miles": (3.5, 4.0),
-            "last_run_completed_prescribed_workout": True,
-        }
-    )
-    assert weekly_schedule._post_adherence_rest_offset(
-        completed_quality_dose,
-        [prior_days[1]],
-        21,
-    ) == 0
-
-
-def test_full_model_calendar_choice_keeps_continuity_in_final_comparison(
+def test_prior_calendar_is_an_unpreferred_warm_start_for_full_scoring(
     monkeypatch,
 ) -> None:
     base = _state(running_days_28d=10)
     states = [
         base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
-        for offset in range(3)
+        for offset in range(5)
     ]
     monkeypatch.setattr(
         weekly_schedule,
         "_adaptive_candidate_cost",
-        lambda *args, **kwargs: 0.0,
+        lambda offsets, *args, **kwargs: (
+            10.0 if tuple(offsets) == (4,) else 0.0
+        ),
     )
     monkeypatch.setattr(
         weekly_schedule,
         "_joint_candidate_program_cost",
-        lambda *args, **kwargs: (0.0, 0.0, 0.0, 0.0),
+        lambda offsets, *args, **kwargs: (
+            (0.0, 0.0, 0.0, 0.0)
+            if tuple(offsets) == (4,)
+            else (100.0, 0.0, 0.0, 0.0)
+        ),
     )
 
     selected = weekly_schedule._adaptive_run_day_offsets_for_frequency(
@@ -907,10 +809,131 @@ def test_full_model_calendar_choice_keeps_continuity_in_final_comparison(
         target_distance_range=(3.0, 4.0),
         horizon_run_count=1,
         joint_program_scoring=True,
-        prior_run_offsets={1},
+        prior_run_offsets={4},
     )
 
-    assert selected == [1]
+    # The incumbent loses the approximate ranking and would not enter the
+    # ordinary three-candidate shortlist. It wins only after being evaluated
+    # by the same final objective as the beam candidates.
+    assert selected == [4]
+
+
+def test_incumbent_prefix_neighbors_reach_full_scoring(monkeypatch) -> None:
+    base = _state(running_days_28d=10)
+    states = [
+        base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
+        for offset in range(6)
+    ]
+    preferred = (1, 2, 4)
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_adaptive_candidate_cost",
+        lambda offsets, *args, **kwargs: (
+            100.0 if tuple(offsets) == preferred else 0.0
+        ),
+    )
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_joint_candidate_program_cost",
+        lambda offsets, *args, **kwargs: (
+            (0.0, 0.0, 0.0, 0.0)
+            if tuple(offsets) == preferred
+            else (100.0, 0.0, 0.0, 0.0)
+        ),
+    )
+
+    selected = weekly_schedule._adaptive_run_day_offsets_for_frequency(
+        states,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        target_run_count=3,
+        target_distance_range=(9.0, 12.0),
+        horizon_run_count=3,
+        joint_program_scoring=True,
+        prior_run_offsets={2, 3, 4},
+    )
+
+    assert selected == list(preferred)
+
+
+def test_incumbent_individual_neighbors_reach_full_scoring(monkeypatch) -> None:
+    base = _state(running_days_28d=10)
+    states = [
+        base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
+        for offset in range(7)
+    ]
+    preferred = (1, 3, 4)
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_adaptive_candidate_cost",
+        lambda offsets, *args, **kwargs: (
+            100.0 if tuple(offsets) == preferred else 0.0
+        ),
+    )
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_joint_candidate_program_cost",
+        lambda offsets, *args, **kwargs: (
+            (0.0, 0.0, 0.0, 0.0)
+            if tuple(offsets) == preferred
+            else (100.0, 0.0, 0.0, 0.0)
+        ),
+    )
+
+    selected = weekly_schedule._adaptive_run_day_offsets_for_frequency(
+        states,
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        target_run_count=3,
+        target_distance_range=(9.0, 12.0),
+        horizon_run_count=3,
+        joint_program_scoring=True,
+        prior_run_offsets={1, 3, 5},
+    )
+
+    assert selected == list(preferred)
+
+
+def test_third_compressed_session_is_softly_priced_but_a_double_is_free() -> None:
+    start = _state().as_of
+    ordinary_loads = [1.0, 1.0]
+
+    assert _three_session_compression_cost(
+        [start, start + timedelta(days=1)],
+        ordinary_loads,
+        start + timedelta(days=2),
+        1.0,
+        48.0,
+    ) == pytest.approx(10.0)
+    assert _three_session_compression_cost(
+        [start, start + timedelta(days=1)],
+        ordinary_loads,
+        start + timedelta(days=3),
+        1.0,
+        48.0,
+    ) == 0.0
+    assert _three_session_compression_cost(
+        [start],
+        [1.0],
+        start + timedelta(days=1),
+        1.0,
+        48.0,
+    ) == 0.0
+
+
+def test_opening_compression_is_load_scaled_and_clears_at_preferred_gap() -> None:
+    ordinary_back_to_back = _opening_session_compression_cost(
+        24.0, 1.0, 1.0, 48.0
+    )
+    post_long_back_to_back = _opening_session_compression_cost(
+        24.0, 2.0, 1.0, 48.0
+    )
+
+    assert ordinary_back_to_back == pytest.approx(5.0)
+    assert post_long_back_to_back > ordinary_back_to_back
+    assert _opening_session_compression_cost(
+        48.0, 2.0, 1.0, 48.0
+    ) == 0.0
 
 
 def test_twenty_one_day_plan_is_retained_internally_but_not_serialized() -> None:
@@ -1873,19 +1896,38 @@ def test_weekly_shortfall_expands_easy_running_without_forcing_medium_long() -> 
         )
 
 
-def test_joint_finalists_preserve_delayed_and_low_cluster_calendars() -> None:
+def test_joint_finalists_preserve_delayed_and_cluster_diversity() -> None:
     scored = [
         (1.0, (0, 1, 3, 5, 7)),
-        (1.1, (0, 2, 4, 6, 7)),
+        (1.05, (0, 2, 4, 6, 8)),
+        (1.1, (1, 3, 5, 7, 9)),
         (1.2, (1, 2, 4, 6, 8)),
-        (1.3, (1, 3, 5, 7, 9)),
+        (1.3, (2, 4, 6, 8, 10)),
     ]
 
     finalists = _select_joint_finalists(scored)
 
     assert scored[0] in finalists
     assert any(offsets[0] == 1 for _, offsets in finalists)
-    assert (1.3, (1, 3, 5, 7, 9)) in finalists
+    assert (1.2, (1, 2, 4, 6, 8)) in finalists
+    assert (1.1, (1, 3, 5, 7, 9)) in finalists
+    assert (1.05, (0, 2, 4, 6, 8)) in finalists
+
+
+def test_joint_finalists_pair_boundary_variants_with_opening_clusters() -> None:
+    scored = [
+        (1.0, (2, 4, 5, 7, 9)),
+        (1.1, (1, 3, 5, 7, 8)),
+        (1.2, (1, 3, 5, 7, 9)),
+        (2.0, (1, 3, 4, 6, 8)),
+        (2.1, (1, 3, 4, 7, 9)),
+        (2.2, (3, 5, 7, 9, 10)),
+    ]
+
+    finalists = _select_joint_finalists(scored)
+
+    assert (2.0, (1, 3, 4, 6, 8)) in finalists
+    assert (2.1, (1, 3, 4, 7, 9)) in finalists
 
 
 def test_selected_time_remains_visible_without_forecast_support() -> None:
