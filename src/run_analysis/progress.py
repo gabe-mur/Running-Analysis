@@ -122,7 +122,7 @@ def _sessions(
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.calculated_moving_time_s,
                m.device_timer_time_s,m.session_zone_load,m.hard_minutes,m.hr_zone_seconds_json,
                m.exclusion_reason,m.detected_workout_type,
-               COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag
+               COALESCE(o.workout_type,m.detected_workout_type) AS workout_type,o.health_tag
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
@@ -176,7 +176,7 @@ def _scored_runs(
     rows = connection.execute(
         """
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.session_zone_load,
-               mr.result_json,COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag
+               mr.result_json,COALESCE(o.workout_type,m.detected_workout_type) AS workout_type,o.health_tag
         FROM model_runs mr JOIN activities a ON a.id=mr.activity_id
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
@@ -439,7 +439,7 @@ def _activity_coverage(
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.exclusion_reason,
                m.calculated_moving_time_s,m.device_timer_time_s,m.hr_zone_seconds_json,
                m.detected_workout_type,
-               COALESCE(o.workout_type,ph.workout_type) AS workout_type,o.health_tag,mr.result_json
+               COALESCE(o.workout_type,m.detected_workout_type) AS workout_type,o.health_tag,mr.result_json
         FROM activities a
         LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
@@ -531,8 +531,9 @@ def _quality_performance(
 ) -> list[QualityPerformancePoint]:
     rows = connection.execute(
         """
-        SELECT a.id,a.start_time_utc,COALESCE(o.workout_type,ph.workout_type) AS workout_type,mr.result_json
+        SELECT a.id,a.start_time_utc,COALESCE(o.workout_type,m.detected_workout_type) AS workout_type,mr.result_json
         FROM activities a
+        LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN model_runs mr ON mr.activity_id=a.id
           AND mr.model_name='standardized_pace_at_target_hr'
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id

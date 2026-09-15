@@ -31,6 +31,7 @@ from .weekly_schedule import (
     _peak_projected_continuous_mileage_rate,
     build_weekly_schedule,
     derive_weekly_target,
+    make_expected_target_projector,
 )
 from .web.schemas import (
     FitnessState,
@@ -530,6 +531,22 @@ def generate_weekly_schedule(
     shared_request = RecommendationRequest(
         health_status=request.health_status,
     )
+    pace_window = planning_reference_state.recent_load.trailing_28d
+    target_projection_pace = (
+        pace_window.moving_minutes / pace_window.distance_miles
+        if pace_window.distance_miles > 0 and pace_window.moving_minutes > 0
+        else 11.0
+    )
+    expected_target_projector = make_expected_target_projector(
+        history,
+        start_date,
+        config,
+        pace_min_mile=target_projection_pace,
+        maximum_horizon_days=PLANNING_HORIZON_DAYS,
+        opening_target_range=target_distance,
+        opening_evidence=target_evidence,
+    )
+
     result = build_weekly_schedule(
         daily_states,
         shared_request,
@@ -541,6 +558,7 @@ def generate_weekly_schedule(
         daily_state_options=daily_state_options,
         forced_rest_offsets=forced_rest_offsets,
         prior_schedule=prior_schedule,
+        expected_target_projector=expected_target_projector,
     )
     # Recent training ends immediately before the forward decision boundary.
     # Ordinarily that excludes the still-open current day. After a run is
@@ -620,10 +638,33 @@ def generate_weekly_schedule(
                     "target_run_count": target_runs,
                     "target_distance_range": list(target_distance),
                     "target_evidence": target_evidence.model_dump(mode="json"),
+                    "observed_planning_activities": [
+                        {
+                            "start_time": item.start_time.isoformat(),
+                            "distance_miles": item.distance_miles,
+                            "moving_minutes": item.moving_minutes,
+                            "easy_minutes": item.easy_minutes,
+                            "baseline_eligible": item.baseline_eligible,
+                        }
+                        for item in history
+                    ],
+                    "target_projection_pace_min_mile": target_projection_pace,
                     "completed_activities_by_offset": {},
                     "forced_rest_offsets": sorted(forced_rest_offsets),
                     "prior_schedule": (
                         prior_schedule.model_dump(mode="json")
+                        if prior_schedule is not None
+                        else None
+                    ),
+                    # ``planning_days`` is intentionally excluded from API
+                    # serialization, so persist it separately for an exact
+                    # optimizer replay. The visible seven-day prior alone is
+                    # not the warm start used by this generation.
+                    "prior_planning_days": (
+                        [
+                            day.model_dump(mode="json")
+                            for day in prior_schedule.planning_days
+                        ]
                         if prior_schedule is not None
                         else None
                     ),
@@ -742,7 +783,52 @@ def replay_latest_weekly_schedule(
         int(offset): [TrailingDayActivity.model_validate(item) for item in items]
         for offset, items in payload.get("completed_activities_by_offset", {}).items()
     }
+    observed_payload = payload.get("observed_planning_activities")
+    replay_target_projector = None
+    if observed_payload is not None:
+        observed_history = [
+            PlanningActivity(
+                start_time=datetime.fromisoformat(item["start_time"]),
+                distance_miles=float(item["distance_miles"]),
+                moving_minutes=item.get("moving_minutes"),
+                easy_minutes=item.get("easy_minutes"),
+                baseline_eligible=bool(item.get("baseline_eligible", True)),
+            )
+            for item in observed_payload
+        ]
+        replay_target_projector = make_expected_target_projector(
+            observed_history,
+            daily_states[0].as_of.date(),
+            payload["config"],
+            pace_min_mile=float(
+                payload.get(
+                    "target_projection_pace_min_mile",
+                    11.0,
+                )
+            ),
+            maximum_horizon_days=PLANNING_HORIZON_DAYS,
+            opening_target_range=tuple(payload["target_distance_range"]),
+            opening_evidence=WeeklyTargetEvidence.model_validate(
+                payload["target_evidence"]
+            ),
+        )
+
     prior_payload = payload.get("prior_schedule")
+    prior_replay_schedule = (
+        WeeklyScheduleResponse.model_validate(prior_payload)
+        if prior_payload is not None
+        else None
+    )
+    prior_planning_payload = payload.get("prior_planning_days")
+    if prior_replay_schedule is not None and prior_planning_payload is not None:
+        prior_replay_schedule = prior_replay_schedule.model_copy(
+            update={
+                "planning_days": [
+                    WeeklyScheduleDay.model_validate(day)
+                    for day in prior_planning_payload
+                ]
+            }
+        )
     replay = build_weekly_schedule(
         daily_states,
         RecommendationRequest.model_validate(payload["request"]),
@@ -755,11 +841,8 @@ def replay_latest_weekly_schedule(
         completed_activities_by_offset=completed,
         daily_state_options=options,
         forced_rest_offsets=set(payload.get("forced_rest_offsets", [])),
-        prior_schedule=(
-            WeeklyScheduleResponse.model_validate(prior_payload)
-            if prior_payload is not None
-            else None
-        ),
+        prior_schedule=prior_replay_schedule,
+        expected_target_projector=replay_target_projector,
     )
     saved = WeeklyScheduleResponse.model_validate(payload["result"])
 

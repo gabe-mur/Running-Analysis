@@ -30,6 +30,7 @@ from .weekly_schedule import (
     PlanningActivity,
     build_weekly_schedule,
     derive_weekly_target,
+    make_expected_target_projector,
 )
 from .web.schemas import (
     ActivityHealthTag,
@@ -182,6 +183,86 @@ class ProjectionReplan:
     target_high_miles: float
     planned_sessions: tuple[ProjectionPlanSession, ...]
     committed_sessions: tuple[ProjectionPlanSession, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedPolicyRolloutStep:
+    """One decision window in a bounded expected-compliance rollout."""
+
+    window_start: datetime
+    window_end: datetime
+    source_replan: ProjectionReplan
+    opening_sessions: tuple[ProjectionPlanSession, ...]
+    policy_sessions: tuple[ProjectionPlanSession, ...]
+
+    @property
+    def schedule_changed_from_opening(self) -> bool:
+        """Whether dates or workout types changed, ignoring distance edits."""
+
+        def signature(
+            sessions: tuple[ProjectionPlanSession, ...],
+        ) -> tuple[tuple[date, WorkoutType], ...]:
+            return tuple(
+                (session.planned_for.date(), session.workout_type)
+                for session in sessions
+            )
+
+        return signature(self.opening_sessions) != signature(self.policy_sessions)
+
+    @property
+    def distance_changed_from_opening(self) -> bool:
+        """Whether an otherwise matching decision changed prescribed mileage."""
+
+        if self.schedule_changed_from_opening:
+            return False
+        return any(
+            abs(opening.midpoint_miles - policy.midpoint_miles) > 1e-9
+            for opening, policy in zip(
+                self.opening_sessions,
+                self.policy_sessions,
+                strict=True,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedPolicyRollout:
+    """A short calendar assembled from successive policy decisions.
+
+    This is deliberately a diagnostic artifact. Each step retains the full
+    planner snapshot that produced it, so the stitched calendar cannot conceal
+    instability in the underlying daily plans.
+    """
+
+    generated_at: datetime
+    horizon_days: int
+    opening_plan: tuple[ProjectionPlanSession, ...]
+    steps: tuple[ExpectedPolicyRolloutStep, ...]
+    replans: tuple[ProjectionReplan, ...]
+
+    @property
+    def opening_horizon_plan(self) -> tuple[ProjectionPlanSession, ...]:
+        return tuple(
+            session
+            for step in self.steps
+            for session in step.opening_sessions
+        )
+
+    @property
+    def policy_plan(self) -> tuple[ProjectionPlanSession, ...]:
+        return tuple(
+            session
+            for step in self.steps
+            for session in step.policy_sessions
+        )
+
+    @property
+    def schedule_change_count(self) -> int:
+        return sum(step.schedule_changed_from_opening for step in self.steps)
+
+    @property
+    def distance_change_count(self) -> int:
+        return sum(step.distance_changed_from_opening for step in self.steps)
 
 
 @dataclass(frozen=True, slots=True)
@@ -894,7 +975,25 @@ def simulate_adherence(
             tzinfo=start_at.tzinfo,
         )
         activities = [
-            PlanningActivity(run.start_time, run.distance_miles) for run in history
+            PlanningActivity(
+                run.start_time,
+                run.distance_miles,
+                moving_minutes=run.moving_minutes,
+                easy_minutes=run.difficulty.zone_breakdown.easy_minutes,
+                baseline_eligible=(
+                    run.workout_type
+                    in {
+                        WorkoutType.EASY,
+                        WorkoutType.RECOVERY,
+                        WorkoutType.RUN_WALK,
+                        WorkoutType.UNKNOWN,
+                    }
+                    and not run.difficulty.is_long_run
+                    and not run.difficulty.is_quality_session
+                    and run.planning_role not in {"support_easy", "medium_long"}
+                ),
+            )
+            for run in history
         ]
         target_runs, target_range, evidence = derive_weekly_target(
             activities, target_as_of, config
@@ -931,6 +1030,23 @@ def simulate_adherence(
                     ),
                 )
             )
+        pace_window = _load_window(history, plan_start, 28)
+        pace = (
+            pace_window.moving_minutes / pace_window.distance_miles
+            if pace_window.distance_miles > 0
+            else 11.0
+        )
+        pace = min(15.0, max(7.0, pace))
+        expected_target_projector = make_expected_target_projector(
+            activities,
+            decision_start_date,
+            config,
+            pace_min_mile=pace,
+            maximum_horizon_days=PLANNING_HORIZON_DAYS,
+            opening_target_range=target_range,
+            opening_evidence=evidence,
+        )
+
         schedule = build_weekly_schedule(
             daily_states,
             RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
@@ -940,6 +1056,7 @@ def simulate_adherence(
             target_evidence=evidence,
             completed_activities_by_offset={},
             prior_schedule=previous_schedule,
+            expected_target_projector=expected_target_projector,
         )
         previous_schedule = schedule
         committed = [
@@ -950,13 +1067,6 @@ def simulate_adherence(
             and day.recommendation.planned_for
             and plan_start <= day.recommendation.planned_for < commit_end
         ]
-        pace_window = _load_window(history, plan_start, 28)
-        pace = (
-            pace_window.moving_minutes / pace_window.distance_miles
-            if pace_window.distance_miles > 0
-            else 11.0
-        )
-        pace = min(15.0, max(7.0, pace))
         opening = (
             daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
             if daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
@@ -1517,3 +1627,72 @@ def simulate_adherence(
         )
         )
     return results
+
+
+def simulate_expected_policy_rollout(
+    template: FitnessState,
+    recorded_runs: list[ProjectionRun],
+    config: dict,
+    start_at: datetime,
+    *,
+    horizon_days: int = 4,
+    initial_schedule: WeeklyScheduleResponse | None = None,
+) -> ExpectedPolicyRollout:
+    """Prototype a short plan from successive exact-compliance decisions.
+
+    The ordinary planner emits an open-loop 21-day plan. This prototype instead
+    runs the same planner once per day, assumes each committed prescription is
+    completed at its midpoint, and stitches together only the work committed in
+    each next 24-hour window. It does not alter or replace the production plan.
+    """
+
+    if not 1 <= horizon_days <= 7:
+        raise ValueError("horizon_days must be between 1 and 7")
+
+    projection = simulate_adherence(
+        template,
+        recorded_runs,
+        config,
+        start_at,
+        weeks=1,
+        replan_interval_days=1,
+        initial_schedule=initial_schedule,
+        simulation_days=horizon_days,
+    )
+    replans = tuple(
+        snapshot
+        for week in projection
+        for snapshot in week.replan_snapshots
+    )
+    if len(replans) != horizon_days:
+        raise RuntimeError(
+            "Expected one daily replan per policy-rollout decision window"
+        )
+
+    opening_plan = replans[0].planned_sessions
+    steps: list[ExpectedPolicyRolloutStep] = []
+    for offset, replan in enumerate(replans):
+        window_start = start_at + timedelta(days=offset)
+        window_end = window_start + timedelta(days=1)
+        opening_sessions = tuple(
+            session
+            for session in opening_plan
+            if window_start <= session.planned_for < window_end
+        )
+        steps.append(
+            ExpectedPolicyRolloutStep(
+                window_start=window_start,
+                window_end=window_end,
+                source_replan=replan,
+                opening_sessions=opening_sessions,
+                policy_sessions=replan.committed_sessions,
+            )
+        )
+
+    return ExpectedPolicyRollout(
+        generated_at=start_at,
+        horizon_days=horizon_days,
+        opening_plan=opening_plan,
+        steps=tuple(steps),
+        replans=replans,
+    )

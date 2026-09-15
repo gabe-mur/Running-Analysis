@@ -373,10 +373,11 @@ def _historical_interval_comparison(
         """
         SELECT a.id,a.start_time_utc
         FROM activities a
+        LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
         LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
-        WHERE COALESCE(o.workout_type,ph.workout_type)='intervals'
+        WHERE COALESCE(o.workout_type,m.detected_workout_type)='intervals'
           AND COALESCE(o.health_tag,'normal')='normal'
           AND a.id<>? AND a.start_time_utc<?
         ORDER BY a.start_time_utc DESC LIMIT 12
@@ -523,7 +524,13 @@ def _prescription_analysis(
     target_work = target_work or None
     detected_work: float | None = None
     source = "heart_rate_zone_exposure"
-    if interval_analysis is not None and interval_analysis.available:
+    if (
+        interval_analysis is not None
+        and interval_analysis.available
+        and interval_analysis.source.startswith("recorded_lap")
+    ):
+        # Pace-only grouping can help explain an explicitly labeled workout,
+        # but it cannot establish that prescribed quality work was completed.
         detected_work = interval_analysis.work_minutes
         source = interval_analysis.source
     elif (
@@ -636,7 +643,20 @@ def _prescription_analysis(
     )
     distance_close = distance_delta_miles <= 0.25
     duration_close = duration_delta_minutes <= 1e-9
-    if prescribed_aerobic and not aerobic_intensity_close and aerobic_intensity_adherence is not None:
+    if (
+        requires_work_detection
+        and not difficulty.is_quality_session
+        and known_hr_minutes > 0
+        and difficulty.zone_breakdown.easy_minutes / known_hr_minutes >= 0.80
+        and not work_close
+    ):
+        status = "Quality not completed; aerobic run"
+        summary = (
+            "This run matches the saved quality-workout slot, but recorded "
+            "effort stayed aerobic and no reliable structured quality work "
+            "was detected. The planned quality dose was not completed."
+        )
+    elif prescribed_aerobic and not aerobic_intensity_close and aerobic_intensity_adherence is not None:
         adherence_percent = aerobic_intensity_adherence * 100
         adjusted_percent = (terrain_adjusted_adherence or 0.0) * 100
         status = (

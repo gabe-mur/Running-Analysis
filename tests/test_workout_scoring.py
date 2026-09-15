@@ -9,6 +9,7 @@ from run_analysis.models import Trackpoint
 from run_analysis.movement import MovementInterval
 from run_analysis.web.schemas import (
     ConfidenceLevel,
+    IntervalAnalysis,
     QualitySessionType,
     ReadinessFlag,
     RecommendationResponse,
@@ -303,6 +304,58 @@ def test_unstructured_quality_text_cannot_pass_from_distance_alone() -> None:
 
     assert analysis.target_work_minutes is None
     assert analysis.execution_status == "Prescription attempted"
+
+
+def test_tentative_pace_work_cannot_verify_quality_against_easy_hr() -> None:
+    connection = _laps_connection()
+    planned_for = datetime(2026, 9, 1, 19, tzinfo=timezone.utc)
+    prescription = RecommendationResponse(
+        generated_at=planned_for - timedelta(hours=1),
+        fitness_state_as_of=planned_for - timedelta(hours=1),
+        planned_for=planned_for,
+        workout_type=WorkoutType.INTERVALS,
+        quality_session_type=QualitySessionType.LONG_INTERVALS,
+        title="Controlled intervals",
+        distance_range_miles=(4.0, 4.5),
+        structure=[
+            WorkoutStep(
+                instruction="Run the quality dose",
+                duration_minutes=15,
+                target_zones=["Z4"],
+            )
+        ],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    difficulty = SessionDifficulty(
+        distance_miles=4.25,
+        moving_minutes=45,
+        elapsed_minutes=45,
+        stopped_minutes=0,
+        zone_breakdown=ZoneBreakdown(easy_minutes=45),
+        is_quality_session=False,
+    )
+    tentative = IntervalAnalysis.model_construct(
+        available=True,
+        source="pace_stream_inference",
+        work_minutes=15.0,
+    )
+
+    analysis = _prescription_analysis(
+        connection,
+        {"zones": {"z3": [154, 166]}},
+        1,
+        difficulty,
+        prescription,
+        timing_delta_hours=1,
+        distance_delta_miles=0,
+        match_confidence="high",
+        interval_analysis=tentative,
+    )
+
+    assert analysis.detected_work_minutes == 0
+    assert analysis.prescribed_quality_completed is False
+    assert analysis.execution_status == "Quality not completed; aerobic run"
 
 
 def test_prescribed_aerobic_run_keeps_match_but_flags_hr_divergence() -> None:

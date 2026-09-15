@@ -18,6 +18,7 @@ from run_analysis.adherence_projection import (
     _projected_difficulty,
     _state_at,
     simulate_adherence,
+    simulate_expected_policy_rollout,
 )
 from run_analysis.weekly_schedule import derive_weekly_target
 from run_analysis.web.schemas import (
@@ -153,6 +154,95 @@ def test_projection_can_limit_exact_daily_replans_to_scenario_boundary(
 
     assert calls == 3
     assert len(projection) == 1
+
+
+def test_expected_policy_rollout_stitches_successive_daily_decisions(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        running_days_28d=12,
+    )
+    calls = 0
+
+    def changing_schedule(daily_states, *args, **kwargs):
+        nonlocal calls
+        generated_at = daily_states[0].as_of
+        current_type = WorkoutType.EASY if calls == 0 else WorkoutType.LONG
+        current_miles = 4.0 if calls == 0 else 6.0
+        prescriptions = [(generated_at, current_type, current_miles)]
+        if calls == 0:
+            prescriptions.append(
+                (generated_at + timedelta(days=1), WorkoutType.INTERVALS, 3.0)
+            )
+        calls += 1
+        days = []
+        for planned_for, workout_type, miles in prescriptions:
+            recommendation = RecommendationResponse(
+                generated_at=generated_at,
+                fitness_state_as_of=generated_at,
+                planned_for=planned_for,
+                workout_type=workout_type,
+                title="Policy rollout fixture",
+                distance_range_miles=(miles, miles),
+                confidence=ConfidenceLevel.MODERATE,
+                readiness=ReadinessFlag.READY,
+            )
+            days.append(
+                WeeklyScheduleDay(
+                    date=planned_for.date(),
+                    planned_at=planned_for,
+                    recommendation=recommendation,
+                    day_role="fixture_run",
+                    rationale="Policy rollout fixture.",
+                )
+            )
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=20),
+            target_run_count=len(days),
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=len(days),
+            projected_distance_range_miles=(
+                sum(item[2] for item in prescriptions),
+                sum(item[2] for item in prescriptions),
+            ),
+            summary="Policy rollout fixture.",
+            days=days,
+            planning_days=days,
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        changing_schedule,
+    )
+
+    rollout = simulate_expected_policy_rollout(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        horizon_days=2,
+    )
+
+    assert calls == 2
+    assert len(rollout.replans) == 2
+    assert len(rollout.steps) == 2
+    assert rollout.steps[0].policy_sessions[0].workout_type == WorkoutType.EASY
+    assert rollout.steps[1].opening_sessions[0].workout_type == WorkoutType.INTERVALS
+    assert rollout.steps[1].policy_sessions[0].workout_type == WorkoutType.LONG
+    assert [item.workout_type for item in rollout.opening_horizon_plan] == [
+        WorkoutType.EASY,
+        WorkoutType.INTERVALS,
+    ]
+    assert [item.workout_type for item in rollout.policy_plan] == [
+        WorkoutType.EASY,
+        WorkoutType.LONG,
+    ]
+    assert rollout.schedule_change_count == 1
+    assert rollout.distance_change_count == 0
 
 
 def test_daily_reload_exposes_an_already_completed_run_on_the_same_date() -> None:

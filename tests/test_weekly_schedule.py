@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from math import log
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 import run_analysis.weekly_schedule as weekly_schedule
@@ -25,7 +26,10 @@ from run_analysis.weekly_schedule import (
     adaptive_run_day_offsets,
     automatic_run_day_offsets,
     build_weekly_schedule,
+    derive_expected_compliance_target,
     derive_weekly_target,
+    expected_compliance_activity,
+    expected_compliance_target_trajectory,
     summarize_distance_alignment,
 )
 from run_analysis.web.schemas import (
@@ -70,6 +74,52 @@ def test_yesterday_run_does_not_push_an_evening_slot_to_tomorrow() -> None:
     assert automatic_run_day_offsets(
         base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=4
     ) == [0, 2, 4, 6]
+
+
+def test_same_calendar_day_suggestion_time_cannot_flip_workout_role() -> None:
+    zone = ZoneInfo("America/New_York")
+    config = {**CONFIG, "timezone_default": "America/New_York"}
+    noon = _state(
+        as_of=datetime(2026, 9, 15, 12, tzinfo=zone),
+        days_since_quality_run=6.716053240740741,
+        days_since_long_run=2.0,
+    )
+    evening = noon.model_copy(
+        update={
+            "as_of": noon.as_of + timedelta(hours=7),
+            "days_since_quality_run": noon.days_since_quality_run + 7 / 24,
+            "days_since_long_run": noon.days_since_long_run + 7 / 24,
+        }
+    )
+    next_day = evening.model_copy(
+        update={
+            "as_of": evening.as_of + timedelta(hours=5),
+            "days_since_quality_run": evening.days_since_quality_run + 5 / 24,
+            "days_since_long_run": evening.days_since_long_run + 5 / 24,
+        }
+    )
+
+    assert weekly_schedule._elapsed_workout_role([noon], [], config) == "easy"
+    assert weekly_schedule._elapsed_workout_role([evening], [], config) == "easy"
+    assert weekly_schedule._elapsed_workout_role([next_day], [], config) == "quality"
+
+
+def test_calendar_role_recency_uses_actual_hours_across_daylight_saving() -> None:
+    zone = ZoneInfo("America/New_York")
+    config = {**CONFIG, "timezone_default": "America/New_York"}
+    quality_run = datetime(2027, 3, 7, 7, tzinfo=zone)
+    suggestion = datetime(2027, 3, 14, 7, tzinfo=zone)
+    elapsed_days = (
+        suggestion.astimezone(timezone.utc)
+        - quality_run.astimezone(timezone.utc)
+    ).total_seconds() / 86400
+
+    assert elapsed_days < 7
+    assert weekly_schedule._calendar_boundary_recency_days(
+        elapsed_days,
+        suggestion,
+        config,
+    ) == pytest.approx(6 + 17 / 24)
 
 
 def test_seven_day_fallback_never_restores_today_when_recovery_delays_it() -> None:
@@ -1013,6 +1063,138 @@ def test_a_lone_long_or_hard_run_is_not_repeated_as_a_baseline() -> None:
     assert distance == (0.0, 0.0)
     assert evidence.planning_mode == "baseline_required"
     assert evidence.baseline_session_miles is None
+
+
+def test_expected_compliance_target_is_causal_and_matches_completion() -> None:
+    boundary = _state().as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+    observed = [
+        PlanningActivity(
+            boundary - timedelta(days=day),
+            4.0,
+            moving_minutes=44.0,
+            easy_minutes=44.0,
+        )
+        for day in range(1, 29, 2)
+    ]
+    planned_for = boundary + timedelta(hours=7)
+    recommendation = RecommendationResponse(
+        generated_at=boundary,
+        fitness_state_as_of=boundary,
+        planned_for=planned_for,
+        workout_type=WorkoutType.LONG,
+        title="Expected long run",
+        distance_range_miles=(7.0, 7.5),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+        planning_role="long",
+    )
+
+    before = derive_expected_compliance_target(
+        observed,
+        [recommendation],
+        planned_for,
+        CONFIG,
+        pace_min_mile=11.0,
+    )
+    observed_only = derive_weekly_target(observed, planned_for, CONFIG)
+    assert before == observed_only
+
+    projected = expected_compliance_activity(
+        recommendation,
+        pace_min_mile=11.0,
+    )
+    assert projected is not None
+    assert projected.distance_miles == 7.25
+    assert projected.moving_minutes == pytest.approx(79.75)
+    assert projected.baseline_eligible is False
+
+    next_boundary = boundary + timedelta(days=1)
+    conditional = derive_expected_compliance_target(
+        observed,
+        [recommendation],
+        next_boundary,
+        CONFIG,
+        pace_min_mile=11.0,
+    )
+    completed = derive_weekly_target(
+        [*observed, projected],
+        next_boundary,
+        CONFIG,
+    )
+    assert conditional == completed
+    assert (
+        conditional[2].baseline_session_miles
+        == observed_only[2].baseline_session_miles
+    )
+
+
+def test_fast_expected_target_trajectory_matches_full_derivation() -> None:
+    boundary = _state().as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+    observed = [
+        PlanningActivity(
+            boundary - timedelta(days=day),
+            4.0,
+            moving_minutes=44.0,
+            easy_minutes=44.0,
+        )
+        for day in range(1, 85, 2)
+    ]
+    # Capacity intentionally ignores history outside its bounded lookback.
+    # Keep an older activity in the equivalence fixture so the optimized
+    # prefix cannot accidentally change that boundary behavior.
+    observed.append(
+        PlanningActivity(
+            boundary - timedelta(days=1000),
+            12.0,
+            moving_minutes=132.0,
+            easy_minutes=132.0,
+        )
+    )
+    recommendations = [
+        RecommendationResponse(
+            generated_at=boundary,
+            fitness_state_as_of=boundary,
+            planned_for=boundary + timedelta(days=day, hours=7),
+            workout_type=(WorkoutType.LONG if day == 2 else WorkoutType.EASY),
+            title="Expected session",
+            distance_range_miles=(6.75, 7.25) if day == 2 else (3.75, 4.25),
+            confidence=ConfidenceLevel.MODERATE,
+            readiness=ReadinessFlag.READY,
+            planning_role="long" if day == 2 else "ordinary_easy",
+        )
+        for day in (2, 5, 7, 10, 12, 15, 17, 20)
+    ]
+    observed_trajectory = tuple(
+        (
+            as_of,
+            derive_weekly_target(observed, as_of, CONFIG)[1],
+            derive_weekly_target(observed, as_of, CONFIG)[2],
+        )
+        for offset in range(21)
+        for as_of in [boundary + timedelta(days=offset)]
+    )
+
+    fast = expected_compliance_target_trajectory(
+        observed,
+        recommendations,
+        boundary.date(),
+        21,
+        CONFIG,
+        pace_min_mile=11.0,
+        observed_trajectory=observed_trajectory,
+    )
+    full = tuple(
+        derive_expected_compliance_target(
+            observed,
+            recommendations,
+            boundary + timedelta(days=offset),
+            CONFIG,
+            pace_min_mile=11.0,
+        )[1]
+        for offset in range(21)
+    )
+
+    assert fast == full
 
 
 def test_baseline_builder_schedules_only_one_observed_easy_repeat() -> None:

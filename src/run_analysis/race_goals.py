@@ -106,7 +106,7 @@ def _recent_training_paces(connection: sqlite3.Connection) -> list[tuple[float, 
           AND am.analysis_distance_m > 0
           AND am.calculated_moving_time_s >= 600
           AND COALESCE(ro.include_in_model, 1) != 0
-          AND COALESCE(ro.workout_type, ph.workout_type, 'easy') NOT IN ('hike', 'bike', 'run_walk')
+          AND COALESCE(ro.workout_type, am.detected_workout_type, 'easy') NOT IN ('hike', 'bike', 'run_walk')
           AND COALESCE(ro.health_tag, 'normal') = 'normal'
         ORDER BY a.start_time_utc_epoch DESC
         LIMIT 10

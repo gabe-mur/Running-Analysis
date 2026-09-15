@@ -23,7 +23,7 @@ from run_analysis.prescription_matching import archive_weekly_prescriptions
 from run_analysis.run_feedback import get_run_feedback
 from run_analysis.web.schemas import WeeklyScheduleRequest
 from run_analysis.weekly_schedule import WEEKLY_PLANNER_VERSION
-from run_analysis.web.schemas import WorkoutType
+from run_analysis.web.schemas import QualitySessionType, WorkoutType
 from run_analysis.web.app import create_app
 from run_analysis.web.upload_service import UploadPayload, run_upload_pipeline
 from test_tcx import TCX_TEMPLATE
@@ -99,6 +99,37 @@ def _structured_threshold_tcx(start: datetime) -> bytes:
     ).encode()
 
 
+def _single_lap_easy_tcx(start: datetime) -> bytes:
+    """A steady aerobic recording with no workout boundaries or hard HR."""
+
+    moving_seconds = 45 * 60
+    distance_meters = 4.36 * 1609.344
+    points = []
+    for elapsed in range(0, moving_seconds + 1, 60):
+        stamp = (start + timedelta(seconds=elapsed)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        points.append(
+            f"<Trackpoint><Time>{stamp}</Time>"
+            f"<DistanceMeters>{distance_meters * elapsed / moving_seconds:.3f}</DistanceMeters>"
+            "<HeartRateBpm><Value>140</Value></HeartRateBpm>"
+            "<Cadence>82</Cadence></Trackpoint>"
+        )
+    activity_id = start.isoformat().replace("+00:00", "Z")
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<TrainingCenterDatabase xmlns='http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'>"
+        f"<Activities><Activity Sport='Running'><Id>{activity_id}</Id>"
+        f"<Lap StartTime='{activity_id}'><TotalTimeSeconds>{moving_seconds}</TotalTimeSeconds>"
+        f"<DistanceMeters>{distance_meters:.3f}</DistanceMeters><Calories>200</Calories>"
+        "<AverageHeartRateBpm><Value>140</Value></AverageHeartRateBpm>"
+        "<MaximumHeartRateBpm><Value>140</Value></MaximumHeartRateBpm>"
+        "<Intensity>Active</Intensity><TriggerMethod>Manual</TriggerMethod>"
+        f"<Track>{''.join(points)}</Track></Lap>"
+        "</Activity></Activities></TrainingCenterDatabase>"
+    ).encode()
+
+
 def test_upload_rejects_non_tcx_before_writing(tmp_path: Path) -> None:
     _write_config(tmp_path)
     client = TestClient(create_app(tmp_path))
@@ -123,6 +154,71 @@ def test_upload_pipeline_imports_and_reports_independent_stage_failures(tmp_path
     assert '"historical_weather_enabled": false' in result.stages[3].detail
     assert (tmp_path / "uploads").exists()
     assert all(path.parent == tmp_path / "uploads" for path in (tmp_path / "uploads").iterdir())
+
+
+def test_easy_upload_matching_intervals_remains_actual_easy_in_planner(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=2)
+    prescribed = _threshold(start).model_copy(
+        update={
+            "workout_type": WorkoutType.INTERVALS,
+            "quality_session_type": QualitySessionType.LONG_INTERVALS,
+            "distance_range_miles": (4.0, 4.5),
+        }
+    )
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        from run_analysis.db import initialize
+
+        initialize(connection)
+        archive_weekly_prescriptions(
+            connection,
+            _schedule(start - timedelta(hours=1), prescribed),
+        )
+        connection.commit()
+
+    uploaded = run_upload_pipeline(
+        tmp_path,
+        "config.yaml",
+        [UploadPayload("single-lap-easy.tcx", _single_lap_easy_tcx(start))],
+    )
+    activity_id = uploaded.primary_activity_id
+    assert activity_id is not None
+    with connect(database) as connection:
+        metric = connection.execute(
+            "SELECT detected_workout_type,moderate_minutes,hard_minutes "
+            "FROM activity_metrics WHERE activity_id=?",
+            (activity_id,),
+        ).fetchone()
+        assert metric["detected_workout_type"] is None
+        assert metric["moderate_minutes"] == 0
+        assert metric["hard_minutes"] == 0
+
+        feedback = get_run_feedback(connection, yaml.safe_load(
+            (tmp_path / "config.yaml").read_text()
+        ), activity_id)
+        assert feedback is not None
+        assert feedback.run.workout_type == WorkoutType.EASY
+        assert feedback.run.session_difficulty.is_quality_session is False
+        assert feedback.workout_analysis.workout_type == WorkoutType.EASY
+        assert feedback.workout_analysis.interval_analysis is None
+        match = feedback.workout_analysis.prescription_match
+        assert match is not None
+        assert match.workout_type == WorkoutType.INTERVALS
+        assert match.prescribed_quality_completed is False
+        assert match.execution_status == "Quality not completed; aerobic run"
+        assert match.detected_work_minutes == 0
+
+        snapshot = connection.execute(
+            "SELECT value_json FROM app_state WHERE key='weekly_planner_snapshot'"
+        ).fetchone()
+        assert snapshot is not None
+        state = json.loads(snapshot[0])["daily_states"][0]
+        assert state["last_run_workout_type"] == "easy"
+        assert state["last_run_prescribed_workout_type"] == "intervals"
+        assert state["last_run"]["is_quality_session"] is False
 
 
 def test_upload_does_not_model_or_replan_partially_processed_activity(
@@ -311,6 +407,38 @@ def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
         ).date()
         assert saved.start_date == expected_start
 
+        # The baseline fixture has no real 21-day internal plan. Supply a
+        # complete temporary prior horizon to exercise snapshot serialization:
+        # API model_dump excludes planning_days, but replay must retain them.
+        prior_horizon = [
+            saved.days[-1].model_copy(
+                update={
+                    "date": expected_start + timedelta(days=offset),
+                    "planned_at": None,
+                    "recommendation": None,
+                    "completed_activities": [],
+                }
+            )
+            for offset in range(21)
+        ]
+        connection.execute(
+            "UPDATE app_state SET value_json=? "
+            "WHERE key='weekly_schedule_internal'",
+            (
+                json.dumps(
+                    {
+                        "planner_version": WEEKLY_PLANNER_VERSION,
+                        "start_date": expected_start.isoformat(),
+                        "days": [
+                            day.model_dump(mode="json")
+                            for day in prior_horizon
+                        ],
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+
         import run_analysis.recommendation_service as service
 
         real_datetime = service.datetime
@@ -328,6 +456,16 @@ def test_quality_plan_upload_and_next_day_refresh_use_laps_and_replay_exactly(
             WeeklyScheduleRequest(health_status="normal"),
             tmp_path,
         )
+        snapshot = json.loads(
+            connection.execute(
+                "SELECT value_json FROM app_state "
+                "WHERE key='weekly_planner_snapshot'"
+            ).fetchone()[0]
+        )
+        assert len(snapshot["prior_planning_days"]) == 21
+        replayed_next_day = replay_latest_weekly_schedule(connection)
+        assert replayed_next_day is not None
+        assert replayed_next_day[1].model_dump() == replayed_next_day[0].model_dump()
         assert next_day.start_date == expected_start
         assert (
             next_day.target_distance_range_miles

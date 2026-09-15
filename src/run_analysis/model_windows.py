@@ -435,7 +435,7 @@ def load_model_window_sets(
                m.days_since_previous_run,m.days_since_previous_hard_run,
                m.moving_pace_min_mile AS run_moving_pace,m.moving_average_hr_bpm,
                COALESCE(o.health_tag,'normal') AS health_tag,aw.weather_quality,
-               COALESCE(o.workout_type,ph.workout_type,'unknown') AS workout_type
+               COALESCE(o.workout_type,m.detected_workout_type,'unknown') AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         JOIN activity_weather aw ON aw.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
@@ -484,7 +484,7 @@ def load_overlapping_model_windows(
                m.days_since_previous_run,m.days_since_previous_hard_run,
                m.moving_pace_min_mile AS run_moving_pace,m.moving_average_hr_bpm,
                COALESCE(o.health_tag,'normal') AS health_tag,aw.weather_quality,
-               COALESCE(o.workout_type,ph.workout_type,'unknown') AS workout_type
+               COALESCE(o.workout_type,m.detected_workout_type,'unknown') AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         JOIN activity_weather aw ON aw.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id

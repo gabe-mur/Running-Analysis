@@ -72,7 +72,7 @@ def update_workloads(connection: sqlite3.Connection, config: dict) -> int:
         SELECT a.id,a.start_time_utc,a.total_distance_m,a.activity_id,
                m.calculated_moving_time_s,m.device_timer_time_s,m.moving_average_hr_bpm,
                m.hr_zone_seconds_json,m.exclusion_reason,
-               COALESCE(o.workout_type,ph.workout_type) AS workout_type
+               COALESCE(o.workout_type,m.detected_workout_type) AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id

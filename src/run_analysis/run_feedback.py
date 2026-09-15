@@ -442,7 +442,7 @@ def _prior_load_context(connection: sqlite3.Connection, as_of: datetime) -> Load
         """
         SELECT a.id,a.start_time_utc,a.total_distance_m,m.calculated_moving_time_s,
                m.device_timer_time_s,m.session_zone_load,m.hard_minutes,m.hr_zone_seconds_json,
-               m.exclusion_reason,COALESCE(o.workout_type,ph.workout_type) AS workout_type
+               m.exclusion_reason,COALESCE(o.workout_type,m.detected_workout_type) AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
@@ -584,7 +584,7 @@ def _feedback_text(
 
 RUN_SELECT = """
     SELECT a.*,m.*,
-           COALESCE(o.workout_type,ph.workout_type) AS workout_type,
+           COALESCE(o.workout_type,m.detected_workout_type) AS workout_type,
            m.detected_workout_type,m.workout_detection_source,
            m.workout_detection_confidence,
            o.include_in_model,o.illness,o.notes AS override_notes,o.health_tag,o.perceived_exertion,
@@ -640,8 +640,9 @@ def _long_run_threshold_from_connection(connection: sqlite3.Connection) -> float
     rows = connection.execute(
         """
         SELECT a.total_distance_m,
-               COALESCE(o.workout_type,ph.workout_type) AS workout_type
+               COALESCE(o.workout_type,m.detected_workout_type) AS workout_type
         FROM activities a
+        LEFT JOIN activity_metrics m ON m.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
         LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id

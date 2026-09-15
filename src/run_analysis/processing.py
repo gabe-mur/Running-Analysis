@@ -16,7 +16,7 @@ from .workload import update_workloads
 from .training_load import calculate_session_load
 from .workout_detection import detect_structured_workout
 
-PROCESSOR_VERSION = "phase3-v10-recorded-workout-labels"
+PROCESSOR_VERSION = "phase3-v11-prescription-is-not-execution"
 
 
 @dataclass(slots=True)
@@ -324,21 +324,9 @@ def process_activities(
         override = connection.execute(
             "SELECT * FROM run_overrides WHERE activity_id = ?", (row["activity_id"],)
         ).fetchone()
-        prescription = connection.execute(
-            """
-            SELECT ph.workout_type
-            FROM activity_plan_matches ap
-            JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
-            WHERE ap.activity_id=?
-            """,
-            (row["id"],),
-        ).fetchone()
         override_values = dict(override) if override else {}
-        if (
-            prescription is not None
-            and not override_values.get("workout_type")
-        ):
-            override_values["workout_type"] = prescription["workout_type"]
+        # A prescription match records what was asked for, not what happened.
+        # Only an explicit correction may override observed workout detection.
         effective_override = (
             override_values if override_values else None
         )
