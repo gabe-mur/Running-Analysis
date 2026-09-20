@@ -187,9 +187,41 @@ def save_settings_overlay(
     return load_config(config_path)
 
 
-def recalculate_for_settings(connection, config: dict[str, Any], project_root: Path, patch: SettingsPatch) -> list[UploadStage]:
+def _effective_changed_fields(
+    previous_config: dict[str, Any],
+    config: dict[str, Any],
+    submitted_fields: set[str],
+) -> set[str]:
+    """Return submitted API settings whose effective values actually changed.
+
+    Both Settings forms intentionally submit complete nested objects. Pydantic's
+    ``model_fields_set`` therefore describes request presence, not a semantic
+    change. Using it directly caused a setup confirmation with identical HR,
+    zones, weather, and coaching values to refit every model and discard the
+    saved weekly plan.
+    """
+
+    before = settings_response(previous_config).model_dump(mode="python")
+    after = settings_response(config).model_dump(mode="python")
+    return {
+        field
+        for field in submitted_fields
+        if before.get(field) != after.get(field)
+    }
+
+
+def recalculate_for_settings(
+    connection,
+    config: dict[str, Any],
+    project_root: Path,
+    patch: SettingsPatch,
+    *,
+    previous_config: dict[str, Any] | None = None,
+) -> list[UploadStage]:
     stages: list[UploadStage] = []
-    changed = patch.model_fields_set
+    changed = set(patch.model_fields_set)
+    if previous_config is not None:
+        changed = _effective_changed_fields(previous_config, config, changed)
     analytical = changed & {
         "max_hr", "resting_hr", "target_hr", "zones", "reference_temperature_f",
         "reference_dewpoint_f", "reference_wind_mph", "reference_grade_percent",

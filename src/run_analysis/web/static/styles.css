@@ -359,6 +359,12 @@ select, input { min-height: 2.35rem; padding: .45rem .55rem; border: 1px solid v
 .schedule-day details { margin-top: .8rem; }
 .schedule-day ol { padding-left: 1.2rem; color: var(--muted); }
 .rest-day { opacity: .72; background: #0c1219; }
+.rest-day.lifting-day { opacity: 1; }
+.strength-suggestion { margin-top: 1rem; padding-top: .85rem; border-top: 1px solid var(--border); }
+.strength-suggestion h3 { margin: .2rem 0 .45rem; font-size: 1rem; }
+.strength-suggestion strong, .strength-suggestion small { display: block; }
+.strength-suggestion strong { color: var(--accent); line-height: 1.45; }
+.strength-suggestion small { margin-top: .5rem; color: var(--muted); line-height: 1.45; }
 .forced-rest-day { opacity: 1; border-color: #6f6282; background: #17131f; }
 .rest-toggle { width: 100%; margin-top: 1rem; background: transparent; border-color: var(--line); color: var(--muted); }
 .rest-toggle:hover, .rest-toggle:focus-visible { border-color: var(--accent); color: var(--accent); }

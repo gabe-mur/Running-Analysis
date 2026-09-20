@@ -1,0 +1,50 @@
+{
+  "baseline": "v104 plus eligible-first baseline fix and Phase 2 evidence semantics",
+  "far_edge_incumbent": {
+    "focused_tests_passed": 3,
+    "effect": "removed the September 20 churn failure; next failure moved to September 21",
+    "timing_seconds": {
+      "samples": 3,
+      "median": 14.106302458327264,
+      "maximum": 17.435586499981582
+    }
+  },
+  "forced_cadence_anchor_expansion": {
+    "status": "rejected",
+    "reason": "one refresh exceeded three minutes while repeatedly full-scoring the distance-allocation DP",
+    "interrupted_in": "_allocate_visible_distance_ranges"
+  },
+  "september_21_failure": {
+    "before": {
+      "2026-09-23": "easy"
+    },
+    "after": {
+      "2026-09-24": "easy",
+      "2026-09-25": "intervals"
+    },
+    "search_conclusion": "the stable continuation was fully scored; the rewrite is not a beam omission",
+    "selected_ten_run_candidate": {
+      "offsets": [2, 3, 4, 7, 9, 11, 13, 15, 18, 19],
+      "total_cost": 67.01407119021597,
+      "target_violation": 2.2773676803350753,
+      "support_violation": 0.0,
+      "shape_violation": 0.27666666666666667,
+      "finalized_recovery_cost": 48.66032876540853,
+      "coaching_cost": 3.0
+    },
+    "stable_ten_run_extension": {
+      "offsets": [1, 4, 7, 9, 12, 14, 16, 18, 19, 20],
+      "total_cost": 84.34571836212194,
+      "target_violation": 1.4393186773605038,
+      "support_violation": 0.0,
+      "shape_violation": 0.9433333333333334,
+      "finalized_recovery_cost": 49.200332299578655,
+      "coaching_cost": 12.356090747358198
+    },
+    "stable_nine_run_extension": {
+      "offsets": [1, 4, 7, 9, 12, 14, 16, 18, 20],
+      "wins_its_frequency": true,
+      "total_cost": 99.76310887255099
+    }
+  }
+}

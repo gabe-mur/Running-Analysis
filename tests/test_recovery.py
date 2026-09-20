@@ -181,6 +181,61 @@ def test_completed_short_rep_prescription_sets_recovery_floor_on_actual_volume()
     )
 
 
+def test_any_distance_inside_prescribed_range_uses_same_calendar_load_band() -> None:
+    state = _state()
+    typical = state.recent_load.trailing_28d
+    low_response = _difficulty(miles=3.7).model_copy(
+        update={"zone_load": 50, "moving_minutes": 40.7, "elapsed_minutes": 40.7}
+    )
+    high_response = low_response.model_copy(
+        update={"distance_miles": 4.2, "moving_minutes": 46.2, "elapsed_minutes": 46.2}
+    )
+
+    low_load, low_evidence = athlete_relative_session_load(
+        low_response,
+        typical,
+        prescribed_intensity_factor=1.1,
+        prescribed_distance_range_miles=(3.7, 4.2),
+    )
+    high_load, high_evidence = athlete_relative_session_load(
+        high_response,
+        typical,
+        prescribed_intensity_factor=1.1,
+        prescribed_distance_range_miles=(3.7, 4.2),
+    )
+
+    assert low_load == pytest.approx(high_load)
+    assert low_load == pytest.approx(4.2 / 4.0 * 1.1)
+    assert low_evidence["load_above_prescribed_band"] == 0
+    assert high_evidence["load_above_prescribed_band"] == 0
+
+
+def test_below_range_execution_can_reduce_load_but_excess_intensity_remains_material() -> None:
+    state = _state()
+    typical = state.recent_load.trailing_28d
+    easy_short = _difficulty(miles=3.0).model_copy(
+        update={"zone_load": 40, "moving_minutes": 33, "elapsed_minutes": 33}
+    )
+    hard_in_range = _difficulty(miles=4.0).model_copy(update={"zone_load": 180})
+
+    short_load, _ = athlete_relative_session_load(
+        easy_short,
+        typical,
+        prescribed_intensity_factor=1.1,
+        prescribed_distance_range_miles=(3.7, 4.2),
+    )
+    hard_load, hard_evidence = athlete_relative_session_load(
+        hard_in_range,
+        typical,
+        prescribed_intensity_factor=1.1,
+        prescribed_distance_range_miles=(3.7, 4.2),
+    )
+
+    assert short_load < 4.2 / 4.0 * 1.1
+    assert hard_load > 4.2 / 4.0 * 1.1
+    assert hard_evidence["load_above_prescribed_band"] > 0
+
+
 def test_actual_duration_changes_recovery_at_equal_distance_and_hr_load() -> None:
     state = _state()
     ordinary_session = _difficulty(miles=5)

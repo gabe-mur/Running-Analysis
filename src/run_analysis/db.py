@@ -40,6 +40,23 @@ def transaction(connection: sqlite3.Connection):
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    # API handlers call ``initialize`` defensively before both reads and
+    # writes.  Once the schema is current, keep that path genuinely read-only:
+    # taking ``BEGIN IMMEDIATE`` here can otherwise make an unrelated GET fail
+    # with "database is locked" while an upload is being processed.
+    stored_version = _stored_schema_version(connection)
+    if stored_version is not None:
+        if stored_version > SCHEMA_VERSION:
+            raise DatabaseTooNewError(
+                f"This database is at schema version {stored_version}, but this build of the "
+                f"application understands version {SCHEMA_VERSION}. A newer version "
+                "has already migrated it. If a server is running, restart it so it "
+                "picks up the current code."
+            )
+        if stored_version == SCHEMA_VERSION and _schema_shape_is_current(
+            connection
+        ):
+            return
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS schema_metadata (
@@ -244,6 +261,49 @@ class DatabaseTooNewError(RuntimeError):
     """The database was migrated by a newer version of this application."""
 
 
+def _stored_schema_version(connection: sqlite3.Connection) -> int | None:
+    """Read the migration marker without creating or locking anything."""
+
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='schema_metadata'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute(
+        "SELECT value FROM schema_metadata WHERE key='schema_version'"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _schema_shape_is_current(connection: sqlite3.Connection) -> bool:
+    """Verify the current marker was not left on a partial/legacy schema."""
+
+    required = {
+        "activity_metrics": {
+            "standardized_pace_at_target_hr_min_mile",
+            "detected_workout_type",
+            "workout_detection_source",
+            "workout_detection_confidence",
+        },
+        "trackpoints": {"pause_after_s"},
+        "planned_workout_history": {
+            "duration_low_minutes",
+            "duration_high_minutes",
+        },
+        "activity_plan_matches": {"duration_delta_minutes"},
+    }
+    return all(
+        expected <= _columns(connection, table)
+        for table, expected in required.items()
+    )
+
+
 def _reject_newer_database(connection: sqlite3.Connection) -> None:
     """Refuse to run against a database a newer build already migrated.
 
@@ -258,14 +318,8 @@ def _reject_newer_database(connection: sqlite3.Connection) -> None:
     restarted. Fail loudly and say so.
     """
 
-    row = connection.execute(
-        "SELECT value FROM schema_metadata WHERE key='schema_version'"
-    ).fetchone()
-    if row is None:
-        return
-    try:
-        stored = int(row[0])
-    except (TypeError, ValueError):
+    stored = _stored_schema_version(connection)
+    if stored is None:
         return
     if stored > SCHEMA_VERSION:
         raise DatabaseTooNewError(

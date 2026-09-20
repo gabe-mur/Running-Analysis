@@ -7,6 +7,12 @@ import {
   readinessLabel, titleCase,
 } from "../format.js";
 
+function strengthSuggestionMarkup(suggestion) {
+  if (!suggestion) return "";
+  const groups = suggestion.muscle_groups.map(escapeHtml).join(" · ");
+  return `<div class="strength-suggestion"><p class="eyebrow">Optional strength</p><h3>${escapeHtml(suggestion.title)}</h3><strong>${groups}</strong><small>${escapeHtml(suggestion.rationale)} No weight, set, or rep target is prescribed.</small></div>`;
+}
+
 function weeklyScheduleMarkup(schedule, goal) {
   if (!schedule) return `<article class="wide-card empty-state">Choose your current health status, then generate the next seven days.</article>`;
   const evidence = schedule.target_evidence;
@@ -20,11 +26,16 @@ function weeklyScheduleMarkup(schedule, goal) {
     const restToggle = baselineMode && !result
       ? ""
       : `<button type="button" class="rest-toggle" data-rest-date="${day.date}" data-forced-rest="${day.forced_rest ? "true" : "false"}" aria-pressed="${day.forced_rest ? "true" : "false"}">${day.forced_rest ? "Allow a run" : result ? "Make run rest day" : "Protect as no-run day"}</button>`;
+    const strengthSuggestion = strengthSuggestionMarkup(day.strength_suggestion);
+    const obsoleteRestRationale = "No run is scheduled between these workouts. Other training is not currently recorded, so only running load is projected.";
+    const restRationale = day.rationale && day.rationale !== obsoleteRestRationale
+      ? `<p>${escapeHtml(day.rationale)}</p>`
+      : "";
     if (day.completed_activities?.length) {
       const completed = day.completed_activities.map((activity) => `<a href="#run/${activity.activity_id}"><strong>${number(activity.distance_miles)} mi · ${titleCase(activity.workout_type)}</strong><small>${titleCase(activity.health_tag)}</small></a>`).join("");
       return `<article class="schedule-day completed-day"><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>Run completed</h2>${completed}<p>${escapeHtml(day.rationale)}</p></article>`;
     }
-    if (!result) return `<article class="schedule-day rest-day ${day.forced_rest ? "forced-rest-day" : ""}"><p class="eyebrow">${label}${day.forced_rest ? " · Your constraint" : ""}</p><h2>${day.forced_rest ? "Run rest day" : "No run planned"}</h2><p>${escapeHtml(day.rationale)}</p>${restToggle}</article>`;
+    if (!result) return `<article class="schedule-day rest-day ${strengthSuggestion ? "lifting-day" : ""} ${day.forced_rest ? "forced-rest-day" : ""}"><p class="eyebrow">${label}${day.forced_rest ? " · Your constraint" : ""}</p><h2>${day.forced_rest ? "Run rest day" : "No run planned"}</h2>${restRationale}${strengthSuggestion}${restToggle}</article>`;
     const extent = result.distance_range_miles
       ? `${number(result.distance_range_miles[0])}–${number(result.distance_range_miles[1])} miles`
       : result.duration_range_minutes
@@ -48,7 +59,7 @@ function weeklyScheduleMarkup(schedule, goal) {
     const readinessExplanation = result.readiness !== "ready" && result.readiness_reason
       ? `<details><summary>Why is this flexible?</summary><p>${escapeHtml(result.readiness_reason)}</p></details>`
       : "";
-    return `<article class="schedule-day ${result.readiness}"><div class="card-heading"><div><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>${escapeHtml(result.title)}</h2></div><span class="quality ${result.confidence}">${readinessLabel(result.readiness)}</span></div><strong class="prescription-extent">${extent}</strong><p>${result.target_zones.map(escapeHtml).join(" · ") || "Recovery"}</p><small>${escapeHtml(weatherLine)}</small>${recoveryLine}${steps ? `<details><summary>Workout details</summary><ol>${steps}</ol></details>` : ""}${readinessExplanation}<details><summary>Why this workout?</summary><p>${reasons}</p></details>${restToggle}</article>`;
+    return `<article class="schedule-day ${result.readiness}"><div class="card-heading"><div><p class="eyebrow">${label} · ${titleCase(day.day_role)}</p><h2>${escapeHtml(result.title)}</h2></div><span class="quality ${result.confidence}">${readinessLabel(result.readiness)}</span></div><strong class="prescription-extent">${extent}</strong><p>${result.target_zones.map(escapeHtml).join(" · ") || "Recovery"}</p><small>${escapeHtml(weatherLine)}</small>${recoveryLine}${strengthSuggestion}${steps ? `<details><summary>Workout details</summary><ol>${steps}</ol></details>` : ""}${readinessExplanation}<details><summary>Why this workout?</summary><p>${reasons}</p></details>${restToggle}</article>`;
   }).join("");
   const trailingCards = schedule.trailing_days.map((day) => {
     const activities = day.activities.map((activity) => `<a href="#run/${activity.activity_id}"><strong>${number(activity.distance_miles)} mi · ${titleCase(activity.workout_type)}</strong><small>${titleCase(activity.health_tag)}</small></a>`).join("");

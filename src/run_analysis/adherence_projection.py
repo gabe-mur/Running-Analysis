@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
 from random import Random
+from time import perf_counter
+from typing import Any, Callable
 
 from .durability import supported_long_run_capacity
 from .easy_baseline import (
@@ -28,6 +30,7 @@ from .training_load import (
 from .weekly_schedule import (
     PLANNING_HORIZON_DAYS,
     PlanningActivity,
+    adherence_normalized_distance,
     build_weekly_schedule,
     derive_weekly_target,
     make_expected_target_projector,
@@ -150,6 +153,28 @@ class OverloadScenario(str, Enum):
     DENSE_SEQUENCE = "dense_sequence"
 
 
+class DeterministicAdherenceScenario(str, Enum):
+    """Named single-purpose deviations for fast closed-loop regressions."""
+
+    IN_RANGE_LOW = "in_range_low"
+    IN_RANGE_HIGH = "in_range_high"
+    BELOW_RANGE_EASY = "below_range_easy"
+    ABOVE_RANGE_OR_HARDER = "above_range_or_harder"
+    SINGLE_HIDDEN_MISS = "single_hidden_miss"
+    KNOWN_FORCED_REST = "known_forced_rest"
+    HIDDEN_VACATION = "hidden_vacation"
+
+
+@dataclass(frozen=True, slots=True)
+class DeterministicAdherenceProfile:
+    scenario: DeterministicAdherenceScenario
+    trigger_scheduled_run: int = 1
+    below_range_fraction: float = 0.75
+    above_range_easy_fraction: float = 0.50
+    block_start_day: int = 5
+    block_days: int = 7
+
+
 @dataclass(frozen=True, slots=True)
 class OverloadAdherenceProfile:
     """One athlete-relative overload introduced into an otherwise clean loop.
@@ -171,6 +196,10 @@ class ProjectionPlanSession:
     planned_for: datetime
     workout_type: WorkoutType
     midpoint_miles: float
+    distance_low_miles: float | None = None
+    distance_high_miles: float | None = None
+    planning_role: str | None = None
+    readiness: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +212,131 @@ class ProjectionReplan:
     target_high_miles: float
     planned_sessions: tuple[ProjectionPlanSession, ...]
     committed_sessions: tuple[ProjectionPlanSession, ...]
+    capacity_reference_miles: float | None = None
+    planning_mode: str | None = None
+    ordinary_easy_midpoint_miles: float | None = None
+    boundary_session_miles: float | None = None
+    opening_continuous_distance_miles: float | None = None
+    opening_short_term_distance_miles: float | None = None
+    peak_projected_continuous_mileage_rate: float | None = None
+    planning_seconds: float | None = None
+    target_trajectory: tuple[tuple[float, float], ...] = ()
+    decision_start_date: date | None = None
+    planner_diagnostics: dict[str, Any] | None = None
+    material_evidence_reasons: tuple[str, ...] = ()
+    opening_recovery_residual_load: float | None = None
+    expected_opening_recovery_residual_load: float | None = None
+    expected_opening_state_at: datetime | None = None
+    recovery_surprise_units: float | None = None
+    days_since_long_run: float | None = None
+    days_since_quality_run: float | None = None
+    long_cadence_reference_days: float | None = None
+    quality_cadence_reference_days: float | None = None
+    cadence_exception_reasons: tuple[str, ...] = ()
+    trigger: str = "scheduled_refresh"
+    source_activity_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionChurnSummary:
+    """Changes between consecutive replans inside one fixed future window."""
+
+    horizon_days: int
+    comparison_count: int
+    schedule_changed_comparisons: int
+    distance_only_changed_comparisons: int
+    date_slot_changes: int
+    workout_type_changes: int
+    distance_changes: int
+
+
+def summarize_replan_churn(
+    replans: list[ProjectionReplan] | tuple[ProjectionReplan, ...],
+    *,
+    horizon_days: int,
+    transition_trigger: str | None = None,
+) -> ProjectionChurnSummary:
+    """Measure future-plan churn without counting already-consumed sessions.
+
+    Each comparison uses the later refresh's next ``horizon_days`` calendar
+    dates. The refresh date itself is excluded because a prescribed run may
+    have been completed before that refresh; its disappearance is compliance,
+    not instability. Date/type changes are kept separate from distance-only
+    edits because moving a run is more disruptive than resizing it.
+    """
+
+    if horizon_days < 1:
+        raise ValueError("horizon_days must be at least one")
+    ordered = sorted(replans, key=lambda item: item.generated_at)
+    schedule_changed_comparisons = 0
+    distance_only_changed_comparisons = 0
+    date_slot_changes = 0
+    workout_type_changes = 0
+    distance_changes = 0
+    for previous, current in zip(ordered, ordered[1:]):
+        if (
+            transition_trigger is not None
+            and current.trigger != transition_trigger
+        ):
+            continue
+        window_start = (
+            current.decision_start_date
+            if current.trigger == "post_upload"
+            and current.decision_start_date is not None
+            else current.generated_at.date() + timedelta(days=1)
+        )
+        window_end = window_start + timedelta(days=horizon_days)
+
+        def future_by_date(
+            replan: ProjectionReplan,
+        ) -> dict[date, ProjectionPlanSession]:
+            return {
+                session.planned_for.date(): session
+                for session in replan.planned_sessions
+                if window_start <= session.planned_for.date() < window_end
+            }
+
+        before = future_by_date(previous)
+        after = future_by_date(current)
+        changed_dates = set(before) ^ set(after)
+        shared_dates = set(before) & set(after)
+        changed_types = {
+            value
+            for value in shared_dates
+            if before[value].workout_type != after[value].workout_type
+        }
+        changed_distances = {
+            value
+            for value in shared_dates - changed_types
+            if abs(
+                before[value].midpoint_miles
+                - after[value].midpoint_miles
+            )
+            > 1e-9
+        }
+        schedule_changed = bool(changed_dates or changed_types)
+        schedule_changed_comparisons += int(schedule_changed)
+        distance_only_changed_comparisons += int(
+            not schedule_changed and bool(changed_distances)
+        )
+        date_slot_changes += len(changed_dates)
+        workout_type_changes += len(changed_types)
+        distance_changes += len(changed_distances)
+
+    return ProjectionChurnSummary(
+        horizon_days=horizon_days,
+        comparison_count=sum(
+            1
+            for _, current in zip(ordered, ordered[1:])
+            if transition_trigger is None
+            or current.trigger == transition_trigger
+        ),
+        schedule_changed_comparisons=schedule_changed_comparisons,
+        distance_only_changed_comparisons=distance_only_changed_comparisons,
+        date_slot_changes=date_slot_changes,
+        workout_type_changes=workout_type_changes,
+        distance_changes=distance_changes,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +427,14 @@ class ProjectionAdherenceEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectionActualSession:
+    occurred_at: datetime
+    workout_type: WorkoutType
+    distance_miles: float
+    was_prescribed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectionWeek:
     week: int
     start_date: date
@@ -294,6 +456,7 @@ class ProjectionWeek:
     adherence_events: tuple[str, ...] = ()
     replan_snapshots: tuple[ProjectionReplan, ...] = ()
     adherence_event_records: tuple[ProjectionAdherenceEvent, ...] = ()
+    actual_sessions: tuple[ProjectionActualSession, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,6 +645,15 @@ def _state_at(
                         if run is last and not run.projected
                         else None
                     ),
+                    prescribed_distance_range_miles=(
+                        (
+                            run.prescribed_low_miles,
+                            run.prescribed_high_miles,
+                        )
+                        if run.prescribed_low_miles is not None
+                        and run.prescribed_high_miles is not None
+                        else None
+                    ),
                 )[0],
                 max(0.0, (as_of - run.start_time).total_seconds() / 3600.0),
             )
@@ -590,6 +762,7 @@ def _state_at(
                 lambda run: run.workout_type == WorkoutType.LONG
             ),
             "last_run": last.difficulty if last else None,
+            "last_run_distance_miles": last.distance_miles if last else None,
             "last_run_workout_type": last.workout_type if last else None,
             "last_run_prescribed_workout_type": (
                 (
@@ -875,8 +1048,11 @@ def simulate_adherence(
     replan_interval_days: int = 1,
     human_profile: HumanAdherenceProfile | None = None,
     overload_profile: OverloadAdherenceProfile | None = None,
+    deterministic_profile: DeterministicAdherenceProfile | None = None,
     initial_schedule: WeeklyScheduleResponse | None = None,
     simulation_days: int | None = None,
+    replan_observer: Callable[[ProjectionReplan], None] | None = None,
+    emit_post_upload_replans: bool = True,
 ) -> list[ProjectionWeek]:
     """Roll the real planner forward under controlled adherence behavior.
 
@@ -893,15 +1069,28 @@ def simulate_adherence(
         raise ValueError("replan_interval_days must be between 1 and 7")
     if simulation_days is not None and simulation_days < 1:
         raise ValueError("simulation_days must be at least one")
-    if human_profile is not None and overload_profile is not None:
+    selected_profiles = sum(
+        profile is not None
+        for profile in (
+            human_profile,
+            overload_profile,
+            deterministic_profile,
+        )
+    )
+    if selected_profiles > 1:
         raise ValueError(
-            "Human and deterministic overload profiles are mutually exclusive"
+            "Human, overload, and deterministic profiles are mutually exclusive"
         )
     if overload_profile is not None and replan_interval_days != 1:
         raise ValueError("Closed-loop overload diagnostics require daily replanning")
     if (
         overload_profile is not None
         and overload_profile.trigger_scheduled_run < 1
+    ):
+        raise ValueError("trigger_scheduled_run must be at least one")
+    if (
+        deterministic_profile is not None
+        and deterministic_profile.trigger_scheduled_run < 1
     ):
         raise ValueError("trigger_scheduled_run must be at least one")
 
@@ -911,6 +1100,9 @@ def simulate_adherence(
     adherence_events: list[tuple[datetime, str, str]] = []
     behavior_rng = Random(human_profile.seed) if human_profile else None
     scheduled_execution_count = 0
+    deterministic_candidate_count = 0
+    deterministic_trigger_complete = False
+    expected_openings: dict[datetime, tuple[datetime, float | None]] = {}
     overload_trigger_date: date | None = None
     unscheduled_overload_complete = False
     candidate_hours = sorted(
@@ -929,7 +1121,30 @@ def simulate_adherence(
     breaks = (
         _human_breaks(human_profile, simulation_start_date, total_days)
         if human_profile
-        else ()
+        else (
+            (
+                _HumanBreak(
+                    start_date=(
+                        simulation_start_date
+                        + timedelta(
+                            days=max(0, deterministic_profile.block_start_day)
+                        )
+                    ),
+                    end_date=(
+                        simulation_start_date
+                        + timedelta(
+                            days=max(0, deterministic_profile.block_start_day)
+                            + max(1, deterministic_profile.block_days)
+                        )
+                    ),
+                    label="hidden vacation",
+                ),
+            )
+            if deterministic_profile is not None
+            and deterministic_profile.scenario
+            == DeterministicAdherenceScenario.HIDDEN_VACATION
+            else ()
+        )
     )
     for pause in breaks:
         adherence_events.append(
@@ -952,6 +1167,322 @@ def simulate_adherence(
     # approximate candidate search from overlooking a still-optimal translated
     # calendar after the horizon origin advances.
     previous_schedule = initial_schedule
+    last_replan_at: datetime | None = None
+
+    def planning_activities_for(
+        values: list[ProjectionRun],
+    ) -> list[PlanningActivity]:
+        return [
+            PlanningActivity(
+                run.start_time,
+                run.distance_miles,
+                moving_minutes=run.moving_minutes,
+                easy_minutes=run.difficulty.zone_breakdown.easy_minutes,
+                baseline_eligible=(
+                    run.workout_type
+                    in {
+                        WorkoutType.EASY,
+                        WorkoutType.RECOVERY,
+                        WorkoutType.RUN_WALK,
+                        WorkoutType.UNKNOWN,
+                    }
+                    and not run.difficulty.is_long_run
+                    and not run.difficulty.is_quality_session
+                    and run.planning_role
+                    not in {"support_easy", "medium_long"}
+                ),
+                target_distance_miles=adherence_normalized_distance(
+                    run.distance_miles,
+                    (
+                        (run.prescribed_low_miles, run.prescribed_high_miles)
+                        if run.prescribed_low_miles is not None
+                        and run.prescribed_high_miles is not None
+                        else None
+                    ),
+                ),
+            )
+            for run in values
+        ]
+
+    def build_post_upload_replan(
+        *,
+        upload_at: datetime,
+        source_activity_at: datetime,
+        prior_schedule: WeeklyScheduleResponse,
+        expected_opening: tuple[datetime, float | None] | None,
+    ) -> tuple[WeeklyScheduleResponse, ProjectionReplan]:
+        """Regenerate from uploaded evidence before the next clock refresh.
+
+        The production planner advances its decision boundary after a run is
+        completed. The projection previously skipped this event and compared
+        the pre-run plan directly with the following day's refresh, obscuring
+        whether churn was caused by the upload or by an evidence-free reload.
+        """
+
+        completed_today = _completed_activities_on_plan_date(history, upload_at)
+        decision_start_date = upload_at.date() + timedelta(
+            days=1 if completed_today else 0
+        )
+        target_as_of = datetime.combine(
+            decision_start_date,
+            time.min,
+            tzinfo=start_at.tzinfo,
+        )
+        activities = planning_activities_for(history)
+        target_runs, target_range, evidence = derive_weekly_target(
+            activities,
+            target_as_of,
+            config,
+        )
+        capacity = evidence.capacity_reference_miles
+        daily_states: list[FitnessState] = []
+        daily_state_options: list[list[FitnessState]] = []
+        for offset in range(PLANNING_HORIZON_DAYS):
+            day = decision_start_date + timedelta(days=offset)
+            hours = list(candidate_hours)
+            if offset == 0 and decision_start_date == upload_at.date():
+                hours = [
+                    hour
+                    for hour in hours
+                    if datetime.combine(
+                        day,
+                        time(hour),
+                        tzinfo=start_at.tzinfo,
+                    )
+                    > upload_at + timedelta(minutes=10)
+                ]
+                if not hours:
+                    hours = [upload_at.hour]
+            options: list[FitnessState] = []
+            for hour in hours:
+                planned_at = datetime.combine(
+                    day,
+                    time(hour),
+                    tzinfo=start_at.tzinfo,
+                )
+                if planned_at < upload_at:
+                    planned_at = upload_at
+                options.append(
+                    _state_at(
+                        template,
+                        history,
+                        planned_at,
+                        capacity,
+                        easy_baseline_half_life_days=float(
+                            config.get("coaching", {}).get(
+                                "capacity_retention_half_life_days",
+                                84,
+                            )
+                        ),
+                        fatigue_half_life_days=float(
+                            config.get("coaching", {}).get(
+                                "continuous_fatigue_half_life_days",
+                                7,
+                            )
+                        ),
+                    )
+                )
+            daily_state_options.append(options)
+        planning_reference_state = _state_at(
+            template,
+            history,
+            target_as_of,
+            capacity,
+            easy_baseline_half_life_days=float(
+                config.get("coaching", {}).get(
+                    "capacity_retention_half_life_days",
+                    84,
+                )
+            ),
+            fatigue_half_life_days=float(
+                config.get("coaching", {}).get(
+                    "continuous_fatigue_half_life_days",
+                    7,
+                )
+            ),
+        )
+        daily_states = [
+            planning_reference_state,
+            *(options[0] for options in daily_state_options[1:]),
+        ]
+        pace_window = _load_window(history, upload_at, 28)
+        pace = (
+            pace_window.moving_minutes / pace_window.distance_miles
+            if pace_window.distance_miles > 0
+            else 11.0
+        )
+        pace = min(15.0, max(7.0, pace))
+        expected_target_projector = make_expected_target_projector(
+            activities,
+            decision_start_date,
+            config,
+            pace_min_mile=pace,
+            maximum_horizon_days=PLANNING_HORIZON_DAYS,
+            opening_target_range=target_range,
+            opening_evidence=evidence,
+            ordinary_easy_midpoint_miles=(
+                daily_states[0].typical_easy_run_miles
+            ),
+            prior_schedule=prior_schedule,
+        )
+        forced_rest_offsets: set[int] = set()
+        if (
+            deterministic_profile is not None
+            and deterministic_profile.scenario
+            == DeterministicAdherenceScenario.KNOWN_FORCED_REST
+        ):
+            block_start = simulation_start_date + timedelta(
+                days=max(0, deterministic_profile.block_start_day)
+            )
+            block_end = block_start + timedelta(
+                days=max(1, deterministic_profile.block_days)
+            )
+            forced_rest_offsets = {
+                offset
+                for offset, state in enumerate(daily_states)
+                if block_start <= state.as_of.date() < block_end
+            }
+        planning_started = perf_counter()
+        schedule = build_weekly_schedule(
+            daily_states,
+            RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+            config,
+            target_run_count=target_runs,
+            target_distance_range=target_range,
+            target_evidence=evidence,
+            completed_activities_by_offset={},
+            daily_state_options=daily_state_options,
+            forced_rest_offsets=forced_rest_offsets,
+            prior_schedule=prior_schedule,
+            expected_target_projector=expected_target_projector,
+        )
+        planning_seconds = perf_counter() - planning_started
+        visible_plan = [
+            day.recommendation
+            for day in (schedule.planning_days or schedule.days)
+            if day.recommendation
+            and day.recommendation.workout_type != WorkoutType.REST
+            and day.recommendation.planned_for
+        ]
+        opening = (
+            daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
+            if daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
+            is not None
+            else daily_states[0].recent_load.acute_distance_to_capacity_ratio
+        )
+        expected_state_at = (
+            expected_opening[0] if expected_opening is not None else None
+        )
+        expected_recovery_residual = (
+            expected_opening[1] if expected_opening is not None else None
+        )
+        actual_recovery_residual = daily_states[0].recovery_residual_load
+        recovery_surprise = (
+            actual_recovery_residual - expected_recovery_residual
+            if actual_recovery_residual is not None
+            and expected_recovery_residual is not None
+            and expected_state_at == daily_states[0].as_of
+            else None
+        )
+        material_evidence_reasons = tuple(
+            f"{kind}: {detail}"
+            for occurred_at, kind, detail in adherence_events
+            if occurred_at == source_activity_at
+            and kind in {"deviation", "overload", "unscheduled"}
+        )
+        snapshot = ProjectionReplan(
+            generated_at=upload_at,
+            opening_load_ratio=opening,
+            target_low_miles=target_range[0],
+            target_high_miles=target_range[1],
+            planned_sessions=tuple(
+                ProjectionPlanSession(
+                    planned_for=item.planned_for,
+                    workout_type=item.workout_type,
+                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    distance_low_miles=item.distance_range_miles[0],
+                    distance_high_miles=item.distance_range_miles[1],
+                    planning_role=item.planning_role,
+                    readiness=item.readiness.value,
+                )
+                for item in visible_plan
+                if item.planned_for and item.distance_range_miles
+            ),
+            committed_sessions=(),
+            capacity_reference_miles=capacity,
+            planning_mode=evidence.planning_mode.value,
+            ordinary_easy_midpoint_miles=daily_states[0].typical_easy_run_miles,
+            boundary_session_miles=(
+                daily_states[0].last_run_distance_miles
+                if daily_states[0].days_since_last_run is not None
+                and daily_states[0].days_since_last_run <= 7
+                else None
+            ),
+            opening_continuous_distance_miles=(
+                daily_states[0].recent_load.continuous_distance_miles
+            ),
+            opening_short_term_distance_miles=(
+                daily_states[0].recent_load.continuous_short_term_distance_miles
+            ),
+            peak_projected_continuous_mileage_rate=(
+                schedule.peak_projected_continuous_mileage_rate
+            ),
+            planning_seconds=planning_seconds,
+            target_trajectory=(
+                expected_target_projector(
+                    visible_plan,
+                    PLANNING_HORIZON_DAYS,
+                )
+                if replan_observer is not None
+                else ()
+            ),
+            decision_start_date=decision_start_date,
+            planner_diagnostics=(
+                schedule.planner_diagnostics.model_dump()
+                if schedule.planner_diagnostics is not None
+                else None
+            ),
+            material_evidence_reasons=material_evidence_reasons,
+            opening_recovery_residual_load=actual_recovery_residual,
+            expected_opening_recovery_residual_load=expected_recovery_residual,
+            expected_opening_state_at=expected_state_at,
+            recovery_surprise_units=recovery_surprise,
+            days_since_long_run=daily_states[0].days_since_long_run,
+            days_since_quality_run=daily_states[0].days_since_quality_run,
+            long_cadence_reference_days=float(
+                config.get("coaching", {}).get(
+                    "long_run_recency_reference_days",
+                    7,
+                )
+            ),
+            quality_cadence_reference_days=float(
+                config.get("coaching", {}).get(
+                    "quality_recency_reference_days",
+                    7,
+                )
+            ),
+            cadence_exception_reasons=tuple(
+                dict.fromkeys(
+                    reason
+                    for day in (schedule.planning_days or schedule.days)
+                    if day.recommendation is not None
+                    for reason in day.recommendation.reasons
+                    if any(
+                        marker in reason.casefold()
+                        for marker in (
+                            "replaced with aerobic",
+                            "recovery guardrail",
+                            "readiness guardrail",
+                            "recovery is incomplete",
+                        )
+                    )
+                )
+            ),
+            trigger="post_upload",
+            source_activity_at=source_activity_at,
+        )
+        return schedule, snapshot
+
     for plan_offset in range(0, total_days, replan_interval_days):
         plan_start = start_at + timedelta(days=plan_offset)
         commit_end = min(
@@ -974,62 +1505,80 @@ def simulate_adherence(
             time.min,
             tzinfo=start_at.tzinfo,
         )
-        activities = [
-            PlanningActivity(
-                run.start_time,
-                run.distance_miles,
-                moving_minutes=run.moving_minutes,
-                easy_minutes=run.difficulty.zone_breakdown.easy_minutes,
-                baseline_eligible=(
-                    run.workout_type
-                    in {
-                        WorkoutType.EASY,
-                        WorkoutType.RECOVERY,
-                        WorkoutType.RUN_WALK,
-                        WorkoutType.UNKNOWN,
-                    }
-                    and not run.difficulty.is_long_run
-                    and not run.difficulty.is_quality_session
-                    and run.planning_role not in {"support_easy", "medium_long"}
-                ),
-            )
-            for run in history
-        ]
+        activities = planning_activities_for(history)
         target_runs, target_range, evidence = derive_weekly_target(
             activities, target_as_of, config
         )
         capacity = evidence.capacity_reference_miles
-        daily_states: list[FitnessState] = []
+        daily_state_options: list[list[FitnessState]] = []
         for offset in range(PLANNING_HORIZON_DAYS):
             day = decision_start_date + timedelta(days=offset)
-            hour = default_hour
+            hours = list(candidate_hours)
             if offset == 0 and decision_start_date == plan_start.date():
-                future_hours = [
-                    value for value in candidate_hours
-                    if value > plan_start.hour
+                hours = [
+                    hour
+                    for hour in hours
+                    if datetime.combine(
+                        day,
+                        time(hour),
+                        tzinfo=start_at.tzinfo,
+                    )
+                    > plan_start + timedelta(minutes=10)
                 ]
-                hour = future_hours[0] if future_hours else plan_start.hour
-            planned_at = datetime.combine(day, time(hour), tzinfo=start_at.tzinfo)
-            if planned_at < plan_start:
-                planned_at = plan_start
-            daily_states.append(
-                _state_at(
-                    template,
-                    history,
-                    planned_at,
-                    capacity,
-                    easy_baseline_half_life_days=float(
-                        config.get("coaching", {}).get(
-                            "capacity_retention_half_life_days", 84
-                        )
-                    ),
-                    fatigue_half_life_days=float(
-                        config.get("coaching", {}).get(
-                            "continuous_fatigue_half_life_days", 7
-                        )
-                    ),
+                if not hours:
+                    hours = [plan_start.hour]
+            options: list[FitnessState] = []
+            for hour in hours:
+                planned_at = datetime.combine(
+                    day,
+                    time(hour),
+                    tzinfo=start_at.tzinfo,
                 )
-            )
+                if planned_at < plan_start:
+                    planned_at = plan_start
+                options.append(
+                    _state_at(
+                        template,
+                        history,
+                        planned_at,
+                        capacity,
+                        easy_baseline_half_life_days=float(
+                            config.get("coaching", {}).get(
+                                "capacity_retention_half_life_days",
+                                84,
+                            )
+                        ),
+                        fatigue_half_life_days=float(
+                            config.get("coaching", {}).get(
+                                "continuous_fatigue_half_life_days",
+                                7,
+                            )
+                        ),
+                    )
+                )
+            daily_state_options.append(options)
+        planning_reference_state = _state_at(
+            template,
+            history,
+            target_as_of,
+            capacity,
+            easy_baseline_half_life_days=float(
+                config.get("coaching", {}).get(
+                    "capacity_retention_half_life_days",
+                    84,
+                )
+            ),
+            fatigue_half_life_days=float(
+                config.get("coaching", {}).get(
+                    "continuous_fatigue_half_life_days",
+                    7,
+                )
+            ),
+        )
+        daily_states = [
+            planning_reference_state,
+            *(options[0] for options in daily_state_options[1:]),
+        ]
         pace_window = _load_window(history, plan_start, 28)
         pace = (
             pace_window.moving_minutes / pace_window.distance_miles
@@ -1045,8 +1594,30 @@ def simulate_adherence(
             maximum_horizon_days=PLANNING_HORIZON_DAYS,
             opening_target_range=target_range,
             opening_evidence=evidence,
+            ordinary_easy_midpoint_miles=(
+                daily_states[0].typical_easy_run_miles
+            ),
+            prior_schedule=previous_schedule,
         )
 
+        planning_started = perf_counter()
+        forced_rest_offsets: set[int] = set()
+        if (
+            deterministic_profile is not None
+            and deterministic_profile.scenario
+            == DeterministicAdherenceScenario.KNOWN_FORCED_REST
+        ):
+            block_start = simulation_start_date + timedelta(
+                days=max(0, deterministic_profile.block_start_day)
+            )
+            block_end = block_start + timedelta(
+                days=max(1, deterministic_profile.block_days)
+            )
+            forced_rest_offsets = {
+                offset
+                for offset, state in enumerate(daily_states)
+                if block_start <= state.as_of.date() < block_end
+            }
         schedule = build_weekly_schedule(
             daily_states,
             RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
@@ -1055,9 +1626,12 @@ def simulate_adherence(
             target_distance_range=target_range,
             target_evidence=evidence,
             completed_activities_by_offset={},
+            daily_state_options=daily_state_options,
+            forced_rest_offsets=forced_rest_offsets,
             prior_schedule=previous_schedule,
             expected_target_projector=expected_target_projector,
         )
+        planning_seconds = perf_counter() - planning_started
         previous_schedule = schedule
         committed = [
             day.recommendation
@@ -1110,35 +1684,246 @@ def simulate_adherence(
                 or "none"
             )
         )
-        summary["snapshots"].append(
-            ProjectionReplan(
-                generated_at=plan_start,
-                opening_load_ratio=opening,
-                target_low_miles=target_range[0],
-                target_high_miles=target_range[1],
-                planned_sessions=tuple(
-                    ProjectionPlanSession(
-                        planned_for=item.planned_for,
-                        workout_type=item.workout_type,
-                        midpoint_miles=sum(item.distance_range_miles) / 2,
+        target_trajectory = (
+            expected_target_projector(
+                visible_plan,
+                PLANNING_HORIZON_DAYS,
+            )
+            if replan_observer is not None
+            else ()
+        )
+        expected_opening = expected_openings.pop(plan_start, None)
+        expected_state_at = (
+            expected_opening[0] if expected_opening is not None else None
+        )
+        expected_recovery_residual = (
+            expected_opening[1] if expected_opening is not None else None
+        )
+        actual_recovery_residual = daily_states[0].recovery_residual_load
+        recovery_surprise = (
+            actual_recovery_residual - expected_recovery_residual
+            if actual_recovery_residual is not None
+            and expected_recovery_residual is not None
+            and expected_state_at == daily_states[0].as_of
+            else None
+        )
+        snapshot = ProjectionReplan(
+            generated_at=plan_start,
+            opening_load_ratio=opening,
+            target_low_miles=target_range[0],
+            target_high_miles=target_range[1],
+            planned_sessions=tuple(
+                ProjectionPlanSession(
+                    planned_for=item.planned_for,
+                    workout_type=item.workout_type,
+                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    distance_low_miles=item.distance_range_miles[0],
+                    distance_high_miles=item.distance_range_miles[1],
+                    planning_role=item.planning_role,
+                    readiness=item.readiness.value,
+                )
+                for item in visible_plan
+                if item.planned_for and item.distance_range_miles
+            ),
+            committed_sessions=tuple(
+                ProjectionPlanSession(
+                    planned_for=item.planned_for,
+                    workout_type=item.workout_type,
+                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    distance_low_miles=item.distance_range_miles[0],
+                    distance_high_miles=item.distance_range_miles[1],
+                    planning_role=item.planning_role,
+                    readiness=item.readiness.value,
+                )
+                for item in committed
+                if item.planned_for and item.distance_range_miles
+            ),
+            capacity_reference_miles=capacity,
+            planning_mode=evidence.planning_mode.value,
+            ordinary_easy_midpoint_miles=(
+                daily_states[0].typical_easy_run_miles
+            ),
+            boundary_session_miles=(
+                daily_states[0].last_run_distance_miles
+                if daily_states[0].days_since_last_run is not None
+                and daily_states[0].days_since_last_run <= 7
+                else None
+            ),
+            opening_continuous_distance_miles=(
+                daily_states[0].recent_load.continuous_distance_miles
+            ),
+            opening_short_term_distance_miles=(
+                daily_states[0]
+                .recent_load
+                .continuous_short_term_distance_miles
+            ),
+            peak_projected_continuous_mileage_rate=(
+                schedule.peak_projected_continuous_mileage_rate
+            ),
+            planning_seconds=planning_seconds,
+            target_trajectory=target_trajectory,
+            decision_start_date=decision_start_date,
+            planner_diagnostics=(
+                schedule.planner_diagnostics.model_dump()
+                if schedule.planner_diagnostics is not None
+                else None
+            ),
+            material_evidence_reasons=tuple(
+                f"{kind}: {detail}"
+                for occurred_at, kind, detail in adherence_events
+                if (last_replan_at is None or last_replan_at < occurred_at)
+                and occurred_at <= plan_start
+                and kind
+                in {
+                    "deviation",
+                    "overload",
+                    "skip",
+                    "unscheduled",
+                    "break",
+                }
+            ),
+            opening_recovery_residual_load=actual_recovery_residual,
+            expected_opening_recovery_residual_load=(
+                expected_recovery_residual
+            ),
+            expected_opening_state_at=expected_state_at,
+            recovery_surprise_units=recovery_surprise,
+            days_since_long_run=daily_states[0].days_since_long_run,
+            days_since_quality_run=daily_states[0].days_since_quality_run,
+            long_cadence_reference_days=float(
+                config.get("coaching", {}).get(
+                    "long_run_recency_reference_days",
+                    7,
+                )
+            ),
+            quality_cadence_reference_days=float(
+                config.get("coaching", {}).get(
+                    "quality_recency_reference_days",
+                    7,
+                )
+            ),
+            cadence_exception_reasons=tuple(
+                dict.fromkeys(
+                    reason
+                    for day in (schedule.planning_days or schedule.days)
+                    if day.recommendation is not None
+                    for reason in day.recommendation.reasons
+                    if any(
+                        marker in reason.casefold()
+                        for marker in (
+                            "replaced with aerobic",
+                            "recovery guardrail",
+                            "readiness guardrail",
+                            "recovery is incomplete",
+                        )
                     )
-                    for item in visible_plan
-                    if item.planned_for and item.distance_range_miles
+                )
+            ),
+        )
+        summary["snapshots"].append(snapshot)
+        if replan_observer is not None:
+            replan_observer(snapshot)
+        last_replan_at = snapshot.generated_at
+        next_plan_start = plan_start + timedelta(
+            days=replan_interval_days
+        )
+        if next_plan_start < simulation_end_at:
+            expected_committed_runs = [
+                ProjectionRun(
+                    start_time=item.planned_for,
+                    distance_miles=sum(item.distance_range_miles) / 2.0,
+                    moving_minutes=(
+                        sum(item.distance_range_miles) / 2.0 * pace
+                    ),
+                    workout_type=item.workout_type,
+                    difficulty=_projected_difficulty(
+                        item,
+                        sum(item.distance_range_miles) / 2.0,
+                        pace,
+                    ),
+                    projected=True,
+                    planning_role=_completed_planning_role(
+                        item,
+                        item.workout_type,
+                    ),
+                    prescribed_workout_type=item.workout_type,
+                    completed_prescribed_workout=True,
+                    prescribed_low_miles=item.distance_range_miles[0],
+                    prescribed_high_miles=item.distance_range_miles[1],
+                    prescription_title=item.title,
+                    quality_session_type=(
+                        item.quality_session_type
+                        if item.workout_type in QUALITY_TYPES
+                        else None
+                    ),
+                )
+                for item in committed
+                if item.planned_for is not None
+                and item.distance_range_miles is not None
+            ]
+            expected_history = sorted(
+                [*history, *expected_committed_runs],
+                key=lambda item: item.start_time,
+            )
+            expected_completed_today = _completed_activities_on_plan_date(
+                expected_history,
+                next_plan_start,
+            )
+            expected_decision_date = next_plan_start.date() + timedelta(
+                days=1 if expected_completed_today else 0
+            )
+            expected_target_as_of = datetime.combine(
+                expected_decision_date,
+                time.min,
+                tzinfo=start_at.tzinfo,
+            )
+            _, _, expected_evidence = derive_weekly_target(
+                planning_activities_for(expected_history),
+                expected_target_as_of,
+                config,
+            )
+            expected_state = _state_at(
+                template,
+                expected_history,
+                expected_target_as_of,
+                expected_evidence.capacity_reference_miles,
+                easy_baseline_half_life_days=float(
+                    config.get("coaching", {}).get(
+                        "capacity_retention_half_life_days",
+                        84,
+                    )
                 ),
-                committed_sessions=tuple(
-                    ProjectionPlanSession(
-                        planned_for=item.planned_for,
-                        workout_type=item.workout_type,
-                        midpoint_miles=sum(item.distance_range_miles) / 2,
+                fatigue_half_life_days=float(
+                    config.get("coaching", {}).get(
+                        "continuous_fatigue_half_life_days",
+                        7,
                     )
-                    for item in committed
-                    if item.planned_for and item.distance_range_miles
                 ),
             )
-        )
+            expected_openings[next_plan_start] = (
+                expected_state.as_of,
+                expected_state.recovery_residual_load,
+            )
         for item in committed:
             if not item.distance_range_miles or not item.planned_for:
                 continue
+            deterministic_triggered = False
+            if (
+                deterministic_profile is not None
+                and not deterministic_trigger_complete
+            ):
+                deterministic_eligible = bool(
+                    deterministic_profile.scenario
+                    != DeterministicAdherenceScenario.BELOW_RANGE_EASY
+                    or item.workout_type
+                    in {WorkoutType.EASY, WorkoutType.RECOVERY}
+                )
+                if deterministic_eligible:
+                    deterministic_candidate_count += 1
+                    deterministic_triggered = bool(
+                        deterministic_candidate_count
+                        == deterministic_profile.trigger_scheduled_run
+                    )
             commitments[item.planned_for.date()] = (
                 item.planned_for,
                 item.distance_range_miles[0],
@@ -1163,6 +1948,21 @@ def simulate_adherence(
                 )
                 continue
             if (
+                deterministic_profile is not None
+                and deterministic_profile.scenario
+                == DeterministicAdherenceScenario.SINGLE_HIDDEN_MISS
+                and deterministic_triggered
+            ):
+                deterministic_trigger_complete = True
+                adherence_events.append(
+                    (
+                        item.planned_for,
+                        "skip",
+                        f"single hidden miss: {item.workout_type.value}",
+                    )
+                )
+                continue
+            if (
                 behavior_rng is not None
                 and behavior_rng.random() < human_profile.skip_probability
             ):
@@ -1176,6 +1976,45 @@ def simulate_adherence(
                 continue
             miles = sum(item.distance_range_miles) / 2.0
             notes: list[str] = []
+            if deterministic_profile is not None:
+                if (
+                    deterministic_profile.scenario
+                    == DeterministicAdherenceScenario.IN_RANGE_LOW
+                ):
+                    miles = item.distance_range_miles[0]
+                elif (
+                    deterministic_profile.scenario
+                    == DeterministicAdherenceScenario.IN_RANGE_HIGH
+                ):
+                    miles = item.distance_range_miles[1]
+                elif (
+                    deterministic_profile.scenario
+                    == DeterministicAdherenceScenario.BELOW_RANGE_EASY
+                    and deterministic_triggered
+                ):
+                    miles = max(
+                        0.5,
+                        item.distance_range_miles[0]
+                        * max(
+                            0.0,
+                            min(1.0, deterministic_profile.below_range_fraction),
+                        ),
+                    )
+                    deterministic_trigger_complete = True
+                    notes.append("below prescribed range")
+                elif (
+                    deterministic_profile.scenario
+                    == DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER
+                    and deterministic_triggered
+                ):
+                    ordinary_miles = daily_states[0].typical_easy_run_miles
+                    miles = item.distance_range_miles[1] + max(
+                        0.1,
+                        ordinary_miles
+                        * deterministic_profile.above_range_easy_fraction,
+                    )
+                    deterministic_trigger_complete = True
+                    notes.append("above prescribed range")
             if (
                 behavior_rng is not None
                 and behavior_rng.random()
@@ -1213,6 +2052,13 @@ def simulate_adherence(
                 and behavior_rng.random()
                 < human_profile.intensity_drift_probability
             )
+            if (
+                deterministic_profile is not None
+                and deterministic_profile.scenario
+                == DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER
+                and deterministic_triggered
+            ):
+                too_intense = True
             if too_intense:
                 notes.append("more intense than prescribed")
             if overload_profile is not None:
@@ -1251,6 +2097,18 @@ def simulate_adherence(
                         too_intense = True
                         notes.append("overload: extra intensity")
             adherence_note = "; ".join(notes) or "within prescribed margin"
+            observed_deviation = bool(
+                human_profile
+                or overload_profile
+                or (
+                    deterministic_profile is not None
+                    and deterministic_profile.scenario
+                    in {
+                        DeterministicAdherenceScenario.BELOW_RANGE_EASY,
+                        DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
+                    }
+                )
+            )
             if notes:
                 adherence_events.append(
                     (
@@ -1267,8 +2125,8 @@ def simulate_adherence(
                         adherence_note,
                     )
                 )
-            history.append(
-                ProjectionRun(
+            history_before_run = list(history)
+            completed_run = ProjectionRun(
                     start_time=item.planned_for,
                     distance_miles=miles,
                     moving_minutes=miles * pace,
@@ -1281,7 +2139,7 @@ def simulate_adherence(
                             actual_type,
                             too_intense=too_intense,
                         )
-                        if human_profile or overload_profile
+                        if observed_deviation
                         else _projected_difficulty(item, miles, pace)
                     ),
                     projected=True,
@@ -1304,11 +2162,104 @@ def simulate_adherence(
                     ),
                     adherence_note=(
                         adherence_note
-                        if human_profile or overload_profile
+                        if observed_deviation
                         else None
                     ),
                 )
+            history.append(completed_run)
+            history.sort(key=lambda run: run.start_time)
+
+            upload_at = item.planned_for + timedelta(
+                minutes=max(1.0, completed_run.moving_minutes)
             )
+            if emit_post_upload_replans and upload_at < simulation_end_at:
+                expected_miles = sum(item.distance_range_miles) / 2.0
+                expected_run = ProjectionRun(
+                    start_time=item.planned_for,
+                    distance_miles=expected_miles,
+                    moving_minutes=expected_miles * pace,
+                    workout_type=item.workout_type,
+                    difficulty=_projected_difficulty(
+                        item,
+                        expected_miles,
+                        pace,
+                    ),
+                    projected=True,
+                    planning_role=_completed_planning_role(
+                        item,
+                        item.workout_type,
+                    ),
+                    prescribed_workout_type=item.workout_type,
+                    completed_prescribed_workout=True,
+                    prescribed_low_miles=item.distance_range_miles[0],
+                    prescribed_high_miles=item.distance_range_miles[1],
+                    prescription_title=item.title,
+                    quality_session_type=(
+                        item.quality_session_type
+                        if item.workout_type in QUALITY_TYPES
+                        else None
+                    ),
+                )
+                expected_history = sorted(
+                    [*history_before_run, expected_run],
+                    key=lambda run: run.start_time,
+                )
+                expected_completed_today = (
+                    _completed_activities_on_plan_date(
+                        expected_history,
+                        upload_at,
+                    )
+                )
+                expected_decision_date = upload_at.date() + timedelta(
+                    days=1 if expected_completed_today else 0
+                )
+                expected_state_at = datetime.combine(
+                    expected_decision_date,
+                    time.min,
+                    tzinfo=start_at.tzinfo,
+                )
+                _, _, expected_evidence = derive_weekly_target(
+                    planning_activities_for(expected_history),
+                    expected_state_at,
+                    config,
+                )
+                expected_state = _state_at(
+                    template,
+                    expected_history,
+                    expected_state_at,
+                    expected_evidence.capacity_reference_miles,
+                    easy_baseline_half_life_days=float(
+                        config.get("coaching", {}).get(
+                            "capacity_retention_half_life_days",
+                            84,
+                        )
+                    ),
+                    fatigue_half_life_days=float(
+                        config.get("coaching", {}).get(
+                            "continuous_fatigue_half_life_days",
+                            7,
+                        )
+                    ),
+                )
+                previous_schedule, post_upload_snapshot = (
+                    build_post_upload_replan(
+                        upload_at=upload_at,
+                        source_activity_at=item.planned_for,
+                        prior_schedule=previous_schedule,
+                        expected_opening=(
+                            expected_state.as_of,
+                            expected_state.recovery_residual_load,
+                        ),
+                    )
+                )
+                summary["snapshots"].append(post_upload_snapshot)
+                summary["replans"].append(
+                    f"{upload_at.strftime('%a %b %-d %H:%M')}: "
+                    "post-upload replan"
+                )
+                if replan_observer is not None:
+                    replan_observer(post_upload_snapshot)
+                last_replan_at = post_upload_snapshot.generated_at
         deterministic_unscheduled = False
         if (
             overload_profile is not None
@@ -1457,6 +2408,27 @@ def simulate_adherence(
                         + (" with intensity drift" if too_intense else ""),
                     )
                 )
+                upload_at = unscheduled_at + timedelta(
+                    minutes=max(1.0, miles * pace)
+                )
+                if emit_post_upload_replans and upload_at < simulation_end_at:
+                    history.sort(key=lambda run: run.start_time)
+                    previous_schedule, post_upload_snapshot = (
+                        build_post_upload_replan(
+                            upload_at=upload_at,
+                            source_activity_at=unscheduled_at,
+                            prior_schedule=previous_schedule,
+                            expected_opening=None,
+                        )
+                    )
+                    summary["snapshots"].append(post_upload_snapshot)
+                    summary["replans"].append(
+                        f"{upload_at.strftime('%a %b %-d %H:%M')}: "
+                        "post-upload replan (unscheduled run)"
+                    )
+                    if replan_observer is not None:
+                        replan_observer(post_upload_snapshot)
+                    last_replan_at = post_upload_snapshot.generated_at
         history.sort(key=lambda item: item.start_time)
 
     # Include recorded history when measuring streaks so a run on projection
@@ -1493,7 +2465,22 @@ def simulate_adherence(
         history_at_open = [run for run in history if run.start_time <= week_start]
         _, target_range, evidence = derive_weekly_target(
             [
-                PlanningActivity(run.start_time, run.distance_miles)
+                PlanningActivity(
+                    run.start_time,
+                    run.distance_miles,
+                    target_distance_miles=adherence_normalized_distance(
+                        run.distance_miles,
+                        (
+                            (
+                                run.prescribed_low_miles,
+                                run.prescribed_high_miles,
+                            )
+                            if run.prescribed_low_miles is not None
+                            and run.prescribed_high_miles is not None
+                            else None
+                        ),
+                    ),
+                )
                 for run in history_at_open
             ],
             week_start,
@@ -1624,6 +2611,15 @@ def simulate_adherence(
                 )
                 for at, kind, message in week_events
             ),
+            actual_sessions=tuple(
+                ProjectionActualSession(
+                    occurred_at=run.start_time,
+                    workout_type=run.workout_type,
+                    distance_miles=run.distance_miles,
+                    was_prescribed=run.prescribed_workout_type is not None,
+                )
+                for run in projected_runs
+            ),
         )
         )
     return results
@@ -1658,11 +2654,13 @@ def simulate_expected_policy_rollout(
         replan_interval_days=1,
         initial_schedule=initial_schedule,
         simulation_days=horizon_days,
+        emit_post_upload_replans=False,
     )
     replans = tuple(
         snapshot
         for week in projection
         for snapshot in week.replan_snapshots
+        if snapshot.trigger == "scheduled_refresh"
     )
     if len(replans) != horizon_days:
         raise RuntimeError(

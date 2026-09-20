@@ -1,0 +1,55 @@
+{
+  "baseline": "v104 plus eligible-history baseline, Phase 2 evidence semantics, and bounded far-edge incumbent admission",
+  "status": "diagnostic_only",
+  "known_hypotheses": [
+    "candidate-dependent target projection",
+    "hard-horizon boundary phase",
+    "short load-path pull-forward"
+  ],
+  "candidate_independent_target_ablation": {
+    "method": "Give every candidate the opening target range instead of allowing its own recommendations to change its target.",
+    "result": "The September 20 long-run date move disappears, but churn remains at the September 21 completion boundary.",
+    "first_remaining_failure": {
+      "before": {
+        "2026-09-23": "easy"
+      },
+      "after": {
+        "2026-09-23": "easy",
+        "2026-09-24": "easy"
+      }
+    },
+    "interpretation": "The already-identified self-referential target is causal for the earlier date move, but is not the complete churn mechanism."
+  },
+  "boundary_normalization_ablation": {
+    "method": "Use a phase-normalized recurring rate, retain a one-ordinary-session hard-horizon allowance, and limit the continuous transition path to seven days.",
+    "stable_nine_run_continuation": {
+      "offsets": [1, 4, 7, 9, 12, 15, 17, 19, 20],
+      "total_cost": 59.352611649554454,
+      "target_violation": 2.5072986808828137,
+      "shape_violation": 1.5999999999999999,
+      "finalized_recovery_cost": 11.792054280859759,
+      "coaching_cost": 3.6570370370370426,
+      "projected_recurring_miles_per_week": 15.790697674418604,
+      "target_miles_per_week": [16.9, 17.9]
+    },
+    "selected_ten_run_calendar": {
+      "offsets": [1, 2, 4, 7, 9, 12, 13, 15, 17, 19],
+      "total_cost": 54.445656161210344,
+      "target_violation": 0.28010505926184237,
+      "shape_violation": 0.3433333333333333,
+      "finalized_recovery_cost": 43.120864398897474,
+      "coaching_cost": 4.309563970488179,
+      "projected_recurring_miles_per_week": 17.115
+    },
+    "forced_stable_later_addition": {
+      "offsets": [1, 4, 7, 9, 12, 13, 15, 17, 19, 20],
+      "total_cost": 71.1173692805126,
+      "target_violation": 1.5631282011700272,
+      "shape_violation": 0.9433333333333334,
+      "finalized_recovery_cost": 43.627797859687085,
+      "coaching_cost": 3.996405775142435
+    },
+    "interpretation": "The beam did not miss a lower-cost stable calendar. The visible-horizon rate detects missing recurring volume, while the short transition-path term rewards adding it immediately. A neutral expected-compliance projection must price continuation beyond day 21 so boundary phase does not become near-term debt."
+  },
+  "decision": "Do not promote the diagnostic Phase 6 prototype. Implement Phase 5's immutable neutral reference stream first, including a soft continuation tail, then reevaluate Phase 6 funding against the daily churn gate."
+}

@@ -44,6 +44,41 @@ def test_settings_are_saved_to_overlay_without_rewriting_documented_base(tmp_pat
     assert settings_response(config).historical_weather_enabled is True
 
 
+def test_settings_endpoint_accepts_strength_training_configuration(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    (tmp_path / "config.local.yaml").write_text(
+        """
+coaching:
+  strength_training:
+    enabled: true
+    leg_frequency_days: 8
+    push_pull_frequency_days: 8
+    muscle_groups:
+      full_upper: [upper pecs, lower pecs]
+      push: [upper pecs, triceps]
+      pull: [lats, biceps]
+      legs: [quads, hamstrings, glutes, calves]
+""",
+        encoding="utf-8",
+    )
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+
+    response = TestClient(create_app(tmp_path)).get("/api/settings")
+
+    assert response.status_code == 200
+    strength = response.json()["coaching"]["strength_training"]
+    assert strength["enabled"] is True
+    assert strength["leg_frequency_days"] == 8
+    assert strength["muscle_groups"]["legs"] == [
+        "quads",
+        "hamstrings",
+        "glutes",
+        "calves",
+    ]
+
+
 def test_invalid_physiology_or_overlapping_zones_are_rejected(tmp_path: Path) -> None:
     _write_config(tmp_path)
     with pytest.raises(ValueError, match="resting HR < target HR < max HR"):
@@ -61,6 +96,9 @@ def test_invalid_physiology_or_overlapping_zones_are_rejected(tmp_path: Path) ->
 
 def test_planner_setting_change_invalidates_saved_schedule(tmp_path: Path) -> None:
     _write_config(tmp_path)
+    previous = load_config(tmp_path / "config.yaml")
+    patch = SettingsPatch(forecast_weather_enabled=True)
+    updated = save_settings_overlay(tmp_path / "config.yaml", patch)
     with connect(tmp_path / "schedule-settings.sqlite") as connection:
         initialize(connection)
         connection.execute(
@@ -73,9 +111,10 @@ def test_planner_setting_change_invalidates_saved_schedule(tmp_path: Path) -> No
 
         stages = recalculate_for_settings(
             connection,
-            load_config(tmp_path / "config.yaml"),
+            updated,
             tmp_path,
-            SettingsPatch(forecast_weather_enabled=True),
+            patch,
+            previous_config=previous,
         )
         saved = connection.execute(
             "SELECT 1 FROM app_state WHERE key='weekly_schedule'"
@@ -83,6 +122,52 @@ def test_planner_setting_change_invalidates_saved_schedule(tmp_path: Path) -> No
 
     assert saved is None
     assert any(stage.name == "schedule" for stage in stages)
+
+
+def test_setup_resubmission_of_unchanged_inputs_preserves_schedule(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    database = tmp_path / "data" / "test.sqlite"
+    with connect(database) as connection:
+        initialize(connection)
+        connection.execute(
+            """
+            INSERT INTO app_state(key,value_json,updated_at_utc)
+            VALUES ('weekly_schedule','{}','now')
+            """
+        )
+        connection.commit()
+
+    client = TestClient(create_app(tmp_path))
+    settings = client.get("/api/settings").json()
+    response = client.patch(
+        "/api/settings",
+        json={
+            "max_hr": settings["max_hr"],
+            "resting_hr": settings["resting_hr"],
+            "target_hr": settings["target_hr"],
+            "zones": settings["zones"],
+            "coaching": settings["coaching"],
+            "historical_weather_enabled": settings[
+                "historical_weather_enabled"
+            ],
+            "forecast_weather_enabled": settings["forecast_weather_enabled"],
+            "weather_privacy_radius_km": settings[
+                "weather_privacy_radius_km"
+            ],
+            "setup": {
+                "confirmed_steps": ["heart_rate"],
+                "zone_method": "device",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["recalculation"] == []
+    with connect(database) as connection:
+        saved = connection.execute(
+            "SELECT 1 FROM app_state WHERE key='weekly_schedule'"
+        ).fetchone()
+    assert saved is not None
 
 
 def test_metadata_round_trips_through_database_and_override_csv(tmp_path: Path) -> None:

@@ -173,6 +173,25 @@ def test_initialize_refuses_a_database_migrated_by_a_newer_build(tmp_path) -> No
         ) == SCHEMA_VERSION + 1
 
 
+def test_current_schema_initialization_stays_read_only_during_an_upload_lock(
+    tmp_path,
+) -> None:
+    """Read endpoints must not compete with an upload for a write lock."""
+
+    path = tmp_path / "concurrent.sqlite"
+    with connect(path) as setup:
+        initialize(setup)
+
+    with connect(path) as writer, connect(path) as reader:
+        writer.execute("BEGIN IMMEDIATE")
+        reader.execute("PRAGMA busy_timeout = 1")
+
+        initialize(reader)
+
+        assert reader.execute("SELECT 1").fetchone()[0] == 1
+        writer.rollback()
+
+
 def test_failed_migration_does_not_advance_version_or_commit_schema(
     tmp_path, monkeypatch
 ) -> None:

@@ -74,7 +74,7 @@ export async function renderSettings() {
         <div class="settings-grid">
           <fieldset><legend>Comparison conditions</legend><label>Temperature (°F)<input type="number" step="0.1" name="reference_temperature_f" value="${settings.reference_temperature_f}"></label><label>Dew point (°F)<input type="number" step="0.1" name="reference_dewpoint_f" value="${settings.reference_dewpoint_f}"></label><label>Wind (mph)<input type="number" step="0.1" name="reference_wind_mph" value="${settings.reference_wind_mph}"></label><label>Grade (%)<input type="number" step="0.1" name="reference_grade_percent" value="${settings.reference_grade_percent}"></label><label>Point in each run (minute)<input type="number" step="0.5" name="reference_within_run_minutes" value="${settings.reference_within_run_minutes}"></label><p>Every run is adjusted to these conditions so runs on different days can be compared.</p></fieldset>
           <fieldset><legend>Movement detection</legend>${Object.entries(settings.moving_time).map(([name, value]) => `<label>${movingLabels[name] ?? titleCase(name)}<input type="number" step="0.01" name="moving_${name}" value="${value}"></label>`).join("")}<p>Decides what counts as stopped. Changing these re-derives every run.</p></fieldset>
-          <fieldset><legend>Planning rules</legend>${Object.entries(settings.coaching).filter(([name]) => !["training_goal", "goal_date", "goal_pace_min_mile", "quality_sessions"].includes(name)).map(([name, value]) => `<label>${coachingLabels[name] ?? titleCase(name)}<input type="number" step="0.01" name="coaching_${name}" value="${value}"></label>`).join("")}<p>Thresholds the weekly plan is built from.</p></fieldset>
+          <fieldset><legend>Planning rules</legend>${Object.entries(settings.coaching).filter(([, value]) => typeof value === "number").map(([name, value]) => `<label>${coachingLabels[name] ?? titleCase(name)}<input type="number" step="0.01" name="coaching_${name}" value="${value}"></label>`).join("")}<p>Thresholds the weekly plan is built from.</p></fieldset>
         </div>
         <div class="settings-actions reset-row">
           <button type="button" id="reset-advanced">Reset to recommended defaults</button>
@@ -113,7 +113,7 @@ export async function renderSettings() {
       reference_temperature_f: numeric("reference_temperature_f"), reference_dewpoint_f: numeric("reference_dewpoint_f"), reference_wind_mph: numeric("reference_wind_mph"), reference_grade_percent: numeric("reference_grade_percent"), reference_within_run_minutes: numeric("reference_within_run_minutes"), weather_privacy_radius_km: numeric("weather_privacy_radius_km"), historical_weather_enabled: data.get("historical_weather_enabled") === "on", forecast_weather_enabled: data.get("forecast_weather_enabled") === "on", default_fitness_window: numeric("default_fitness_window"),
       moving_time: Object.fromEntries(Object.keys(settings.moving_time).map((name) => [name, numeric(`moving_${name}`)])),
       coaching: {
-        ...Object.fromEntries(Object.keys(settings.coaching).filter((name) => !["training_goal", "goal_date", "goal_pace_min_mile", "quality_sessions"].includes(name)).map((name) => [name, numeric(`coaching_${name}`)])),
+        ...Object.fromEntries(Object.entries(settings.coaching).filter(([, value]) => typeof value === "number").map(([name]) => [name, numeric(`coaching_${name}`)])),
         training_goal: data.get("training_goal"),
         // A race date and pace only mean something for a race. Keeping them
         // when the goal is general fitness leaves a goal the app half-believes.
@@ -123,6 +123,7 @@ export async function renderSettings() {
             ? null
             : durationSeconds(data.get("goal_pace")) / 60,
         quality_sessions: Object.fromEntries(Object.keys(settings.coaching.quality_sessions).map((name) => [name, data.get(`quality_${name}`) === "on"])),
+        strength_training: settings.coaching.strength_training,
       },
     };
     const statusNodes = [...form.querySelectorAll("#settings-status, #settings-status-top")];

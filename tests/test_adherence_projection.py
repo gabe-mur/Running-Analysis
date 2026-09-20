@@ -6,9 +6,13 @@ from statistics import median_high
 import pytest
 
 from run_analysis.adherence_projection import (
+    DeterministicAdherenceProfile,
+    DeterministicAdherenceScenario,
     HumanAdherenceProfile,
     OverloadAdherenceProfile,
     OverloadScenario,
+    ProjectionPlanSession,
+    ProjectionReplan,
     ProjectionRun,
     _completed_activities_on_plan_date,
     _completed_planning_role,
@@ -19,8 +23,9 @@ from run_analysis.adherence_projection import (
     _state_at,
     simulate_adherence,
     simulate_expected_policy_rollout,
+    summarize_replan_churn,
 )
-from run_analysis.weekly_schedule import derive_weekly_target
+from run_analysis.weekly_schedule import _project_state, derive_weekly_target
 from run_analysis.web.schemas import (
     ConfidenceLevel,
     QualitySessionType,
@@ -30,8 +35,68 @@ from run_analysis.web.schemas import (
     WorkoutType,
     WeeklyScheduleDay,
     WeeklyScheduleResponse,
+    ZoneBreakdown,
 )
 from test_recommendation import CONFIG, _difficulty, _state
+
+
+def test_replan_churn_separates_date_moves_from_distance_edits() -> None:
+    opening = datetime(2026, 9, 1, 18, tzinfo=timezone.utc)
+
+    def session(day: int, workout_type: WorkoutType, miles: float):
+        return ProjectionPlanSession(
+            planned_for=opening + timedelta(days=day),
+            workout_type=workout_type,
+            midpoint_miles=miles,
+        )
+
+    replans = (
+        ProjectionReplan(
+            generated_at=opening,
+            opening_load_ratio=1.0,
+            target_low_miles=17.0,
+            target_high_miles=18.0,
+            planned_sessions=(
+                session(1, WorkoutType.EASY, 4.0),
+                session(3, WorkoutType.EASY, 4.0),
+                session(5, WorkoutType.LONG, 7.0),
+            ),
+            committed_sessions=(),
+        ),
+        ProjectionReplan(
+            generated_at=opening + timedelta(days=1),
+            opening_load_ratio=1.0,
+            target_low_miles=17.0,
+            target_high_miles=18.0,
+            planned_sessions=(
+                session(3, WorkoutType.EASY, 4.5),
+                session(6, WorkoutType.LONG, 7.0),
+            ),
+            committed_sessions=(),
+        ),
+        ProjectionReplan(
+            generated_at=opening + timedelta(days=2),
+            opening_load_ratio=1.0,
+            target_low_miles=17.0,
+            target_high_miles=18.0,
+            planned_sessions=(
+                session(3, WorkoutType.EASY, 5.0),
+                session(6, WorkoutType.LONG, 7.0),
+            ),
+            committed_sessions=(),
+        ),
+    )
+
+    churn = summarize_replan_churn(replans, horizon_days=7)
+
+    assert churn.comparison_count == 2
+    assert churn.schedule_changed_comparisons == 1
+    assert churn.distance_only_changed_comparisons == 1
+    assert churn.date_slot_changes == 2
+    assert churn.workout_type_changes == 0
+    assert churn.distance_changes == 2
+    # The day-one session disappeared because it was consumed before the
+    # second refresh; it is deliberately absent from date-slot churn.
 
 
 def test_human_break_calendar_has_bounded_trips_and_at_most_one_vacation() -> None:
@@ -72,6 +137,163 @@ def test_human_intensity_drift_becomes_observed_load_evidence() -> None:
     assert normal.zone_load is not None
     assert drifted.zone_load > normal.zone_load
     assert drifted.zone_breakdown.hard_minutes > 0
+
+
+def test_simulated_in_range_edges_have_materially_same_recovery_residual() -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    recommendation = RecommendationResponse(
+        generated_at=template.as_of,
+        fitness_state_as_of=template.as_of,
+        planned_for=template.as_of,
+        workout_type=WorkoutType.EASY,
+        title="Range-equivalence fixture",
+        distance_range_miles=(3.0, 4.0),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+
+    def projected_run(miles: float) -> ProjectionRun:
+        return ProjectionRun(
+            start_time=template.as_of,
+            distance_miles=miles,
+            moving_minutes=miles * 10.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_projected_difficulty(
+                recommendation,
+                miles,
+                10.0,
+            ),
+            projected=True,
+            planning_role="ordinary_easy",
+            prescribed_workout_type=WorkoutType.EASY,
+            completed_prescribed_workout=True,
+            prescribed_low_miles=3.0,
+            prescribed_high_miles=4.0,
+        )
+
+    prior_runs = [
+        ProjectionRun(
+            start_time=template.as_of - timedelta(days=day),
+            distance_miles=4.0,
+            moving_minutes=40.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_difficulty(miles=4.0),
+            planning_role="ordinary_easy",
+        )
+        for day in (8, 6, 4, 2)
+    ]
+    observed_at = template.as_of + timedelta(hours=12)
+    low_state = _state_at(
+        template,
+        [*prior_runs, projected_run(3.0)],
+        observed_at,
+        16.0,
+    )
+    high_state = _state_at(
+        template,
+        [*prior_runs, projected_run(4.0)],
+        observed_at,
+        16.0,
+    )
+
+    assert low_state.recovery_residual_load == pytest.approx(
+        high_state.recovery_residual_load,
+        abs=0.001,
+    )
+
+
+def test_midpoint_compliance_matches_the_planners_projected_future_state() -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 19, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+        running_days_28d=12,
+    )
+    history = [
+        ProjectionRun(
+            start_time=template.as_of - timedelta(days=day),
+            distance_miles=4.0,
+            moving_minutes=44.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_difficulty(miles=4.0).model_copy(
+                update={
+                    "zone_breakdown": ZoneBreakdown(
+                        easy_minutes=44.0,
+                        moderate_minutes=0.0,
+                        hard_minutes=0.0,
+                    )
+                }
+            ),
+            planning_role="ordinary_easy",
+        )
+        for day in range(2, 30, 2)
+    ]
+    planned_at = template.as_of + timedelta(days=2)
+    future_at = planned_at + timedelta(days=1)
+    recommendation = RecommendationResponse(
+        generated_at=template.as_of,
+        fitness_state_as_of=template.as_of,
+        planned_for=planned_at,
+        workout_type=WorkoutType.LONG,
+        title="Projected long run",
+        distance_range_miles=(7.5, 8.5),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+        planning_role="long",
+    )
+    capacity = 16.0
+    raw_future = _state_at(template, history, future_at, capacity)
+    projected = _project_state(raw_future, [recommendation], CONFIG)
+    midpoint = 8.0
+    completed = ProjectionRun(
+        start_time=planned_at,
+        distance_miles=midpoint,
+        moving_minutes=midpoint * 11.0,
+        workout_type=WorkoutType.LONG,
+        difficulty=_projected_difficulty(
+            recommendation,
+            midpoint,
+            11.0,
+        ),
+        projected=True,
+        planning_role="long",
+        prescribed_workout_type=WorkoutType.LONG,
+        completed_prescribed_workout=True,
+        prescribed_low_miles=7.5,
+        prescribed_high_miles=8.5,
+    )
+    observed = _state_at(
+        template,
+        [*history, completed],
+        future_at,
+        capacity,
+    )
+
+    assert projected.recovery_residual_load == pytest.approx(
+        observed.recovery_residual_load,
+        abs=0.001,
+    )
+    assert projected.recent_load.continuous_distance_miles == pytest.approx(
+        observed.recent_load.continuous_distance_miles
+    )
+    assert (
+        projected.recent_load.continuous_short_term_distance_miles
+        == pytest.approx(
+            observed.recent_load.continuous_short_term_distance_miles
+        )
+    )
+    assert projected.recent_load.continuous_fatigue_miles == pytest.approx(
+        observed.recent_load.continuous_fatigue_miles,
+        abs=0.2,
+    )
+    assert projected.days_since_long_run == pytest.approx(
+        observed.days_since_long_run
+    )
+    assert projected.recent_load.trailing_28d.distance_miles == pytest.approx(
+        observed.recent_load.trailing_28d.distance_miles
+    )
 
 
 @pytest.mark.parametrize(
@@ -168,12 +390,17 @@ def test_expected_policy_rollout_stitches_successive_daily_decisions(
     def changing_schedule(daily_states, *args, **kwargs):
         nonlocal calls
         generated_at = daily_states[0].as_of
+        first_schedulable_at = kwargs["daily_state_options"][0][0].as_of
         current_type = WorkoutType.EASY if calls == 0 else WorkoutType.LONG
         current_miles = 4.0 if calls == 0 else 6.0
-        prescriptions = [(generated_at, current_type, current_miles)]
+        prescriptions = [(first_schedulable_at, current_type, current_miles)]
         if calls == 0:
             prescriptions.append(
-                (generated_at + timedelta(days=1), WorkoutType.INTERVALS, 3.0)
+                (
+                    first_schedulable_at + timedelta(days=1),
+                    WorkoutType.INTERVALS,
+                    3.0,
+                )
             )
         calls += 1
         days = []
@@ -322,7 +549,7 @@ def test_projection_advances_boundary_after_a_same_day_completion(
     )
 
     assert captured == [
-        (template.as_of.replace(day=3, hour=7), {})
+        (template.as_of.replace(day=3, hour=0), {})
     ]
 
 
@@ -392,7 +619,7 @@ def test_projection_groups_runs_by_workout_date_and_excludes_end_boundary(
 
     def one_run_per_boundary_schedule(daily_states, *args, **kwargs):
         generated_at = daily_states[0].as_of
-        planned_for = generated_at
+        planned_for = kwargs["daily_state_options"][0][0].as_of
         recommendation = RecommendationResponse(
             generated_at=generated_at,
             fitness_state_as_of=generated_at,
@@ -526,6 +753,90 @@ def test_human_projection_feeds_skipped_commitments_back_into_replans(
     assert projection[0].prescribed_low_miles > 0
 
 
+def test_hidden_vacation_attempts_are_not_aggregated_into_one_live_plan(
+    monkeypatch,
+) -> None:
+    template = _state(as_of=_state().as_of.replace(hour=12))
+
+    def next_morning_schedule(daily_states, *args, **kwargs):
+        generated_at = daily_states[0].as_of
+        planned_for = (generated_at + timedelta(days=1)).replace(
+            hour=7,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        recommendation = RecommendationResponse(
+            generated_at=generated_at,
+            fitness_state_as_of=generated_at,
+            planned_for=planned_for,
+            workout_type=WorkoutType.EASY,
+            title="Vacation attempt fixture",
+            distance_range_miles=(4.0, 4.0),
+            confidence=ConfidenceLevel.MODERATE,
+            readiness=ReadinessFlag.READY,
+        )
+        day = WeeklyScheduleDay(
+            date=planned_for.date(),
+            planned_at=planned_for,
+            recommendation=recommendation,
+            day_role="easy_run",
+            rationale="Vacation attempt fixture.",
+        )
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=1,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=1,
+            projected_distance_range_miles=(4.0, 4.0),
+            summary="Vacation attempt fixture.",
+            days=[day],
+            planning_days=[day],
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        next_morning_schedule,
+    )
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=2,
+        human_profile=HumanAdherenceProfile(
+            seed=17,
+            skip_probability=0.0,
+            distance_variation_probability=0.0,
+            intensity_drift_probability=0.0,
+            substitution_probability=0.0,
+            unscheduled_easy_probability_per_day=0.0,
+            short_break_count_min=0,
+            short_break_count_max=0,
+            vacation_probability=1.0,
+            vacation_days=7,
+        ),
+    )
+
+    snapshots = [
+        snapshot
+        for week in projection
+        for snapshot in week.replan_snapshots
+    ]
+    attempted_dates = {
+        session.planned_for.date()
+        for snapshot in snapshots
+        for session in snapshot.planned_sessions
+    }
+
+    assert len(attempted_dates) > 1
+    assert max(len(snapshot.planned_sessions) for snapshot in snapshots) == 1
+    assert sum(week.skipped_run_count for week in projection) == 7
+
+
 def test_human_projection_can_add_an_unscheduled_rest_day_run(monkeypatch) -> None:
     template = _state(as_of=_state().as_of.replace(hour=12))
 
@@ -571,6 +882,16 @@ def test_human_projection_can_add_an_unscheduled_rest_day_run(monkeypatch) -> No
     assert projection[0].planned_run_count == 0
     assert projection[0].unscheduled_run_count == 7
     assert projection[0].run_count == 7
+    uploads = [
+        snapshot
+        for snapshot in projection[0].replan_snapshots
+        if snapshot.trigger == "post_upload"
+    ]
+    assert len(uploads) == 7
+    assert all(
+        any(reason.startswith("unscheduled:") for reason in snapshot.material_evidence_reasons)
+        for snapshot in uploads
+    )
 
 
 def test_human_unscheduled_run_does_not_duplicate_morning_completion(
@@ -665,6 +986,276 @@ def _single_then_empty_schedule():
     return schedule
 
 
+def _repeating_range_schedule(
+    distance_range: tuple[float, float] = (3.0, 4.0),
+):
+    def schedule(daily_states, *args, **kwargs):
+        generated_at = daily_states[0].as_of
+        planned_for = (generated_at + timedelta(days=1)).replace(
+            hour=7,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        recommendation = RecommendationResponse(
+            generated_at=generated_at,
+            fitness_state_as_of=generated_at,
+            planned_for=planned_for,
+            workout_type=WorkoutType.EASY,
+            title="Deterministic scenario fixture",
+            distance_range_miles=distance_range,
+            confidence=ConfidenceLevel.MODERATE,
+            readiness=ReadinessFlag.READY,
+        )
+        day = WeeklyScheduleDay(
+            date=planned_for.date(),
+            planned_at=planned_for,
+            recommendation=recommendation,
+            day_role="easy_run",
+            rationale="Deterministic scenario fixture.",
+        )
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=1,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=1,
+            projected_distance_range_miles=distance_range,
+            summary="Deterministic scenario fixture.",
+            days=[day],
+            planning_days=[day],
+        )
+
+    return schedule
+
+
+def test_projection_replans_immediately_after_upload_before_daily_refresh(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _single_then_empty_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=2,
+    )
+
+    snapshots = projection[0].replan_snapshots
+    assert [snapshot.trigger for snapshot in snapshots] == [
+        "scheduled_refresh",
+        "post_upload",
+        "scheduled_refresh",
+    ]
+    upload = snapshots[1]
+    assert upload.source_activity_at is not None
+    assert upload.generated_at > upload.source_activity_at
+    assert upload.generated_at < snapshots[2].generated_at
+    assert upload.decision_start_date == (
+        upload.source_activity_at.date() + timedelta(days=1)
+    )
+    assert not upload.material_evidence_reasons
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_miles"),
+    [
+        (DeterministicAdherenceScenario.IN_RANGE_LOW, 3.0),
+        (DeterministicAdherenceScenario.IN_RANGE_HIGH, 4.0),
+    ],
+)
+def test_in_range_edge_scenarios_execute_exact_prescription_edges(
+    monkeypatch,
+    scenario: DeterministicAdherenceScenario,
+    expected_miles: float,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _repeating_range_schedule(),
+    )
+    seed = [
+        ProjectionRun(
+            start_time=template.as_of - timedelta(days=day),
+            distance_miles=4.0,
+            moving_minutes=40.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_difficulty(miles=4.0),
+            planning_role="ordinary_easy",
+        )
+        for day in (8, 6, 4, 2)
+    ]
+
+    projection = simulate_adherence(
+        template,
+        seed,
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=2,
+        deterministic_profile=DeterministicAdherenceProfile(
+            scenario=scenario
+        ),
+    )
+
+    assert projection[0].assumed_completed_miles == expected_miles
+    assert not projection[0].adherence_event_records
+    comparison = next(
+        snapshot
+        for snapshot in projection[0].replan_snapshots
+        if snapshot.trigger == "post_upload"
+    )
+    assert comparison.expected_opening_recovery_residual_load is not None
+    assert abs(comparison.recovery_surprise_units or 0.0) <= 0.01
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_fragment"),
+    [
+        (
+            DeterministicAdherenceScenario.BELOW_RANGE_EASY,
+            "below prescribed range",
+        ),
+        (
+            DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
+            "above prescribed range; more intense than prescribed",
+        ),
+    ],
+)
+def test_out_of_range_scenarios_emit_material_evidence(
+    monkeypatch,
+    scenario: DeterministicAdherenceScenario,
+    expected_fragment: str,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _repeating_range_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=2,
+        deterministic_profile=DeterministicAdherenceProfile(
+            scenario=scenario
+        ),
+    )
+
+    events = projection[0].adherence_event_records
+    assert len(events) == 1
+    assert events[0].kind == "deviation"
+    assert events[0].detail == expected_fragment
+    post_upload = next(
+        snapshot
+        for snapshot in projection[0].replan_snapshots
+        if snapshot.trigger == "post_upload"
+    )
+    assert post_upload.material_evidence_reasons == (
+        f"deviation: {expected_fragment}",
+    )
+    following_refresh = [
+        snapshot
+        for snapshot in projection[0].replan_snapshots
+        if snapshot.trigger == "scheduled_refresh"
+    ][1]
+    assert not following_refresh.material_evidence_reasons
+
+
+def test_single_hidden_miss_skips_only_one_prescription(monkeypatch) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        _repeating_range_schedule(),
+    )
+
+    projection = simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=3,
+        deterministic_profile=DeterministicAdherenceProfile(
+            scenario=DeterministicAdherenceScenario.SINGLE_HIDDEN_MISS
+        ),
+    )
+
+    assert projection[0].skipped_run_count == 1
+    assert projection[0].planned_run_count == 2
+    assert projection[0].run_count == 1
+
+
+def test_known_forced_rest_scenario_supplies_absolute_block_to_planner(
+    monkeypatch,
+) -> None:
+    template = _state(
+        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        typical_easy_run_miles=4.0,
+    )
+    observed_offsets: list[set[int]] = []
+
+    def empty_schedule(daily_states, *args, **kwargs):
+        observed_offsets.append(set(kwargs["forced_rest_offsets"]))
+        generated_at = daily_states[0].as_of
+        return WeeklyScheduleResponse(
+            generated_at=generated_at,
+            start_date=generated_at.date(),
+            end_date=generated_at.date() + timedelta(days=6),
+            target_run_count=0,
+            target_distance_range_miles=kwargs["target_distance_range"],
+            target_evidence=kwargs["target_evidence"],
+            run_count=0,
+            projected_distance_range_miles=(0.0, 0.0),
+            summary="Known forced-rest fixture.",
+            days=[],
+            planning_days=[],
+        )
+
+    monkeypatch.setattr(
+        "run_analysis.adherence_projection.build_weekly_schedule",
+        empty_schedule,
+    )
+    simulate_adherence(
+        template,
+        [],
+        CONFIG,
+        template.as_of,
+        weeks=1,
+        simulation_days=1,
+        deterministic_profile=DeterministicAdherenceProfile(
+            scenario=DeterministicAdherenceScenario.KNOWN_FORCED_REST,
+            block_start_day=5,
+            block_days=3,
+        ),
+    )
+
+    assert observed_offsets == [{5, 6, 7}]
+
+
 def test_deterministic_distance_overload_is_observed_by_the_next_replan(
     monkeypatch,
 ) -> None:
@@ -704,8 +1295,19 @@ def test_deterministic_distance_overload_is_observed_by_the_next_replan(
     assert "2.0 extra miles" in events[0].detail
     assert projection[0].assumed_completed_miles == 6.0
     snapshots = projection[0].replan_snapshots
-    assert len(snapshots) == 7
-    assert snapshots[1].opening_load_ratio > snapshots[0].opening_load_ratio
+    scheduled = [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.trigger == "scheduled_refresh"
+    ]
+    post_upload = [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.trigger == "post_upload"
+    ]
+    assert len(scheduled) == 7
+    assert len(post_upload) == 1
+    assert post_upload[0].opening_load_ratio > scheduled[0].opening_load_ratio
 
 
 def test_dense_sequence_profile_injects_runs_only_after_daily_replans(
@@ -997,6 +1599,125 @@ def test_projection_uses_prescribed_quality_dose_not_a_fixed_fraction() -> None:
     assert difficulty.zone_breakdown.hard_minutes == 8
     assert difficulty.zone_breakdown.moderate_minutes == 0
     assert difficulty.zone_breakdown.easy_minutes == 42
+
+
+def test_planner_projected_state_matches_compliant_completed_state() -> None:
+    planned_at = datetime(2026, 9, 25, 7, tzinfo=timezone.utc)
+    as_of = planned_at + timedelta(days=1)
+    template = _state(
+        as_of=planned_at - timedelta(days=1),
+        typical_easy_run_miles=4.0,
+    )
+    history = [
+        ProjectionRun(
+            start_time=planned_at - timedelta(days=day),
+            distance_miles=4.0,
+            moving_minutes=44.0,
+            workout_type=WorkoutType.EASY,
+            difficulty=_difficulty(miles=4.0).model_copy(
+                update={
+                    "zone_breakdown": ZoneBreakdown(
+                        easy_minutes=44.0,
+                        moderate_minutes=0.0,
+                        hard_minutes=0.0,
+                    )
+                }
+            ),
+            planning_role="ordinary_easy",
+        )
+        for day in (9, 7, 4, 2)
+    ]
+    planned = RecommendationResponse(
+        generated_at=planned_at - timedelta(days=1),
+        fitness_state_as_of=planned_at - timedelta(days=1),
+        planned_for=planned_at,
+        workout_type=WorkoutType.INTERVALS,
+        quality_session_type=QualitySessionType.SHORT_INTERVALS,
+        title="Prescribed quality",
+        distance_range_miles=(4.25, 4.75),
+        structure=[
+            WorkoutStep(
+                instruction="8 x 1 minute",
+                phase="work",
+                repetitions=8,
+                work_duration_minutes=1,
+                recovery_duration_minutes=1.5,
+                target_zones=["Z4 effort"],
+            )
+        ],
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    raw_future = _state_at(
+        template,
+        history,
+        as_of,
+        capacity_reference=18.0,
+    )
+    projected = _project_state(raw_future, [planned], CONFIG)
+    completed = ProjectionRun(
+        start_time=planned_at,
+        distance_miles=4.5,
+        moving_minutes=49.5,
+        workout_type=WorkoutType.INTERVALS,
+        difficulty=_projected_difficulty(planned, 4.5, 11.0),
+        projected=True,
+        planning_role="quality",
+        prescribed_workout_type=WorkoutType.INTERVALS,
+        completed_prescribed_workout=True,
+        prescribed_low_miles=4.25,
+        prescribed_high_miles=4.75,
+        quality_session_type=QualitySessionType.SHORT_INTERVALS,
+    )
+    actual = _state_at(
+        template,
+        [*history, completed],
+        as_of,
+        capacity_reference=18.0,
+    )
+
+    # Planning prices the top of the adherence range, so recovery/fatigue may
+    # be slightly conservative. Distance-derived state and prescription
+    # identity must otherwise agree with an exact midpoint completion.
+    assert projected.recovery_residual_load >= actual.recovery_residual_load
+    assert projected.recent_load.continuous_distance_miles == pytest.approx(
+        actual.recent_load.continuous_distance_miles
+    )
+    assert (
+        projected.recent_load.continuous_short_term_distance_miles
+        == pytest.approx(
+            actual.recent_load.continuous_short_term_distance_miles
+        )
+    )
+    assert (
+        projected.recent_load.continuous_fatigue_miles
+        >= actual.recent_load.continuous_fatigue_miles
+    )
+    assert (
+        projected.recent_load.acute_to_prior_ratio
+        >= actual.recent_load.acute_to_prior_ratio
+    )
+    assert projected.last_run_distance_miles == actual.last_run_distance_miles
+    assert (
+        projected.last_run_prescribed_workout_type
+        == actual.last_run_prescribed_workout_type
+        == WorkoutType.INTERVALS
+    )
+    assert (
+        projected.last_run_prescribed_distance_range_miles
+        == actual.last_run_prescribed_distance_range_miles
+        == (4.25, 4.75)
+    )
+    assert projected.last_run_completed_prescribed_workout is True
+    assert projected.easy_fraction_14d == pytest.approx(
+        actual.easy_fraction_14d
+    )
+    assert projected.moderate_fraction_14d == pytest.approx(
+        actual.moderate_fraction_14d
+    )
+    assert projected.hard_fraction_14d == pytest.approx(
+        actual.hard_fraction_14d
+    )
 
 
 def test_adherence_maintains_then_builds_long_run_instead_of_decaying_it() -> None:

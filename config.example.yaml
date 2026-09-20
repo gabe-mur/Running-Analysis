@@ -139,6 +139,17 @@ coaching:
     threshold: true
     progression: true
     hill_repeats: true
+  # Strength suggestions are attached after the run plan is finalized, so
+  # enabling them cannot move a run or change its distance.
+  strength_training:
+    enabled: false
+    leg_frequency_days: 8
+    push_pull_frequency_days: 8
+    muscle_groups:
+      full_upper: [upper pecs, lower pecs, lats, upper back, side delts, rear delts, biceps, triceps, core/trunk]
+      push: [upper pecs, lower pecs, side delts, triceps, core/trunk]
+      pull: [lats, upper back, rear delts, biceps]
+      legs: [quads, hamstrings, glutes, calves]
 
 weather:
   # Opt in only after approving transmission of dates and privacy-jittered

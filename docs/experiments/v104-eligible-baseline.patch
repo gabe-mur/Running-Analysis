@@ -1,0 +1,63 @@
+diff --git a/src/run_analysis/weekly_schedule.py b/src/run_analysis/weekly_schedule.py
+--- a/src/run_analysis/weekly_schedule.py
++++ b/src/run_analysis/weekly_schedule.py
+@@ -940,11 +940,15 @@ def derive_weekly_target(
+         recent_baseline_activities = [
+             activity
+             for activity in sorted(
+-                activities,
++                (
++                    activity
++                    for activity in activities
++                    if activity.distance_miles > 0
++                    and activity.baseline_eligible
++                ),
+                 key=lambda item: item.start_time,
+                 reverse=True,
+             )[:4]
+-            if activity.distance_miles > 0 and activity.baseline_eligible
+         ]
+     recent_activity_distances = [
+         activity.distance_miles for activity in recent_baseline_activities
+diff --git a/tests/test_weekly_schedule.py b/tests/test_weekly_schedule.py
+--- a/tests/test_weekly_schedule.py
++++ b/tests/test_weekly_schedule.py
+@@ -1065,6 +1065,38 @@ def test_sparse_history_without_usable_easy_baseline_stays_baseline_required() -
+     assert evidence.baseline_session_miles is None
+ 
+ 
++def test_recent_ineligible_runs_do_not_hide_an_older_easy_baseline() -> None:
++    base = _state()
++    activities = [
++        PlanningActivity(
++            base.as_of - timedelta(days=day),
++            7.0,
++            baseline_eligible=False,
++        )
++        for day in range(1, 5)
++    ]
++    activities.append(
++        PlanningActivity(
++            base.as_of - timedelta(days=5),
++            3.5,
++            moving_minutes=38.5,
++            easy_minutes=38.5,
++            baseline_eligible=True,
++        )
++    )
++
++    runs, distance, evidence = derive_weekly_target(
++        activities,
++        base.as_of,
++        CONFIG,
++    )
++
++    assert runs == 1
++    assert distance == (0.0, 0.0)
++    assert evidence.planning_mode == "baseline_building"
++    assert evidence.baseline_session_miles == 3.5
++
++
+ def test_expected_compliance_target_is_causal_and_matches_completion() -> None:
+     boundary = _state().as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+     observed = [

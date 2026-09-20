@@ -1,0 +1,32 @@
+{
+  "baseline_commit": "4d6dd6d",
+  "baseline_patch": "docs/experiments/v104-eligible-baseline.patch",
+  "focused_tests": {
+    "selected": 4,
+    "passed": 4
+  },
+  "daily_replan_proof": {
+    "status": "failed_as_expected",
+    "failure_code": "near_term_schedule_churn",
+    "occurred_at": "2026-09-22T16:19:00.720987-04:00",
+    "before": {
+      "2026-09-24": "easy",
+      "2026-09-26": "intervals"
+    },
+    "after": {
+      "2026-09-23": "easy",
+      "2026-09-25": "intervals"
+    },
+    "timing_seconds": {
+      "samples": 4,
+      "median": 14.577950229635462,
+      "maximum": 17.309269957710057,
+      "per_refresh": [
+        17.309269957710057,
+        14.942106292117387,
+        14.213794167153537,
+        12.993112166877836
+      ]
+    }
+  }
+}

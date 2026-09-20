@@ -81,6 +81,7 @@ def _cumulative_recovery_residual(
     performance_response_activity_id: int | None = None,
     latest_drift_percent: float | None = None,
     latest_prescribed_intensity_factor: float | None = None,
+    latest_prescribed_distance_range_miles: tuple[float, float] | None = None,
 ) -> float:
     """Accumulate independently decayed recovery load from recorded runs."""
 
@@ -110,6 +111,9 @@ def _cumulative_recovery_residual(
             drift_percent=latest_drift_percent if is_latest else None,
             prescribed_intensity_factor=(
                 latest_prescribed_intensity_factor if is_latest else None
+            ),
+            prescribed_distance_range_miles=(
+                latest_prescribed_distance_range_miles if is_latest else None
             ),
         )
         elapsed_hours = max(
@@ -536,6 +540,9 @@ def build_fitness_state(
         ),
         latest_drift_percent=latest_drift_percent,
         latest_prescribed_intensity_factor=latest_prescribed_intensity_factor,
+        latest_prescribed_distance_range_miles=(
+            latest.prescribed_distance_range_miles if latest else None
+        ),
     )
     return FitnessState(
         as_of=as_of,
@@ -550,6 +557,7 @@ def build_fitness_state(
         days_since_quality_run=days_since_quality,
         days_since_long_run=days_since_long,
         last_run=latest.session_difficulty if latest else None,
+        last_run_distance_miles=latest.distance_miles if latest else None,
         last_run_activity_id=latest.activity_id if latest else None,
         last_run_workout_type=latest.workout_type if latest else None,
         last_run_prescribed_workout_type=(

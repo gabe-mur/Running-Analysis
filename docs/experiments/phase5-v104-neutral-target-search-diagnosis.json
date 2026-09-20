@@ -1,0 +1,44 @@
+{
+  "baseline": "v104 plus eligible-history baseline, Phase 2 evidence semantics, Phase 4 compression prototype, and bounded incumbent admission",
+  "status": "prototype_boundary_fixed_broader_gate_pending",
+  "target_reference": {
+    "accepted_direction": "One deterministic athlete-relative neutral expected-compliance stream, immutable within an invocation and independent of both candidate calendars and the prior winning calendar.",
+    "rejected_direction": "Using the prior winning plan as the next invocation's scoring reference; this creates inter-refresh self-feedback even though candidates are equal within one invocation.",
+    "focused_invariants": [
+      "Sparse and dense candidates receive identical target trajectories.",
+      "Removing a candidate run does not lower its target obligation.",
+      "Saved-plan replay remains exact."
+    ]
+  },
+  "first_true_no_evidence_failure": {
+    "before": {
+      "2026-09-24": "easy",
+      "2026-09-26": "intervals",
+      "2026-09-27": "easy"
+    },
+    "after": {
+      "2026-09-24": "easy",
+      "2026-09-26": "intervals"
+    },
+    "moved_to": {
+      "2026-09-28": "easy"
+    },
+    "translated_prior_score": 27.072187376754343,
+    "later_discovered_neighbor_score": 25.639980217901282,
+    "cause": "When the horizon count first increased, only the exact far-edge extension received full scoring. Its one-day local neighbor did not reach the finalized objective until the following refresh, when it became an exact-count incumbent neighbor."
+  },
+  "score_neutral_fix": {
+    "change": "Fully score bounded single-day neighbors of the far-edge incumbent extension for the first four inherited dates.",
+    "unit_test": "test_far_edge_incumbent_neighbors_reach_full_scoring",
+    "result": "The lower-cost calendar is selected on the earlier refresh and retained with the identical 25.639980217901282 score on the next refresh."
+  },
+  "harness_finding": {
+    "problem": "The simulator plans once per day, executes a committed run, and does not emit the immediate post-upload replan used by production.",
+    "consequence": "Its old churn gate compared a pre-run plan directly with the next day's refresh and conflated compliant-upload churn with no-new-evidence churn.",
+    "required_change": "Emit a post-upload snapshot after every completed or substituted run and maintain separate compliant-upload and no-new-evidence stability gates."
+  },
+  "broader_replay": {
+    "result": "Progressed beyond the former September 23 failure without a new failure before manual interruption.",
+    "qualification": "Not a completed 42-day pass; the script was still configured for 91 days and was stopped rather than allowed to run unbounded."
+  }
+}

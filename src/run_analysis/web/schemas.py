@@ -764,6 +764,7 @@ class FitnessState(ApiModel):
     days_since_quality_run: float | None = Field(default=None, ge=0)
     days_since_long_run: float | None = Field(default=None, ge=0)
     last_run: SessionDifficulty | None = None
+    last_run_distance_miles: float | None = Field(default=None, ge=0)
     last_run_activity_id: int | None = Field(default=None, ge=1)
     last_run_workout_type: WorkoutType | None = None
     last_run_prescribed_workout_type: WorkoutType | None = None
@@ -916,10 +917,27 @@ class WeeklyRestDayRequest(ApiModel):
     is_rest_day: bool = True
 
 
+class StrengthSessionType(StrEnum):
+    FULL_UPPER = "full_upper"
+    PUSH = "push"
+    PULL = "pull"
+    LEGS = "legs"
+
+
+class StrengthSuggestion(ApiModel):
+    """Optional muscle-group guidance that never changes the running plan."""
+
+    session_type: StrengthSessionType
+    title: str
+    muscle_groups: list[str]
+    rationale: str
+
+
 class WeeklyScheduleDay(ApiModel):
     date: date
     planned_at: datetime | None = None
     recommendation: RecommendationResponse | None = None
+    strength_suggestion: StrengthSuggestion | None = None
     day_role: str
     rationale: str
     forced_rest: bool = False
@@ -966,6 +984,40 @@ class WeeklyTargetEvidence(ApiModel):
     rationale: str
 
 
+class PlannerScoreBreakdown(ApiModel):
+    """Internal objective evidence for one fully scored calendar."""
+
+    offsets: list[int] = Field(default_factory=list)
+    total_cost: float
+    coaching_cost: float
+    target_violation: float
+    support_violation: float
+    shape_violation: float
+    finalized_recovery_cost: float
+    fragmentation_violation: float | None = None
+    long_shape_violation: float | None = None
+    medium_long_shape_violation: float | None = None
+    allocation_trace: list[str] = Field(default_factory=list)
+
+
+class PlannerDiagnostics(ApiModel):
+    """Internal search evidence retained by simulations and audits."""
+
+    candidate_count: int = Field(default=0, ge=0)
+    full_score_count: int = Field(default=0, ge=0)
+    winning_candidate: PlannerScoreBreakdown | None = None
+    translated_prior_candidate: PlannerScoreBreakdown | None = None
+    prior_continuation_candidate: PlannerScoreBreakdown | None = None
+    near_term_stable_candidate: PlannerScoreBreakdown | None = None
+    near_term_stable_offsets: list[list[int]] = Field(default_factory=list)
+    prior_independent_frequency_candidates: list[PlannerScoreBreakdown] = Field(
+        default_factory=list
+    )
+    unconstrained_winning_candidate: PlannerScoreBreakdown | None = None
+    stability_tie_break_applied: bool = False
+    stability_tolerance: float | None = None
+
+
 class WeeklyScheduleResponse(ApiModel):
     planner_version: int = Field(default=1, ge=1)
     generated_at: datetime
@@ -996,6 +1048,20 @@ class WeeklyScheduleResponse(ApiModel):
         exclude=True,
         repr=False,
         description="Internal full-horizon plan; excluded from API serialization.",
+    )
+    planner_diagnostics: PlannerDiagnostics | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="Internal optimizer evidence for simulations and audits.",
+    )
+    expected_target_start_date: date | None = Field(
+        default=None,
+        description="Decision date anchoring the persisted expected-compliance target curve.",
+    )
+    expected_target_trajectory: list[tuple[float, float]] = Field(
+        default_factory=list,
+        description="Candidate-independent expected-compliance target curve retained across replans.",
     )
 
 
@@ -1055,6 +1121,22 @@ class QualitySessionSettings(ApiModel):
         return self
 
 
+class StrengthMuscleGroupSettings(ApiModel):
+    full_upper: list[str] = Field(default_factory=list)
+    push: list[str] = Field(default_factory=list)
+    pull: list[str] = Field(default_factory=list)
+    legs: list[str] = Field(default_factory=list)
+
+
+class StrengthTrainingSettings(ApiModel):
+    enabled: bool = False
+    leg_frequency_days: int = Field(default=8, ge=1, le=60)
+    push_pull_frequency_days: int = Field(default=8, ge=1, le=60)
+    muscle_groups: StrengthMuscleGroupSettings = Field(
+        default_factory=StrengthMuscleGroupSettings
+    )
+
+
 class CoachingSettings(ApiModel):
     training_goal: str = Field(pattern="^(general_fitness|5k|10k|half_marathon|marathon)$")
     goal_date: date | None = None
@@ -1075,6 +1157,9 @@ class CoachingSettings(ApiModel):
     long_run_recency_reference_days: float = Field(ge=5, le=30)
     reduced_volume_factor: float = Field(gt=0, le=1)
     quality_sessions: QualitySessionSettings = Field(default_factory=QualitySessionSettings)
+    strength_training: StrengthTrainingSettings = Field(
+        default_factory=StrengthTrainingSettings
+    )
 
     @model_validator(mode="after")
     def ordered_weekly_mileage(self) -> "CoachingSettings":

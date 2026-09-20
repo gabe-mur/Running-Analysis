@@ -638,7 +638,13 @@ def create_app(
                     config = save_settings_overlay(
                         selected_config, patch, connection=connection
                     )
-                    stages = recalculate_for_settings(connection, config, root, patch)
+                    stages = recalculate_for_settings(
+                        connection,
+                        config,
+                        root,
+                        patch,
+                        previous_config=base,
+                    )
             else:
                 config = save_settings_overlay(selected_config, patch)
         except ValueError as exc:

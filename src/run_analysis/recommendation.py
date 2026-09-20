@@ -1039,6 +1039,21 @@ def recommend_next_run(
             distance_ratio=(round(recovery.distance_ratio, 3) if recovery and recovery.distance_ratio is not None else None),
             duration_ratio=(round(recovery.duration_ratio, 3) if recovery and recovery.duration_ratio is not None else None),
             zone_load_ratio=(round(recovery.zone_load_ratio, 3) if recovery and recovery.zone_load_ratio is not None else None),
+            prescribed_load_low=(
+                round(recovery.prescribed_load_low, 3)
+                if recovery and recovery.prescribed_load_low is not None
+                else None
+            ),
+            prescribed_load_high=(
+                round(recovery.prescribed_load_high, 3)
+                if recovery and recovery.prescribed_load_high is not None
+                else None
+            ),
+            material_load_deviation=(
+                round(recovery.material_load_deviation, 3)
+                if recovery and recovery.material_load_deviation is not None
+                else None
+            ),
         )
     )
     if recovery_caution:

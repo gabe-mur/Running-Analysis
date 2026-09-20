@@ -1,0 +1,946 @@
+diff --git a/src/run_analysis/recovery.py b/src/run_analysis/recovery.py
+index f16e045..48f2d40 100644
+--- a/src/run_analysis/recovery.py
++++ b/src/run_analysis/recovery.py
+@@ -20,6 +20,10 @@ TAXING_RUN_RESIDUAL_LIMIT = 0.25
+ # Below this residue, the effect on an ordinary easy-run distance would be
+ # smaller than the prescription's half-mile display precision.
+ EASY_VOLUME_RESIDUAL_FLOOR = 0.10
++# Differences smaller than one tenth of an athlete-relative ordinary session
++# cannot justify moving a calendar date. They remain in recorded history but
++# are treated as execution noise at the prescription/upload seam.
++PRESCRIPTION_LOAD_MATERIALITY_UNITS = 0.10
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -33,6 +37,9 @@ class RecoveryEstimate:
+     distance_ratio: float | None
+     duration_ratio: float | None
+     zone_load_ratio: float | None
++    prescribed_load_low: float | None
++    prescribed_load_high: float | None
++    material_load_deviation: float | None
+ 
+ 
+ def _weighted_mean(values: list[tuple[float | None, float]]) -> float | None:
+@@ -51,6 +58,7 @@ def athlete_relative_session_load(
+     performance_response: str = "unknown",
+     drift_percent: float | None = None,
+     prescribed_intensity_factor: float | None = None,
++    prescribed_distance_range_miles: tuple[float, float] | None = None,
+ ) -> tuple[float, dict[str, float | None]]:
+     """Measure a completed session against this athlete's ordinary run.
+ 
+@@ -156,12 +164,60 @@ def athlete_relative_session_load(
+         and prescribed_intensity_factor > 1.0
+         else None
+     )
+-    load = (
++    observed_or_intensity_floor = (
+         max(observed_load, prescribed_load_floor or 0.0)
+         * rpe_factor
+         * mechanical_factor
+         * response_factor
+     )
++    prescribed_load_low: float | None = None
++    prescribed_load_high: float | None = None
++    if prescribed_distance_range_miles is not None and typical_distance:
++        prescribed_low, prescribed_high = prescribed_distance_range_miles
++        intensity = max(1.0, prescribed_intensity_factor or 1.0)
++        prescribed_load_low = (
++            max(0.0, prescribed_low) / typical_distance * intensity
++        )
++        prescribed_load_high = max(
++            prescribed_load_low,
++            max(0.0, prescribed_high) / typical_distance * intensity,
++        )
++
++    # A prescribed range is an adherence band, not a point estimate. Calendar
++    # recovery is planned against its supported upper edge so completing any
++    # in-range dose does not become surprise evidence. A materially easier
++    # below-range run remains free to reduce load; observed intensity, RPE,
++    # terrain, drift, or response can still raise load above the band.
++    within_or_above_prescribed_distance = bool(
++        prescribed_distance_range_miles is not None
++        and session.distance_miles >= prescribed_distance_range_miles[0]
++    )
++    material_load_deviation: float | None = None
++    if prescribed_load_low is not None and prescribed_load_high is not None:
++        if (
++            observed_or_intensity_floor
++            > prescribed_load_high + PRESCRIPTION_LOAD_MATERIALITY_UNITS
++        ):
++            material_load_deviation = (
++                observed_or_intensity_floor
++                - prescribed_load_high
++                - PRESCRIPTION_LOAD_MATERIALITY_UNITS
++            )
++        elif (
++            not within_or_above_prescribed_distance
++            and observed_or_intensity_floor
++            < prescribed_load_low - PRESCRIPTION_LOAD_MATERIALITY_UNITS
++        ):
++            material_load_deviation = (
++                observed_or_intensity_floor
++                - prescribed_load_low
++                + PRESCRIPTION_LOAD_MATERIALITY_UNITS
++            )
++        else:
++            material_load_deviation = 0.0
++        load = prescribed_load_high + material_load_deviation
++    else:
++        load = observed_or_intensity_floor
+     return max(0.10, min(4.0, load)), {
+         "distance_ratio": distance_ratio,
+         "duration_ratio": duration_ratio,
+@@ -171,6 +227,14 @@ def athlete_relative_session_load(
+         "response_factor": response_factor,
+         "prescribed_intensity_factor": prescribed_intensity_factor,
+         "prescribed_load_floor": prescribed_load_floor,
++        "prescribed_load_low": prescribed_load_low,
++        "prescribed_load_high": prescribed_load_high,
++        "load_above_prescribed_band": (
++            max(0.0, observed_or_intensity_floor - prescribed_load_high)
++            if prescribed_load_high is not None
++            else None
++        ),
++        "material_load_deviation": material_load_deviation,
+     }
+ 
+ 
+@@ -354,6 +418,9 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
+         ),
+         drift_percent=state.last_run_drift_percent,
+         prescribed_intensity_factor=state.last_run_prescribed_intensity_factor,
++        prescribed_distance_range_miles=(
++            state.last_run_prescribed_distance_range_miles
++        ),
+     )
+     elapsed_hours = max(0.0, state.days_since_last_run * 24.0)
+     residual = (
+@@ -375,4 +442,7 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
+         distance_ratio=evidence["distance_ratio"],
+         duration_ratio=evidence["duration_ratio"],
+         zone_load_ratio=evidence["zone_load_ratio"],
++        prescribed_load_low=evidence["prescribed_load_low"],
++        prescribed_load_high=evidence["prescribed_load_high"],
++        material_load_deviation=evidence["material_load_deviation"],
+     )
+diff --git a/src/run_analysis/fitness_state.py b/src/run_analysis/fitness_state.py
+index 8ad4fd4..4f9dbf0 100644
+--- a/src/run_analysis/fitness_state.py
++++ b/src/run_analysis/fitness_state.py
+@@ -81,6 +81,7 @@ def _cumulative_recovery_residual(
+     performance_response_activity_id: int | None = None,
+     latest_drift_percent: float | None = None,
+     latest_prescribed_intensity_factor: float | None = None,
++    latest_prescribed_distance_range_miles: tuple[float, float] | None = None,
+ ) -> float:
+     """Accumulate independently decayed recovery load from recorded runs."""
+ 
+@@ -111,6 +112,9 @@ def _cumulative_recovery_residual(
+             prescribed_intensity_factor=(
+                 latest_prescribed_intensity_factor if is_latest else None
+             ),
++            prescribed_distance_range_miles=(
++                latest_prescribed_distance_range_miles if is_latest else None
++            ),
+         )
+         elapsed_hours = max(
+             0.0,
+@@ -536,6 +540,9 @@ def build_fitness_state(
+         ),
+         latest_drift_percent=latest_drift_percent,
+         latest_prescribed_intensity_factor=latest_prescribed_intensity_factor,
++        latest_prescribed_distance_range_miles=(
++            latest.prescribed_distance_range_miles if latest else None
++        ),
+     )
+     return FitnessState(
+         as_of=as_of,
+diff --git a/src/run_analysis/weekly_schedule.py b/src/run_analysis/weekly_schedule.py
+index 36e2b7a..42b7f91 100644
+--- a/src/run_analysis/weekly_schedule.py
++++ b/src/run_analysis/weekly_schedule.py
+@@ -156,6 +156,40 @@ class PlanningActivity:
+     moving_minutes: float | None = None
+     easy_minutes: float | None = None
+     baseline_eligible: bool = True
++    target_distance_miles: float | None = None
++
++
++def adherence_normalized_distance(
++    actual_miles: float,
++    prescribed_range_miles: tuple[float, float] | None,
++) -> float:
++    """Return prescribed midpoint plus only out-of-range execution deviation.
++
++    Actual distance remains available to observed easy-run baselines. This
++    normalized value is only for the conditional mileage/capacity ledger,
++    where every value inside a prescribed range is equally compliant.
++    """
++
++    actual = max(0.0, actual_miles)
++    if prescribed_range_miles is None:
++        return actual
++    low, high = prescribed_range_miles
++    low = max(0.0, low)
++    high = max(low, high)
++    midpoint = (low + high) / 2.0
++    if actual < low:
++        return max(0.0, midpoint - (low - actual))
++    if actual > high:
++        return midpoint + (actual - high)
++    return midpoint
++
++
++def _target_activity_miles(activity: PlanningActivity) -> float:
++    return (
++        activity.target_distance_miles
++        if activity.target_distance_miles is not None
++        else activity.distance_miles
++    )
+ 
+ 
+ def expected_compliance_activity(
+@@ -305,7 +339,9 @@ def expected_compliance_target_trajectory(
+     capacity_daily: dict[date, float] = {}
+     for item in [*observed_activities, *expected]:
+         day = item.start_time.astimezone(zone).date()
+-        capacity_daily[day] = capacity_daily.get(day, 0.0) + item.distance_miles
++        capacity_daily[day] = (
++            capacity_daily.get(day, 0.0) + _target_activity_miles(item)
++        )
+     capacity_first = min(capacity_daily, default=start_date)
+     capacity_last = max(
+         capacity_daily,
+@@ -371,7 +407,7 @@ def expected_compliance_target_trajectory(
+         end = boundary.astimezone(zone).date()
+         end_index = (end - prefix_start).days
+         unavailable_today = sum(
+-            item.distance_miles
++            _target_activity_miles(item)
+             for item in expected
+             if item.start_time.astimezone(zone).date() == end
+             and item.start_time >= boundary
+@@ -466,21 +502,21 @@ def expected_compliance_target_trajectory(
+         ]
+         end = boundary.astimezone(zone).date()
+         added_7 = sum(
+-            item.distance_miles
++            _target_activity_miles(item)
+             for item in eligible
+             if end - timedelta(days=6)
+             <= item.start_time.astimezone(zone).date()
+             <= end
+         )
+         added_14_weekly = sum(
+-            item.distance_miles
++            _target_activity_miles(item)
+             for item in eligible
+             if end - timedelta(days=13)
+             <= item.start_time.astimezone(zone).date()
+             <= end
+         ) / 2.0
+         added_21_weekly = sum(
+-            item.distance_miles
++            _target_activity_miles(item)
+             for item in eligible
+             if end - timedelta(days=20)
+             <= item.start_time.astimezone(zone).date()
+@@ -628,6 +664,8 @@ def _continuous_mileage_path_cost(
+     session_tolerance_miles: float,
+     opening_weekly_rate: float | None = None,
+     half_life_days: float = 7.0,
++    impulse_hours: list[float | None] | None = None,
++    opening_hour: float = 0.0,
+ ) -> float:
+     """Score cumulative load against a boundary-free daily target path.
+ 
+@@ -649,8 +687,26 @@ def _continuous_mileage_path_cost(
+         opening_low = min(rate, target_weekly_range[0])
+         opening_high = max(rate, target_weekly_range[1])
+         for elapsed_days, miles in enumerate(daily_miles, start=1):
+-            rate = rate * daily_decay + max(0.0, miles) * session_normalization
+-            path_decay = daily_decay**elapsed_days
++            impulse_hour = (
++                impulse_hours[elapsed_days - 1]
++                if impulse_hours is not None
++                and elapsed_days - 1 < len(impulse_hours)
++                else None
++            )
++            rate = _advance_continuous_mileage_rate(
++                rate,
++                miles,
++                daily_decay=daily_decay,
++                session_normalization=session_normalization,
++                impulse_hour=impulse_hour,
++                opening_hour=(opening_hour if elapsed_days == 1 else 0.0),
++            )
++            elapsed_from_opening = (
++                (24.0 - min(24.0, max(0.0, opening_hour))) / 24.0
++                + elapsed_days
++                - 1
++            )
++            path_decay = daily_decay**elapsed_from_opening
+             lower_path = target_weekly_range[0] + (
+                 opening_low - target_weekly_range[0]
+             ) * path_decay
+@@ -685,6 +741,8 @@ def _continuous_mileage_path_violation(
+     opening_weekly_rate: float | None = None,
+     half_life_days: float = 7.0,
+     target_weekly_ranges: tuple[tuple[float, float], ...] | None = None,
++    impulse_hours: list[float | None] | None = None,
++    opening_hour: float = 0.0,
+ ) -> float:
+     """Return the worst cumulative breach outside the session corridor."""
+ 
+@@ -707,8 +765,26 @@ def _continuous_mileage_path_violation(
+             zip(daily_miles, target_curve),
+             start=1,
+         ):
+-            rate = rate * daily_decay + max(0.0, miles) * session_normalization
+-            path_decay = daily_decay**elapsed_days
++            impulse_hour = (
++                impulse_hours[elapsed_days - 1]
++                if impulse_hours is not None
++                and elapsed_days - 1 < len(impulse_hours)
++                else None
++            )
++            rate = _advance_continuous_mileage_rate(
++                rate,
++                miles,
++                daily_decay=daily_decay,
++                session_normalization=session_normalization,
++                impulse_hour=impulse_hour,
++                opening_hour=(opening_hour if elapsed_days == 1 else 0.0),
++            )
++            elapsed_from_opening = (
++                (24.0 - min(24.0, max(0.0, opening_hour))) / 24.0
++                + elapsed_days
++                - 1
++            )
++            path_decay = daily_decay**elapsed_from_opening
+             lower_path = current_target[0] + (
+                 opening_low - target_curve[0][0]
+             ) * path_decay
+@@ -735,6 +811,55 @@ def _continuous_mileage_path_violation(
+     return max(0.0, worst)
+ 
+ 
++def _advance_continuous_mileage_rate(
++    opening_rate: float,
++    miles: float,
++    *,
++    daily_decay: float,
++    session_normalization: float,
++    impulse_hour: float | None,
++    opening_hour: float = 0.0,
++) -> float:
++    """Advance one local day while retaining the session's clock time."""
++
++    start_hour = min(24.0, max(0.0, opening_hour))
++    hour = (
++        24.0
++        if impulse_hour is None
++        else min(24.0, max(start_hour, impulse_hour))
++    )
++    opening_decay = daily_decay ** ((24.0 - start_hour) / 24.0)
++    after_impulse_decay = daily_decay ** ((24.0 - hour) / 24.0)
++    return (
++        max(0.0, opening_rate) * opening_decay
++        + max(0.0, miles) * session_normalization * after_impulse_decay
++    )
++
++
++def _planned_impulse_hours(days: list[WeeklyScheduleDay]) -> list[float | None]:
++    """Return local clock hours aligned with one day of planned mileage."""
++
++    values: list[float | None] = []
++    for day in days:
++        result = day.recommendation
++        planned_for = result.planned_for if result is not None else None
++        if planned_for is None or planned_for.date() != day.date:
++            values.append(None)
++            continue
++        values.append(
++            planned_for.hour
++            + planned_for.minute / 60.0
++            + planned_for.second / 3600.0
++        )
++    return values
++
++
++def _clock_hour(value: datetime) -> float:
++    """Return a fractional local hour for continuous within-day decay."""
++
++    return value.hour + value.minute / 60.0 + value.second / 3600.0
++
++
+ def _peak_projected_continuous_mileage_rate(
+     opening_weekly_rate: float | None,
+     opening_at: datetime,
+@@ -835,7 +960,7 @@ def derive_weekly_target(
+     for activity in activities:
+         day = activity.start_time.astimezone(zone).date()
+         if day <= end:
+-            daily[day] = daily.get(day, 0.0) + activity.distance_miles
++            daily[day] = daily.get(day, 0.0) + _target_activity_miles(activity)
+     if not daily:
+         evidence = WeeklyTargetEvidence(
+             recent_7d_miles=0,
+@@ -898,13 +1023,13 @@ def derive_weekly_target(
+             TrainingSession(
+                 activity_id=index,
+                 start_time=activity.start_time,
+-                distance_miles=activity.distance_miles,
++                distance_miles=_target_activity_miles(activity),
+                 moving_minutes=float(activity.moving_minutes or 0.0),
+                 zone_load=None,
+                 hard_minutes=0.0,
+             )
+             for index, activity in enumerate(activities)
+-            if activity.distance_miles > 0
++            if _target_activity_miles(activity) > 0
+         ],
+         as_of,
+         retention_grace_days=retention_grace,
+@@ -1509,17 +1634,28 @@ def _recommendation_load_units(
+     result: RecommendationResponse,
+     easy_reference_miles: float,
+ ) -> float:
+-    midpoint = _midpoint(result)
+-    duration_ratio = midpoint / easy_reference_miles if easy_reference_miles > 0 else 0.0
++    # Calendar placement must remain valid for every dose the prescription
++    # calls compliant. Price recovery at the upper edge of a distance range;
++    # mileage targets and progression still use the midpoint independently.
++    planned_miles = (
++        result.distance_range_miles[1]
++        if result.distance_range_miles is not None
++        else _midpoint(result)
++    )
++    duration_ratio = (
++        planned_miles / easy_reference_miles
++        if easy_reference_miles > 0
++        else 0.0
++    )
+     # At planning time, recent pace makes duration proportional to distance.
+     # The prescribed work fraction adds the intensity component; recorded HR
+     # and actual duration replace both estimates after upload.
+     estimated_minutes = max(
+         _structured_duration_minutes(result) or 0.0,
+-        midpoint * 11.0,
++        planned_miles * 11.0,
+     )
+     return _session_load_units(
+-        midpoint,
++        planned_miles,
+         easy_reference_miles,
+         estimated_duration_ratio=duration_ratio,
+         prescribed_intensity_factor=_prescribed_intensity_factor(
+@@ -1617,6 +1753,9 @@ def _decayed_recovery_load(
+             prescribed_intensity_factor=(
+                 raw_state.last_run_prescribed_intensity_factor
+             ),
++            prescribed_distance_range_miles=(
++                raw_state.last_run_prescribed_distance_range_miles
++            ),
+         )
+         residual += decay_recovery_load(
+             completed_units,
+@@ -2957,6 +3096,7 @@ def _adaptive_candidate_cost(
+     # This map contains only proposed work so the reload boundary is not
+     # double-counted.
+     minimum_density_miles_by_offset: dict[int, float] = {}
++    impulse_hours_by_offset: dict[int, float] = {}
+     cost = 0.0
+     for session in sessions:
+         offset = session.offset
+@@ -2988,6 +3128,8 @@ def _adaptive_candidate_cost(
+             minimum_density_miles_by_offset.get(offset, 0.0)
+             + minimum_density_miles
+         )
++        if result.planned_for is not None:
++            impulse_hours_by_offset[offset] = _clock_hour(result.planned_for)
+         planned.append(result)
+         if result.readiness.value == "not_ready":
+             cost += 100.0
+@@ -3071,6 +3213,11 @@ def _adaptive_candidate_cost(
+                     "continuous_fatigue_half_life_days", 7
+                 )
+             ),
++            opening_hour=_clock_hour(daily_states[0].as_of),
++            impulse_hours=[
++                impulse_hours_by_offset.get(offset)
++                for offset in range(len(daily_states))
++            ],
+         )
+         cost += path_violation**2 * 3.0
+ 
+@@ -3894,6 +4041,8 @@ def _joint_candidate_program_cost(
+         opening_weekly_rate=opening_distance_rate,
+         half_life_days=fatigue_half_life_days,
+         target_weekly_ranges=hard_target_ranges,
++        impulse_hours=_planned_impulse_hours(allocated),
++        opening_hour=_clock_hour(daily_states[0].as_of),
+     )
+     # The continuous path governs placement while the whole-horizon average
+     # separately verifies that the selected policy funds its target.
+@@ -5240,6 +5389,8 @@ def _allocate_visible_distance_ranges(
+                             session_tolerance_miles=path_tolerance,
+                             opening_weekly_rate=opening_distance_rate,
+                             half_life_days=fatigue_half_life_days,
++                            impulse_hours=_planned_impulse_hours(updated),
++                            opening_hour=_clock_hour(daily_states[0].as_of),
+                         )
+                         density_score += path_violation**2 * 20.0
+                         if opening_distance_rate is not None:
+@@ -5249,6 +5400,8 @@ def _allocate_visible_distance_ranges(
+                                 session_tolerance_miles=path_tolerance,
+                                 opening_weekly_rate=opening_distance_rate,
+                                 half_life_days=fatigue_half_life_days,
++                                impulse_hours=_planned_impulse_hours(updated),
++                                opening_hour=_clock_hour(daily_states[0].as_of),
+                             ) * 8.0
+                     score = balance_cost + density_score + role_shape_score - (
+                         0.25 if retain_long else 0.0
+diff --git a/src/run_analysis/recommendation_service.py b/src/run_analysis/recommendation_service.py
+index 7301db1..306f2b9 100644
+--- a/src/run_analysis/recommendation_service.py
++++ b/src/run_analysis/recommendation_service.py
+@@ -29,6 +29,7 @@ from .weekly_schedule import (
+     PLANNING_HORIZON_DAYS,
+     PlanningActivity,
+     _peak_projected_continuous_mileage_rate,
++    adherence_normalized_distance,
+     build_weekly_schedule,
+     derive_weekly_target,
+     make_expected_target_projector,
+@@ -254,6 +255,10 @@ def generate_weekly_schedule(
+                     )
+                 )
+             ),
++            target_distance_miles=adherence_normalized_distance(
++                run.distance_miles,
++                run.prescribed_distance_range_miles,
++            ),
+         )
+         for run in run_history
+         if run.start_time
+@@ -645,6 +650,7 @@ def generate_weekly_schedule(
+                             "moving_minutes": item.moving_minutes,
+                             "easy_minutes": item.easy_minutes,
+                             "baseline_eligible": item.baseline_eligible,
++                            "target_distance_miles": item.target_distance_miles,
+                         }
+                         for item in history
+                     ],
+@@ -793,6 +799,7 @@ def replay_latest_weekly_schedule(
+                 moving_minutes=item.get("moving_minutes"),
+                 easy_minutes=item.get("easy_minutes"),
+                 baseline_eligible=bool(item.get("baseline_eligible", True)),
++                target_distance_miles=item.get("target_distance_miles"),
+             )
+             for item in observed_payload
+         ]
+diff --git a/src/run_analysis/adherence_projection.py b/src/run_analysis/adherence_projection.py
+index 0531f9d..50d6c21 100644
+--- a/src/run_analysis/adherence_projection.py
++++ b/src/run_analysis/adherence_projection.py
+@@ -6,6 +6,8 @@ from dataclasses import dataclass
+ from datetime import date, datetime, time, timedelta
+ from enum import Enum
+ from random import Random
++from time import perf_counter
++from typing import Callable
+ 
+ from .durability import supported_long_run_capacity
+ from .easy_baseline import (
+@@ -28,6 +30,7 @@ from .training_load import (
+ from .weekly_schedule import (
+     PLANNING_HORIZON_DAYS,
+     PlanningActivity,
++    adherence_normalized_distance,
+     build_weekly_schedule,
+     derive_weekly_target,
+     make_expected_target_projector,
+@@ -171,6 +174,7 @@ class ProjectionPlanSession:
+     planned_for: datetime
+     workout_type: WorkoutType
+     midpoint_miles: float
++    readiness: str | None = None
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -183,6 +187,12 @@ class ProjectionReplan:
+     target_high_miles: float
+     planned_sessions: tuple[ProjectionPlanSession, ...]
+     committed_sessions: tuple[ProjectionPlanSession, ...]
++    capacity_reference_miles: float | None = None
++    planning_mode: str | None = None
++    ordinary_easy_midpoint_miles: float | None = None
++    peak_projected_continuous_mileage_rate: float | None = None
++    target_trajectory: tuple[tuple[float, float], ...] = ()
++    planning_seconds: float = 0.0
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -482,6 +492,12 @@ def _state_at(
+                         if run is last and not run.projected
+                         else None
+                     ),
++                    prescribed_distance_range_miles=(
++                        (run.prescribed_low_miles, run.prescribed_high_miles)
++                        if run.prescribed_low_miles is not None
++                        and run.prescribed_high_miles is not None
++                        else None
++                    ),
+                 )[0],
+                 max(0.0, (as_of - run.start_time).total_seconds() / 3600.0),
+             )
+@@ -877,6 +893,7 @@ def simulate_adherence(
+     overload_profile: OverloadAdherenceProfile | None = None,
+     initial_schedule: WeeklyScheduleResponse | None = None,
+     simulation_days: int | None = None,
++    replan_observer: Callable[[ProjectionReplan], None] | None = None,
+ ) -> list[ProjectionWeek]:
+     """Roll the real planner forward under controlled adherence behavior.
+ 
+@@ -992,6 +1009,15 @@ def simulate_adherence(
+                     and not run.difficulty.is_quality_session
+                     and run.planning_role not in {"support_easy", "medium_long"}
+                 ),
++                target_distance_miles=adherence_normalized_distance(
++                    run.distance_miles,
++                    (
++                        (run.prescribed_low_miles, run.prescribed_high_miles)
++                        if run.prescribed_low_miles is not None
++                        and run.prescribed_high_miles is not None
++                        else None
++                    ),
++                ),
+             )
+             for run in history
+         ]
+@@ -1047,6 +1073,7 @@ def simulate_adherence(
+             opening_evidence=evidence,
+         )
+ 
++        planning_started_at = perf_counter()
+         schedule = build_weekly_schedule(
+             daily_states,
+             RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+@@ -1058,6 +1085,7 @@ def simulate_adherence(
+             prior_schedule=previous_schedule,
+             expected_target_projector=expected_target_projector,
+         )
++        planning_seconds = perf_counter() - planning_started_at
+         previous_schedule = schedule
+         committed = [
+             day.recommendation
+@@ -1110,8 +1138,7 @@ def simulate_adherence(
+                 or "none"
+             )
+         )
+-        summary["snapshots"].append(
+-            ProjectionReplan(
++        snapshot = ProjectionReplan(
+                 generated_at=plan_start,
+                 opening_load_ratio=opening,
+                 target_low_miles=target_range[0],
+@@ -1121,6 +1148,7 @@ def simulate_adherence(
+                         planned_for=item.planned_for,
+                         workout_type=item.workout_type,
+                         midpoint_miles=sum(item.distance_range_miles) / 2,
++                        readiness=item.readiness.value,
+                     )
+                     for item in visible_plan
+                     if item.planned_for and item.distance_range_miles
+@@ -1130,12 +1158,28 @@ def simulate_adherence(
+                         planned_for=item.planned_for,
+                         workout_type=item.workout_type,
+                         midpoint_miles=sum(item.distance_range_miles) / 2,
++                        readiness=item.readiness.value,
+                     )
+                     for item in committed
+                     if item.planned_for and item.distance_range_miles
+                 ),
++                capacity_reference_miles=capacity,
++                planning_mode=evidence.planning_mode.value,
++                ordinary_easy_midpoint_miles=(
++                    daily_states[0].typical_easy_run_miles
++                ),
++                peak_projected_continuous_mileage_rate=(
++                    schedule.peak_projected_continuous_mileage_rate
++                ),
++                target_trajectory=expected_target_projector(
++                    visible_plan,
++                    PLANNING_HORIZON_DAYS,
++                ),
++                planning_seconds=planning_seconds,
+             )
+-        )
++        summary["snapshots"].append(snapshot)
++        if replan_observer is not None:
++            replan_observer(snapshot)
+         for item in committed:
+             if not item.distance_range_miles or not item.planned_for:
+                 continue
+@@ -1493,7 +1537,19 @@ def simulate_adherence(
+         history_at_open = [run for run in history if run.start_time <= week_start]
+         _, target_range, evidence = derive_weekly_target(
+             [
+-                PlanningActivity(run.start_time, run.distance_miles)
++                PlanningActivity(
++                    run.start_time,
++                    run.distance_miles,
++                    target_distance_miles=adherence_normalized_distance(
++                        run.distance_miles,
++                        (
++                            (run.prescribed_low_miles, run.prescribed_high_miles)
++                            if run.prescribed_low_miles is not None
++                            and run.prescribed_high_miles is not None
++                            else None
++                        ),
++                    ),
++                )
+                 for run in history_at_open
+             ],
+             week_start,
+diff --git a/tests/test_recovery.py b/tests/test_recovery.py
+index f786f8f..b508a5f 100644
+--- a/tests/test_recovery.py
++++ b/tests/test_recovery.py
+@@ -181,6 +181,61 @@ def test_completed_short_rep_prescription_sets_recovery_floor_on_actual_volume()
+     )
+ 
+ 
++def test_any_distance_inside_prescribed_range_uses_same_calendar_load_band() -> None:
++    state = _state()
++    typical = state.recent_load.trailing_28d
++    low_response = _difficulty(miles=3.7).model_copy(
++        update={"zone_load": 50, "moving_minutes": 40.7, "elapsed_minutes": 40.7}
++    )
++    high_response = low_response.model_copy(
++        update={"distance_miles": 4.2, "moving_minutes": 46.2, "elapsed_minutes": 46.2}
++    )
++
++    low_load, low_evidence = athlete_relative_session_load(
++        low_response,
++        typical,
++        prescribed_intensity_factor=1.1,
++        prescribed_distance_range_miles=(3.7, 4.2),
++    )
++    high_load, high_evidence = athlete_relative_session_load(
++        high_response,
++        typical,
++        prescribed_intensity_factor=1.1,
++        prescribed_distance_range_miles=(3.7, 4.2),
++    )
++
++    assert low_load == pytest.approx(high_load)
++    assert low_load == pytest.approx(4.2 / 4.0 * 1.1)
++    assert low_evidence["load_above_prescribed_band"] == 0
++    assert high_evidence["load_above_prescribed_band"] == 0
++
++
++def test_below_range_can_reduce_load_but_excess_intensity_remains_material() -> None:
++    state = _state()
++    typical = state.recent_load.trailing_28d
++    easy_short = _difficulty(miles=3.0).model_copy(
++        update={"zone_load": 40, "moving_minutes": 33, "elapsed_minutes": 33}
++    )
++    hard_in_range = _difficulty(miles=4.0).model_copy(update={"zone_load": 180})
++
++    short_load, _ = athlete_relative_session_load(
++        easy_short,
++        typical,
++        prescribed_intensity_factor=1.1,
++        prescribed_distance_range_miles=(3.7, 4.2),
++    )
++    hard_load, hard_evidence = athlete_relative_session_load(
++        hard_in_range,
++        typical,
++        prescribed_intensity_factor=1.1,
++        prescribed_distance_range_miles=(3.7, 4.2),
++    )
++
++    assert short_load < 4.2 / 4.0 * 1.1
++    assert hard_load > 4.2 / 4.0 * 1.1
++    assert hard_evidence["load_above_prescribed_band"] > 0
++
++
+ def test_actual_duration_changes_recovery_at_equal_distance_and_hr_load() -> None:
+     state = _state()
+     ordinary_session = _difficulty(miles=5)
+diff --git a/tests/test_weekly_schedule.py b/tests/test_weekly_schedule.py
+index 6b4ab75..cdb494f 100644
+--- a/tests/test_weekly_schedule.py
++++ b/tests/test_weekly_schedule.py
+@@ -163,6 +163,16 @@ def test_distance_grid_preserves_a_narrow_off_grid_feasible_band() -> None:
+     )
+ 
+ 
++def test_adherence_normalized_distance_uses_only_deviation_outside_range() -> None:
++    prescribed = (3.5, 4.0)
++
++    assert weekly_schedule.adherence_normalized_distance(3.5, prescribed) == 3.75
++    assert weekly_schedule.adherence_normalized_distance(3.8, prescribed) == 3.75
++    assert weekly_schedule.adherence_normalized_distance(4.0, prescribed) == 3.75
++    assert weekly_schedule.adherence_normalized_distance(3.2, prescribed) == 3.45
++    assert weekly_schedule.adherence_normalized_distance(4.2, prescribed) == 3.95
++
++
+ def test_visible_continuous_mileage_peak_uses_actual_session_times() -> None:
+     opening = datetime(2026, 9, 3, 12, tzinfo=timezone.utc)
+     days = [
+@@ -826,6 +836,51 @@ def test_continuous_path_is_invariant_when_a_rest_day_moves_the_origin() -> None
+     assert original == pytest.approx(reloaded)
+ 
+ 
++def test_evening_impulse_reaches_next_midnight_with_only_remaining_decay() -> None:
++    daily_decay = 0.5 ** (1 / 7)
++    normalization = log(2.0)
++
++    advanced = weekly_schedule._advance_continuous_mileage_rate(
++        14.0,
++        4.0,
++        daily_decay=daily_decay,
++        session_normalization=normalization,
++        impulse_hour=20.0,
++    )
++
++    assert advanced == pytest.approx(
++        14.0 * daily_decay
++        + 4.0 * normalization * daily_decay ** (4 / 24)
++    )
++
++
++def test_continuous_path_preserves_absolute_load_across_intraday_refresh() -> None:
++    daily_decay = 0.5 ** (1 / 7)
++    morning_opening = 12.0
++    evening_opening = morning_opening * daily_decay ** (12 / 24)
++    common = {
++        "target_weekly_range": (17.0, 18.0),
++        "session_tolerance_miles": 2.0,
++        "half_life_days": 7.0,
++        "impulse_hours": [None, 7.0],
++    }
++
++    morning = weekly_schedule._continuous_mileage_path_violation(
++        [0.0, 7.0],
++        opening_weekly_rate=morning_opening,
++        opening_hour=7.0,
++        **common,
++    )
++    evening = weekly_schedule._continuous_mileage_path_violation(
++        [0.0, 7.0],
++        opening_weekly_rate=evening_opening,
++        opening_hour=19.0,
++        **common,
++    )
++
++    assert morning == pytest.approx(evening)
++
++
+ def test_prior_calendar_is_an_unpreferred_warm_start_for_full_scoring(
+     monkeypatch,
+ ) -> None:
+@@ -1154,6 +1209,23 @@ def test_expected_compliance_target_is_causal_and_matches_completion() -> None:
+         CONFIG,
+     )
+     assert conditional == completed
++    completed_at_low_edge = PlanningActivity(
++        start_time=projected.start_time,
++        distance_miles=7.0,
++        moving_minutes=projected.moving_minutes,
++        easy_minutes=projected.easy_minutes,
++        baseline_eligible=False,
++        target_distance_miles=weekly_schedule.adherence_normalized_distance(
++            7.0,
++            recommendation.distance_range_miles,
++        ),
++    )
++    normalized_completion = derive_weekly_target(
++        [*observed, completed_at_low_edge],
++        next_boundary,
++        CONFIG,
++    )
++    assert conditional == normalized_completion
+     assert (
+         conditional[2].baseline_session_miles
+         == observed_only[2].baseline_session_miles
+diff --git a/tests/test_adherence_projection.py b/tests/test_adherence_projection.py
+index bd1f375..3d3ec8e 100644
+--- a/tests/test_adherence_projection.py
++++ b/tests/test_adherence_projection.py
+@@ -74,6 +74,68 @@ def test_human_intensity_drift_becomes_observed_load_evidence() -> None:
+     assert drifted.zone_breakdown.hard_minutes > 0
+ 
+ 
++def test_simulated_in_range_edges_have_same_recovery_residual() -> None:
++    template = _state(
++        as_of=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
++        typical_easy_run_miles=4.0,
++    )
++    recommendation = RecommendationResponse(
++        generated_at=template.as_of,
++        fitness_state_as_of=template.as_of,
++        planned_for=template.as_of,
++        workout_type=WorkoutType.EASY,
++        title="Range-equivalence fixture",
++        distance_range_miles=(3.0, 4.0),
++        confidence=ConfidenceLevel.MODERATE,
++        readiness=ReadinessFlag.READY,
++    )
++
++    def projected_run(miles: float) -> ProjectionRun:
++        return ProjectionRun(
++            start_time=template.as_of,
++            distance_miles=miles,
++            moving_minutes=miles * 10.0,
++            workout_type=WorkoutType.EASY,
++            difficulty=_projected_difficulty(recommendation, miles, 10.0),
++            projected=True,
++            planning_role="ordinary_easy",
++            prescribed_workout_type=WorkoutType.EASY,
++            completed_prescribed_workout=True,
++            prescribed_low_miles=3.0,
++            prescribed_high_miles=4.0,
++        )
++
++    prior_runs = [
++        ProjectionRun(
++            start_time=template.as_of - timedelta(days=day),
++            distance_miles=4.0,
++            moving_minutes=40.0,
++            workout_type=WorkoutType.EASY,
++            difficulty=_difficulty(miles=4.0),
++            planning_role="ordinary_easy",
++        )
++        for day in (8, 6, 4, 2)
++    ]
++    observed_at = template.as_of + timedelta(hours=12)
++    low_state = _state_at(
++        template,
++        [*prior_runs, projected_run(3.0)],
++        observed_at,
++        16.0,
++    )
++    high_state = _state_at(
++        template,
++        [*prior_runs, projected_run(4.0)],
++        observed_at,
++        16.0,
++    )
++
++    assert low_state.recovery_residual_load == pytest.approx(
++        high_state.recovery_residual_load,
++        abs=0.001,
++    )
++
++
+ @pytest.mark.parametrize(
+     ("planned_role", "actual_type", "expected_role"),
+     [
+

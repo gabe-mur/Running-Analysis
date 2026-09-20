@@ -17,11 +17,12 @@ from .forecast import (
     get_planned_forecast,
     planned_forecast_options,
 )
-from .recommendation import recommend_next_run
+from .recommendation import recommend_next_run, typical_easy_distance
 from .recovery import decay_recovery_load
 from .training_load import continuous_distance_rate, short_term_density_half_life_days
 from .prescription_matching import archive_weekly_prescriptions
 from .run_feedback import get_run_feedback, list_runs
+from .strength_schedule import add_strength_suggestions
 from .weekly_schedule import (
     BASELINE_MINIMUM_AEROBIC_MINUTES,
     WEEKLY_PLANNER_VERSION,
@@ -32,6 +33,7 @@ from .weekly_schedule import (
     build_weekly_schedule,
     derive_weekly_target,
     make_expected_target_projector,
+    adherence_normalized_distance,
 )
 from .web.schemas import (
     FitnessState,
@@ -253,6 +255,10 @@ def generate_weekly_schedule(
                         or run.session_difficulty.is_quality_session
                     )
                 )
+            ),
+            target_distance_miles=adherence_normalized_distance(
+                run.distance_miles,
+                run.prescribed_distance_range_miles,
             ),
         )
         for run in run_history
@@ -545,6 +551,11 @@ def generate_weekly_schedule(
         maximum_horizon_days=PLANNING_HORIZON_DAYS,
         opening_target_range=target_distance,
         opening_evidence=target_evidence,
+        ordinary_easy_midpoint_miles=sum(
+            typical_easy_distance(planning_reference_state)
+        )
+        / 2.0,
+        prior_schedule=prior_schedule,
     )
 
     result = build_weekly_schedule(
@@ -645,10 +656,15 @@ def generate_weekly_schedule(
                             "moving_minutes": item.moving_minutes,
                             "easy_minutes": item.easy_minutes,
                             "baseline_eligible": item.baseline_eligible,
+                            "target_distance_miles": item.target_distance_miles,
                         }
                         for item in history
                     ],
                     "target_projection_pace_min_mile": target_projection_pace,
+                    "ordinary_easy_midpoint_miles": sum(
+                        typical_easy_distance(planning_reference_state)
+                    )
+                    / 2.0,
                     "completed_activities_by_offset": {},
                     "forced_rest_offsets": sorted(forced_rest_offsets),
                     "prior_schedule": (
@@ -783,6 +799,22 @@ def replay_latest_weekly_schedule(
         int(offset): [TrailingDayActivity.model_validate(item) for item in items]
         for offset, items in payload.get("completed_activities_by_offset", {}).items()
     }
+    prior_payload = payload.get("prior_schedule")
+    prior_replay_schedule = (
+        WeeklyScheduleResponse.model_validate(prior_payload)
+        if prior_payload is not None
+        else None
+    )
+    prior_planning_payload = payload.get("prior_planning_days")
+    if prior_replay_schedule is not None and prior_planning_payload is not None:
+        prior_replay_schedule = prior_replay_schedule.model_copy(
+            update={
+                "planning_days": [
+                    WeeklyScheduleDay.model_validate(day)
+                    for day in prior_planning_payload
+                ]
+            }
+        )
     observed_payload = payload.get("observed_planning_activities")
     replay_target_projector = None
     if observed_payload is not None:
@@ -793,6 +825,7 @@ def replay_latest_weekly_schedule(
                 moving_minutes=item.get("moving_minutes"),
                 easy_minutes=item.get("easy_minutes"),
                 baseline_eligible=bool(item.get("baseline_eligible", True)),
+                target_distance_miles=item.get("target_distance_miles"),
             )
             for item in observed_payload
         ]
@@ -811,23 +844,13 @@ def replay_latest_weekly_schedule(
             opening_evidence=WeeklyTargetEvidence.model_validate(
                 payload["target_evidence"]
             ),
-        )
-
-    prior_payload = payload.get("prior_schedule")
-    prior_replay_schedule = (
-        WeeklyScheduleResponse.model_validate(prior_payload)
-        if prior_payload is not None
-        else None
-    )
-    prior_planning_payload = payload.get("prior_planning_days")
-    if prior_replay_schedule is not None and prior_planning_payload is not None:
-        prior_replay_schedule = prior_replay_schedule.model_copy(
-            update={
-                "planning_days": [
-                    WeeklyScheduleDay.model_validate(day)
-                    for day in prior_planning_payload
-                ]
-            }
+            ordinary_easy_midpoint_miles=float(
+                payload.get(
+                    "ordinary_easy_midpoint_miles",
+                    sum(typical_easy_distance(daily_states[0])) / 2.0,
+                )
+            ),
+            prior_schedule=prior_replay_schedule,
         )
     replay = build_weekly_schedule(
         daily_states,
@@ -1051,6 +1074,51 @@ def _weekly_plan_shape_is_stale(schedule: WeeklyScheduleResponse) -> bool:
     )
 
 
+def _enrich_saved_schedule_strength(
+    connection: sqlite3.Connection,
+    schedule: WeeklyScheduleResponse,
+    config: dict,
+) -> WeeklyScheduleResponse:
+    """Add display-only lifting guidance without regenerating the run plan."""
+
+    planning_days = load_latest_weekly_planning_days(
+        connection,
+        minimum_planner_version=WEEKLY_WARM_START_MIN_VERSION,
+    )
+    if not planning_days:
+        planning_days = list(schedule.days)
+
+    def days_since(types: set[WorkoutType]) -> float | None:
+        starts = [
+            activity.start_time
+            for day in schedule.trailing_days
+            for activity in day.activities
+            if activity.workout_type in types
+        ]
+        if not starts:
+            return None
+        latest = max(starts)
+        return float((schedule.start_date - latest.date()).days)
+
+    annotated = add_strength_suggestions(
+        planning_days,
+        config,
+        days_since_quality_run=days_since(
+            {
+                WorkoutType.INTERVALS,
+                WorkoutType.TEMPO_THRESHOLD,
+                WorkoutType.RACE,
+            }
+        ),
+        days_since_long_run=days_since({WorkoutType.LONG}),
+    )
+    visible_by_date = {day.date: day for day in annotated[:7]}
+    visible = [visible_by_date.get(day.date, day) for day in schedule.days]
+    return schedule.model_copy(
+        update={"days": visible, "planning_days": annotated}
+    )
+
+
 def _weekly_emergency_alerts_are_stale(
     schedule: WeeklyScheduleResponse,
     local_now: datetime,
@@ -1210,6 +1278,11 @@ def ensure_current_weekly_schedule(
                 config,
                 local_now,
             )
+        current = _enrich_saved_schedule_strength(
+            connection,
+            current,
+            config,
+        )
         if _weekly_emergency_alerts_are_stale(current, local_now, config):
             refreshed = _refresh_saved_schedule_emergency_alerts(
                 connection,

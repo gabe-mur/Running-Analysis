@@ -20,6 +20,10 @@ TAXING_RUN_RESIDUAL_LIMIT = 0.25
 # Below this residue, the effect on an ordinary easy-run distance would be
 # smaller than the prescription's half-mile display precision.
 EASY_VOLUME_RESIDUAL_FLOOR = 0.10
+# Differences smaller than one tenth of an athlete-relative ordinary session
+# cannot justify moving a calendar date. They remain in the recorded training
+# history, but are treated as execution noise at the prescription/upload seam.
+PRESCRIPTION_LOAD_MATERIALITY_UNITS = 0.10
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +37,9 @@ class RecoveryEstimate:
     distance_ratio: float | None
     duration_ratio: float | None
     zone_load_ratio: float | None
+    prescribed_load_low: float | None
+    prescribed_load_high: float | None
+    material_load_deviation: float | None
 
 
 def _weighted_mean(values: list[tuple[float | None, float]]) -> float | None:
@@ -51,6 +58,7 @@ def athlete_relative_session_load(
     performance_response: str = "unknown",
     drift_percent: float | None = None,
     prescribed_intensity_factor: float | None = None,
+    prescribed_distance_range_miles: tuple[float, float] | None = None,
 ) -> tuple[float, dict[str, float | None]]:
     """Measure a completed session against this athlete's ordinary run.
 
@@ -156,12 +164,61 @@ def athlete_relative_session_load(
         and prescribed_intensity_factor > 1.0
         else None
     )
-    load = (
+    observed_or_intensity_floor = (
         max(observed_load, prescribed_load_floor or 0.0)
         * rpe_factor
         * mechanical_factor
         * response_factor
     )
+    prescribed_load_low: float | None = None
+    prescribed_load_high: float | None = None
+    if prescribed_distance_range_miles is not None and typical_distance:
+        prescribed_low, prescribed_high = prescribed_distance_range_miles
+        intensity = max(1.0, prescribed_intensity_factor or 1.0)
+        prescribed_load_low = (
+            max(0.0, prescribed_low) / typical_distance * intensity
+        )
+        prescribed_load_high = max(
+            prescribed_load_low,
+            max(0.0, prescribed_high) / typical_distance * intensity,
+        )
+
+    # A prescribed range is an adherence band, not a point estimate. Calendar
+    # recovery is planned against its supported upper edge so completing any
+    # in-range dose does not become surprise evidence merely because it differs
+    # from the midpoint. A materially easier below-range run remains free to
+    # reduce load; observed intensity, RPE, terrain, drift, or response can
+    # still raise load above the band at any distance.
+    within_or_above_prescribed_distance = bool(
+        prescribed_distance_range_miles is not None
+        and session.distance_miles >= prescribed_distance_range_miles[0]
+    )
+    material_load_deviation: float | None = None
+    if prescribed_load_low is not None and prescribed_load_high is not None:
+        if (
+            observed_or_intensity_floor
+            > prescribed_load_high + PRESCRIPTION_LOAD_MATERIALITY_UNITS
+        ):
+            material_load_deviation = (
+                observed_or_intensity_floor
+                - prescribed_load_high
+                - PRESCRIPTION_LOAD_MATERIALITY_UNITS
+            )
+        elif (
+            not within_or_above_prescribed_distance
+            and observed_or_intensity_floor
+            < prescribed_load_low - PRESCRIPTION_LOAD_MATERIALITY_UNITS
+        ):
+            material_load_deviation = (
+                observed_or_intensity_floor
+                - prescribed_load_low
+                + PRESCRIPTION_LOAD_MATERIALITY_UNITS
+            )
+        else:
+            material_load_deviation = 0.0
+        load = prescribed_load_high + material_load_deviation
+    else:
+        load = observed_or_intensity_floor
     return max(0.10, min(4.0, load)), {
         "distance_ratio": distance_ratio,
         "duration_ratio": duration_ratio,
@@ -171,6 +228,14 @@ def athlete_relative_session_load(
         "response_factor": response_factor,
         "prescribed_intensity_factor": prescribed_intensity_factor,
         "prescribed_load_floor": prescribed_load_floor,
+        "prescribed_load_low": prescribed_load_low,
+        "prescribed_load_high": prescribed_load_high,
+        "load_above_prescribed_band": (
+            max(0.0, observed_or_intensity_floor - prescribed_load_high)
+            if prescribed_load_high is not None
+            else None
+        ),
+        "material_load_deviation": material_load_deviation,
     }
 
 
@@ -354,6 +419,9 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
         ),
         drift_percent=state.last_run_drift_percent,
         prescribed_intensity_factor=state.last_run_prescribed_intensity_factor,
+        prescribed_distance_range_miles=(
+            state.last_run_prescribed_distance_range_miles
+        ),
     )
     elapsed_hours = max(0.0, state.days_since_last_run * 24.0)
     residual = (
@@ -375,4 +443,7 @@ def estimate_recovery(state: FitnessState) -> RecoveryEstimate | None:
         distance_ratio=evidence["distance_ratio"],
         duration_ratio=evidence["duration_ratio"],
         zone_load_ratio=evidence["zone_load_ratio"],
+        prescribed_load_low=evidence["prescribed_load_low"],
+        prescribed_load_high=evidence["prescribed_load_high"],
+        material_load_deviation=evidence["material_load_deviation"],
     )

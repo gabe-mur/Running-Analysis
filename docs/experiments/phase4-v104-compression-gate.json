@@ -1,0 +1,29 @@
+{
+  "baseline": "v104 plus eligible-history baseline, Phase 2 evidence semantics, and bounded far-edge incumbent admission",
+  "status": "failed_daily_churn_gate",
+  "focused_tests": {
+    "passed": 8,
+    "scope": "finalized recovery, target-derived bridge density, opening seam, third-session compression, soft continuation, incumbent admission"
+  },
+  "first_failure": {
+    "occurred_at": "2026-09-22T16:56:47.171127-04:00",
+    "code": "near_term_schedule_churn",
+    "before": {
+      "2026-09-23": "easy",
+      "2026-09-25": "intervals"
+    },
+    "after": {
+      "2026-09-23": "easy",
+      "2026-09-25": "intervals",
+      "2026-09-26": "easy"
+    },
+    "three_day_streak": false,
+    "interpretation": "The bundle delays the first failure by two daily refreshes and the remaining failure is an added allowed back-to-back, not a compression-rule breach. It remains a churn failure and is not waived."
+  },
+  "timing_seconds": {
+    "samples": 4,
+    "median": 12.81117460434325,
+    "max": 14.090501583181322
+  },
+  "decision": "Preserve the Phase 4 prototype for the combined Phase 5 experiment, but do not mark Phase 4 complete until the same daily gate passes after candidate-independent target projection."
+}
