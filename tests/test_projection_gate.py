@@ -300,6 +300,37 @@ def test_distance_only_edit_is_reported_but_does_not_fail_stability() -> None:
     assert report["churn"]["4"]["distance_changes"] == 1
 
 
+def test_material_distance_edit_fails_without_new_evidence() -> None:
+    gate = ProjectionGate(
+        ProjectionGateConfig(enforce_stability=True),
+    )
+    opening = _replan(_session(2))
+    resized = _session(2)
+    resized = ProjectionPlanSession(
+        planned_for=resized.planned_for,
+        workout_type=resized.workout_type,
+        midpoint_miles=2.75,
+    )
+
+    gate.observe(opening)
+    gate.observe(
+        _replan(
+            resized,
+            generated_at=OPENING + timedelta(days=1),
+        )
+    )
+
+    assert gate.failures[-1].code == "no_evidence_distance_churn"
+    assert gate.failures[-1].evidence["distance_changes"] == [
+        {
+            "date": (OPENING + timedelta(days=2)).date().isoformat(),
+            "before_midpoint_miles": 4.0,
+            "after_midpoint_miles": 2.75,
+            "movement_miles": 1.25,
+        }
+    ]
+
+
 def test_same_date_workout_type_change_fails_compliant_stability() -> None:
     gate = ProjectionGate(
         ProjectionGateConfig(enforce_stability=True),

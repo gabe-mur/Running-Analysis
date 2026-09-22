@@ -1120,7 +1120,7 @@ def test_in_range_edge_scenarios_execute_exact_prescription_edges(
         if snapshot.trigger == "post_upload"
     )
     assert comparison.expected_opening_recovery_residual_load is not None
-    assert abs(comparison.recovery_surprise_units or 0.0) <= 0.01
+    assert comparison.recovery_surprise_units == pytest.approx(0.0, abs=1e-4)
 
 
 @pytest.mark.parametrize(

@@ -33,7 +33,7 @@ from run_analysis.projection_gate import (
     ProjectionGateTriggered,
     build_projection_report,
 )
-from run_analysis.weekly_schedule import WEEKLY_PLANNER_VERSION
+from run_analysis.weekly_schedule import WEEKLY_WARM_START_MIN_VERSION
 
 
 def main() -> None:
@@ -183,7 +183,8 @@ def main() -> None:
         )
         if (
             initial_schedule is not None
-            and initial_schedule.planner_version == WEEKLY_PLANNER_VERSION
+            and initial_schedule.planner_version
+            >= WEEKLY_WARM_START_MIN_VERSION
         ):
             initial_schedule = initial_schedule.model_copy(
                 update={
@@ -194,8 +195,12 @@ def main() -> None:
             initial_schedule = None
     gate = ProjectionGate(
         ProjectionGateConfig(
-            enforce_stability=scenario
-            in {"perfect", "in_range_low", "in_range_high"},
+            # Stability is evidence-aware inside ProjectionGate: a miss,
+            # forced rest, overload, or other recorded deviation may justify
+            # a rewrite, while a later exact-compliance upload may not. Keep
+            # this enabled for imperfect scenarios so legitimate disruption
+            # does not grant every subsequent replan a blanket exemption.
+            enforce_stability=True,
             enforce_key_session_cadence=scenario
             in {"perfect", "in_range_low", "in_range_high"},
             require_capacity_progression=(

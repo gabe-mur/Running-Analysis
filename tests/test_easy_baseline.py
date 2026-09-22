@@ -39,7 +39,9 @@ def test_recent_medium_long_completions_prevent_a_circular_baseline_collapse() -
 def test_matched_ordinary_run_clamps_execution_noise_to_prescription() -> None:
     assert ordinary_easy_sample_distance(2.5, "ordinary_easy", (3.5, 4.0)) == 3.5
     assert ordinary_easy_sample_distance(5.0, "ordinary_easy", (3.5, 4.0)) == 4.0
-    assert ordinary_easy_sample_distance(3.8, "ordinary_easy", (3.5, 4.0)) == 3.8
+    assert ordinary_easy_sample_distance(3.5, "ordinary_easy", (3.5, 4.0)) == 3.75
+    assert ordinary_easy_sample_distance(3.8, "ordinary_easy", (3.5, 4.0)) == 3.75
+    assert ordinary_easy_sample_distance(4.0, "ordinary_easy", (3.5, 4.0)) == 3.75
 
 
 def test_unmatched_easy_run_remains_direct_baseline_evidence() -> None:

@@ -75,7 +75,7 @@ def test_yesterday_evening_run_delays_a_morning_slot_without_losing_target() -> 
 def test_yesterday_run_does_not_push_an_evening_slot_to_tomorrow() -> None:
     base = _state(
         as_of=datetime(2026, 8, 25, 19, tzinfo=timezone.utc),
-        days_since_last_run=1.0,
+        days_since_last_run=3.0,
     )
     assert automatic_run_day_offsets(
         base, CurrentHealthStatus.NORMAL, CONFIG, target_run_count=4
@@ -179,6 +179,52 @@ def test_rolling_role_can_run_early_when_deferral_is_materially_worse() -> None:
         CONFIG,
         next_state_options=[next_opportunity],
     ) == "long"
+
+
+def test_role_aware_stability_candidate_replays_prior_workout_purpose() -> None:
+    base = _state(
+        as_of=datetime(2026, 10, 8, 0, tzinfo=timezone.utc),
+        days_since_last_run=1.0,
+        days_since_quality_run=5.7,
+        days_since_long_run=3.7,
+        running_days_28d=12,
+    )
+    states = [
+        base.model_copy(
+            update={
+                "as_of": base.as_of + timedelta(days=offset),
+                "days_since_last_run": 3.0 + offset,
+                "days_since_quality_run": 5.7 + offset,
+                "days_since_long_run": 3.7 + offset,
+            }
+        )
+        for offset in range(7)
+    ]
+    offsets = (0, 3, 5)
+    request = RecommendationRequest(health_status=CurrentHealthStatus.NORMAL)
+
+    ordinary = weekly_schedule._materialize_candidate_sessions(
+        offsets,
+        states,
+        [[state] for state in states],
+        request,
+        CONFIG,
+    )
+    retained = weekly_schedule._materialize_candidate_sessions(
+        offsets,
+        states,
+        [[state] for state in states],
+        request,
+        CONFIG,
+        role_overrides_by_offset={0: "quality", 3: "long"},
+    )
+
+    assert ordinary[0].recommendation.workout_type == WorkoutType.EASY
+    assert (
+        retained[0].recommendation.workout_type
+        in weekly_schedule.QUALITY_WORKOUT_TYPES
+    )
+    assert retained[1].recommendation.workout_type == WorkoutType.LONG
 
 
 def test_seven_day_fallback_never_restores_today_when_recovery_delays_it() -> None:
@@ -1425,6 +1471,34 @@ def test_near_term_refinement_covers_every_leading_finalist() -> None:
     # This is a neighbor of only the third seed. Refining only the numerical
     # leader used to omit it and made the next replan discover it by accident.
     assert (1, 3, 5, 8) in neighbors
+
+
+def test_back_to_back_count_refinement_exposes_adjacent_frequency_plan() -> None:
+    seeds = [(1, 2, 4, 6, 9, 11, 13, 16, 18, 20)]
+
+    neighbors = weekly_schedule._back_to_back_count_refinement_neighbors(
+        seeds,
+        set(range(21)),
+    )
+
+    # The adjacent-frequency beam can miss both the direct deletion and the
+    # locally improved calendar that moves the following workout one day up.
+    assert (1, 4, 6, 9, 11, 13, 16, 18, 20) in neighbors
+    assert (1, 3, 6, 9, 11, 13, 16, 18, 20) in neighbors
+    assert (2, 4, 6, 9, 11, 13, 16, 18, 20) not in neighbors
+
+
+def test_back_to_back_count_refinement_is_near_term_and_bounded() -> None:
+    seeds = [(1, 3, 6, 10, 11, 14, 17, 20)]
+
+    neighbors = weekly_schedule._back_to_back_count_refinement_neighbors(
+        seeds,
+        set(range(21)),
+    )
+
+    # A far-horizon adjacent pair is soft-projection detail and must not open
+    # another cross-frequency neighborhood in the expensive final pass.
+    assert neighbors == []
 
 
 def test_unconstrained_frequency_choice_is_independent_of_prior_warm_start(
@@ -3033,6 +3107,56 @@ def test_future_candidate_pressure_cannot_create_tiny_established_easy_run() -> 
     assert reconciled_midpoint <= 2.2
 
 
+def test_recovery_rounding_boundary_does_not_create_expansion_cliff() -> None:
+    request = RecommendationRequest(health_status=CurrentHealthStatus.NORMAL)
+
+    def allocated_midpoint(residual: float) -> float:
+        opening = _state(typical_easy_run_miles=3.7)
+        run_state = opening.model_copy(
+            update={
+                "as_of": opening.as_of + timedelta(days=1),
+                "recovery_residual_load": residual,
+            }
+        )
+        result = recommend_next_run(
+            run_state,
+            request,
+            CONFIG,
+            weekly_role="easy",
+            allowed_candidates={"easy"},
+        )
+        days = [
+            WeeklyScheduleDay(
+                date=opening.as_of.date(),
+                day_role="rest_day",
+                rationale="Opening rest fixture.",
+            ),
+            WeeklyScheduleDay(
+                date=run_state.as_of.date(),
+                planned_at=run_state.as_of,
+                recommendation=result,
+                day_role="easy_run",
+                rationale="Recovery boundary fixture.",
+            ),
+        ]
+        allocated = _allocate_visible_distance_ranges(
+            days,
+            [opening, run_state],
+            (4.0, 4.5),
+            CONFIG,
+            preserve_projected_recovery_caps=True,
+        )
+        return sum(
+            allocated[1].recommendation.distance_range_miles
+        ) / 2
+
+    morning = allocated_midpoint(0.236)
+    noon = allocated_midpoint(0.177)
+
+    assert abs(morning - noon) <= 0.25
+    assert morning >= 3.5
+
+
 def test_future_first_session_does_not_inherit_same_day_recovery_exception() -> None:
     base = _state(typical_easy_run_miles=4.0)
     states, run_days = _role_days_for_allocation(base, ["easy", "easy"])
@@ -3066,6 +3190,90 @@ def test_future_first_session_does_not_inherit_same_day_recovery_exception() -> 
 
     midpoint = sum(allocated[1].recommendation.distance_range_miles) / 2
     assert midpoint >= weekly_schedule._established_easy_midpoint_floor(base)
+
+
+def test_later_same_day_ready_slot_does_not_inherit_offset_zero_distance_cap() -> None:
+    opening = _state(
+        as_of=datetime(2026, 9, 22, 0, tzinfo=timezone.utc),
+        typical_easy_run_miles=3.7,
+        recovery_residual_load=0.6,
+    )
+    timed = opening.model_copy(
+        update={
+            "as_of": opening.as_of + timedelta(hours=7),
+            "recovery_residual_load": 0.24,
+        }
+    )
+    shortened = RecommendationResponse(
+        generated_at=timed.as_of,
+        fitness_state_as_of=timed.as_of,
+        planned_for=timed.as_of,
+        workout_type=WorkoutType.EASY,
+        title="Recovery-shortened easy run",
+        distance_range_miles=(2.7, 3.2),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    days = [
+        WeeklyScheduleDay(
+            date=opening.as_of.date(),
+            planned_at=timed.as_of,
+            recommendation=shortened,
+            day_role="easy_run",
+            rationale="Later same-day slot fixture.",
+        )
+    ]
+
+    allocation_states = weekly_schedule._allocation_states_at_planned_times(
+        days,
+        [opening],
+        [[timed]],
+    )
+    allocated = _allocate_visible_distance_ranges(
+        days,
+        allocation_states,
+        (4.0, 4.5),
+        CONFIG,
+        prior_distance_midpoints_by_date={opening.as_of.date(): 4.25},
+    )
+
+    assert allocation_states[0] is timed
+    assert sum(allocated[0].recommendation.distance_range_miles) / 2 >= 3.25
+
+
+def test_material_opening_day_caution_still_preserves_shortened_distance() -> None:
+    cautious = _state(
+        typical_easy_run_miles=3.7,
+        current_health_status=CurrentHealthStatus.SICK_OR_RECOVERING,
+    )
+    shortened = RecommendationResponse(
+        generated_at=cautious.as_of,
+        fitness_state_as_of=cautious.as_of,
+        planned_for=cautious.as_of,
+        workout_type=WorkoutType.EASY,
+        title="Health-shortened easy run",
+        distance_range_miles=(2.7, 3.2),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.CAUTION,
+    )
+    days = [
+        WeeklyScheduleDay(
+            date=cautious.as_of.date(),
+            planned_at=cautious.as_of,
+            recommendation=shortened,
+            day_role="easy_run",
+            rationale="Material caution fixture.",
+        )
+    ]
+
+    allocated = _allocate_visible_distance_ranges(
+        days,
+        [cautious],
+        (4.0, 4.5),
+        CONFIG,
+    )
+
+    assert sum(allocated[0].recommendation.distance_range_miles) / 2 == 2.95
 
 
 def test_safe_meaningful_long_is_reserved_before_other_weekly_mileage() -> None:
@@ -3330,6 +3538,35 @@ def test_spare_budget_does_not_make_long_run_guardrail_the_default() -> None:
     # make this lower-frequency candidate balance arithmetically.
     assert long_midpoint == 8.5
     assert total_midpoint < 22.0
+
+
+def test_allocator_preserves_progression_after_8_45_mile_long() -> None:
+    """A current long-run baseline must not regress to an old absolute floor."""
+
+    base = _state(
+        longest_run_30d_miles=8.45,
+        retained_long_run_capacity_miles=8.45,
+        days_since_last_run=3.0,
+        days_since_long_run=8.0,
+        days_since_quality_run=3.0,
+        typical_easy_run_miles=3.9,
+        running_days_28d=12,
+    )
+    states, days = _role_days_for_allocation(
+        base, ["long", "easy", "quality"]
+    )
+
+    allocated = _allocate_visible_distance_ranges(
+        days,
+        states,
+        (17.1, 18.2),
+        CONFIG,
+        weekly_target_range=(17.1, 18.2),
+    )
+
+    planned_long = allocated[0].recommendation
+    assert planned_long.workout_type == WorkoutType.LONG
+    assert sum(planned_long.distance_range_miles) / 2 >= 8.5
 
 
 def test_joint_allocator_scales_long_distinction_for_higher_mileage_runner() -> None:
@@ -5092,6 +5329,72 @@ def test_finalized_program_recovery_prices_allocated_distance() -> None:
     assert enlarged_cost > ordinary_cost
 
 
+def test_finalized_recovery_is_invariant_when_same_day_run_becomes_offset_zero() -> None:
+    run_at = datetime(2026, 9, 22, 7, tzinfo=timezone.utc)
+    session_state = _state(
+        as_of=run_at,
+        last_run=None,
+        days_since_last_run=None,
+        recovery_residual_load=0.24,
+        typical_easy_run_miles=3.7,
+    )
+    session_state = session_state.model_copy(
+        update={
+            "recent_load": session_state.recent_load.model_copy(
+                update={
+                    "continuous_distance_miles": None,
+                    "continuous_short_term_distance_miles": 12.0,
+                }
+            )
+        }
+    )
+    monday_opening = session_state.model_copy(
+        update={"as_of": run_at - timedelta(hours=31)}
+    )
+    tuesday_opening = session_state.model_copy(
+        update={"as_of": run_at - timedelta(hours=7)}
+    )
+    recommendation = RecommendationResponse(
+        generated_at=run_at,
+        fitness_state_as_of=run_at,
+        planned_for=run_at,
+        workout_type=WorkoutType.EASY,
+        title="Same absolute workout",
+        distance_range_miles=(4.0, 4.5),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    rest = WeeklyScheduleDay(
+        date=monday_opening.as_of.date(),
+        day_role="rest_day",
+        rationale="Pre-rollover opening day.",
+    )
+    run = WeeklyScheduleDay(
+        date=run_at.date(),
+        planned_at=run_at,
+        recommendation=recommendation,
+        day_role="easy_run",
+        rationale="Same absolute workout.",
+    )
+
+    before_rollover = _finalized_program_recovery_cost(
+        [rest, run],
+        [monday_opening, session_state],
+        CONFIG,
+        (17.0, 18.0),
+        session_states=[monday_opening, session_state],
+    )
+    after_rollover = _finalized_program_recovery_cost(
+        [run],
+        [tuesday_opening],
+        CONFIG,
+        (17.0, 18.0),
+        session_states=[session_state],
+    )
+
+    assert after_rollover == pytest.approx(before_rollover)
+
+
 def test_finalized_program_prices_committed_short_term_density() -> None:
     base = _state(days_since_last_run=4.0, running_days_28d=12)
     base = base.model_copy(
@@ -5303,6 +5606,45 @@ def test_future_candidate_only_caution_preserves_projected_recovery_size(monkeyp
 
     midpoint = sum(sessions[0].recommendation.distance_range_miles) / 2
     assert midpoint == 2.0
+
+
+def test_materialized_session_retains_reconciled_distance_range(monkeypatch) -> None:
+    base = _state(typical_easy_run_miles=4.0)
+    states = [
+        base.model_copy(update={"as_of": base.as_of + timedelta(days=offset)})
+        for offset in range(3)
+    ]
+    draft = RecommendationResponse(
+        generated_at=states[1].as_of,
+        fitness_state_as_of=states[1].as_of,
+        planned_for=states[1].as_of,
+        workout_type=WorkoutType.EASY,
+        title="Draft easy candidate",
+        distance_range_miles=(3.5, 4.0),
+        confidence=ConfidenceLevel.MODERATE,
+        readiness=ReadinessFlag.READY,
+    )
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_elapsed_workout_role",
+        lambda *args, **kwargs: "easy",
+    )
+    monkeypatch.setattr(
+        weekly_schedule,
+        "_select_budgeted_timed_recommendation",
+        lambda *args, **kwargs: (states[1], draft),
+    )
+
+    sessions = weekly_schedule._materialize_candidate_sessions(
+        (1,),
+        states,
+        [[state] for state in states],
+        RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
+        CONFIG,
+        projected_distance_ranges={1: (4.2, 4.8)},
+    )
+
+    assert sessions[0].recommendation.distance_range_miles == (4.2, 4.8)
 
 
 def test_race_inside_horizon_is_scheduled_without_previous_day_compression() -> None:

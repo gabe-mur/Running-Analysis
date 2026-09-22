@@ -31,6 +31,14 @@ def ordinary_easy_sample_distance(
         return None
     if planning_role == "ordinary_easy" and prescribed_range_miles is not None:
         low, high = prescribed_range_miles
+        low = max(0.0, low)
+        high = max(low, high)
+        if low <= actual_distance_miles <= high:
+            # Every value in the prescription band is equally compliant. If
+            # the baseline learns the exact low/high-edge execution, that
+            # value changes the athlete-relative recovery denominator and can
+            # rewrite the calendar despite no material new evidence.
+            return (low + high) / 2.0
         return min(max(actual_distance_miles, low), high)
     return actual_distance_miles
 

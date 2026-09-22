@@ -998,6 +998,8 @@ class PlannerScoreBreakdown(ApiModel):
     long_shape_violation: float | None = None
     medium_long_shape_violation: float | None = None
     allocation_trace: list[str] = Field(default_factory=list)
+    projected_state_trace: list[str] = Field(default_factory=list)
+    recovery_cost_components: dict[str, float] = Field(default_factory=dict)
 
 
 class PlannerDiagnostics(ApiModel):

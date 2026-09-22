@@ -218,6 +218,10 @@ class ProjectionReplan:
     boundary_session_miles: float | None = None
     opening_continuous_distance_miles: float | None = None
     opening_short_term_distance_miles: float | None = None
+    expected_opening_continuous_distance_miles: float | None = None
+    expected_opening_short_term_distance_miles: float | None = None
+    continuous_distance_surprise_miles: float | None = None
+    short_term_distance_surprise_miles: float | None = None
     peak_projected_continuous_mileage_rate: float | None = None
     planning_seconds: float | None = None
     target_trajectory: tuple[tuple[float, float], ...] = ()
@@ -235,6 +239,16 @@ class ProjectionReplan:
     cadence_exception_reasons: tuple[str, ...] = ()
     trigger: str = "scheduled_refresh"
     source_activity_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedOpeningState:
+    """Planner state projected before a committed completion is observed."""
+
+    as_of: datetime
+    recovery_residual_load: float | None
+    continuous_distance_miles: float | None
+    continuous_short_term_distance_miles: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1102,7 +1116,7 @@ def simulate_adherence(
     scheduled_execution_count = 0
     deterministic_candidate_count = 0
     deterministic_trigger_complete = False
-    expected_openings: dict[datetime, tuple[datetime, float | None]] = {}
+    expected_openings: dict[datetime, _ExpectedOpeningState] = {}
     overload_trigger_date: date | None = None
     unscheduled_overload_complete = False
     candidate_hours = sorted(
@@ -1209,7 +1223,7 @@ def simulate_adherence(
         upload_at: datetime,
         source_activity_at: datetime,
         prior_schedule: WeeklyScheduleResponse,
-        expected_opening: tuple[datetime, float | None] | None,
+        expected_opening: _ExpectedOpeningState | None,
     ) -> tuple[WeeklyScheduleResponse, ProjectionReplan]:
         """Regenerate from uploaded evidence before the next clock refresh.
 
@@ -1371,12 +1385,30 @@ def simulate_adherence(
             else daily_states[0].recent_load.acute_distance_to_capacity_ratio
         )
         expected_state_at = (
-            expected_opening[0] if expected_opening is not None else None
+            expected_opening.as_of if expected_opening is not None else None
         )
         expected_recovery_residual = (
-            expected_opening[1] if expected_opening is not None else None
+            expected_opening.recovery_residual_load
+            if expected_opening is not None
+            else None
+        )
+        expected_continuous_distance = (
+            expected_opening.continuous_distance_miles
+            if expected_opening is not None
+            else None
+        )
+        expected_short_term_distance = (
+            expected_opening.continuous_short_term_distance_miles
+            if expected_opening is not None
+            else None
         )
         actual_recovery_residual = daily_states[0].recovery_residual_load
+        actual_continuous_distance = (
+            daily_states[0].recent_load.continuous_distance_miles
+        )
+        actual_short_term_distance = (
+            daily_states[0].recent_load.continuous_short_term_distance_miles
+        )
         recovery_surprise = (
             actual_recovery_residual - expected_recovery_residual
             if actual_recovery_residual is not None
@@ -1423,6 +1455,26 @@ def simulate_adherence(
             ),
             opening_short_term_distance_miles=(
                 daily_states[0].recent_load.continuous_short_term_distance_miles
+            ),
+            expected_opening_continuous_distance_miles=(
+                expected_continuous_distance
+            ),
+            expected_opening_short_term_distance_miles=(
+                expected_short_term_distance
+            ),
+            continuous_distance_surprise_miles=(
+                actual_continuous_distance - expected_continuous_distance
+                if actual_continuous_distance is not None
+                and expected_continuous_distance is not None
+                and expected_state_at == daily_states[0].as_of
+                else None
+            ),
+            short_term_distance_surprise_miles=(
+                actual_short_term_distance - expected_short_term_distance
+                if actual_short_term_distance is not None
+                and expected_short_term_distance is not None
+                and expected_state_at == daily_states[0].as_of
+                else None
             ),
             peak_projected_continuous_mileage_rate=(
                 schedule.peak_projected_continuous_mileage_rate
@@ -1694,12 +1746,30 @@ def simulate_adherence(
         )
         expected_opening = expected_openings.pop(plan_start, None)
         expected_state_at = (
-            expected_opening[0] if expected_opening is not None else None
+            expected_opening.as_of if expected_opening is not None else None
         )
         expected_recovery_residual = (
-            expected_opening[1] if expected_opening is not None else None
+            expected_opening.recovery_residual_load
+            if expected_opening is not None
+            else None
+        )
+        expected_continuous_distance = (
+            expected_opening.continuous_distance_miles
+            if expected_opening is not None
+            else None
+        )
+        expected_short_term_distance = (
+            expected_opening.continuous_short_term_distance_miles
+            if expected_opening is not None
+            else None
         )
         actual_recovery_residual = daily_states[0].recovery_residual_load
+        actual_continuous_distance = (
+            daily_states[0].recent_load.continuous_distance_miles
+        )
+        actual_short_term_distance = (
+            daily_states[0].recent_load.continuous_short_term_distance_miles
+        )
         recovery_surprise = (
             actual_recovery_residual - expected_recovery_residual
             if actual_recovery_residual is not None
@@ -1756,6 +1826,26 @@ def simulate_adherence(
                 daily_states[0]
                 .recent_load
                 .continuous_short_term_distance_miles
+            ),
+            expected_opening_continuous_distance_miles=(
+                expected_continuous_distance
+            ),
+            expected_opening_short_term_distance_miles=(
+                expected_short_term_distance
+            ),
+            continuous_distance_surprise_miles=(
+                actual_continuous_distance - expected_continuous_distance
+                if actual_continuous_distance is not None
+                and expected_continuous_distance is not None
+                and expected_state_at == daily_states[0].as_of
+                else None
+            ),
+            short_term_distance_surprise_miles=(
+                actual_short_term_distance - expected_short_term_distance
+                if actual_short_term_distance is not None
+                and expected_short_term_distance is not None
+                and expected_state_at == daily_states[0].as_of
+                else None
             ),
             peak_projected_continuous_mileage_rate=(
                 schedule.peak_projected_continuous_mileage_rate
@@ -1900,9 +1990,17 @@ def simulate_adherence(
                     )
                 ),
             )
-            expected_openings[next_plan_start] = (
-                expected_state.as_of,
-                expected_state.recovery_residual_load,
+            expected_openings[next_plan_start] = _ExpectedOpeningState(
+                as_of=expected_state.as_of,
+                recovery_residual_load=expected_state.recovery_residual_load,
+                continuous_distance_miles=(
+                    expected_state.recent_load.continuous_distance_miles
+                ),
+                continuous_short_term_distance_miles=(
+                    expected_state
+                    .recent_load
+                    .continuous_short_term_distance_miles
+                ),
             )
         for item in committed:
             if not item.distance_range_miles or not item.planned_for:
@@ -2246,9 +2344,21 @@ def simulate_adherence(
                         upload_at=upload_at,
                         source_activity_at=item.planned_for,
                         prior_schedule=previous_schedule,
-                        expected_opening=(
-                            expected_state.as_of,
-                            expected_state.recovery_residual_load,
+                        expected_opening=_ExpectedOpeningState(
+                            as_of=expected_state.as_of,
+                            recovery_residual_load=(
+                                expected_state.recovery_residual_load
+                            ),
+                            continuous_distance_miles=(
+                                expected_state
+                                .recent_load
+                                .continuous_distance_miles
+                            ),
+                            continuous_short_term_distance_miles=(
+                                expected_state
+                                .recent_load
+                                .continuous_short_term_distance_miles
+                            ),
                         ),
                     )
                 )

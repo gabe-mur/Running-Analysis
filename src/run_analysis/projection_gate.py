@@ -29,6 +29,7 @@ class ProjectionGateConfig:
     funding_rounding_tolerance_miles: float = 0.5
     peak_load_rounding_tolerance_miles: float = 0.5
     stability_horizon_days: int = 4
+    distance_stability_tolerance_miles: float = 0.5
     recovery_surprise_tolerance_units: float = 0.01
     enforce_stability: bool = False
     enforce_key_session_cadence: bool = False
@@ -105,6 +106,52 @@ def _future_schedule_changes(
         if before[value] != after[value]
     )
     return date_changes, type_changes
+
+
+def _future_distance_changes(
+    previous: ProjectionReplan,
+    current: ProjectionReplan,
+    *,
+    horizon_days: int,
+    tolerance_miles: float,
+) -> list[dict[str, float | str]]:
+    """Return material same-date, same-workout dose rewrites."""
+
+    window_start = (
+        current.decision_start_date
+        if current.trigger == "post_upload"
+        and current.decision_start_date is not None
+        else current.generated_at.date() + timedelta(days=1)
+    )
+    window_end = window_start + timedelta(days=horizon_days)
+
+    def by_date(replan: ProjectionReplan) -> dict[date, Any]:
+        return {
+            item.planned_for.date(): item
+            for item in replan.planned_sessions
+            if window_start <= item.planned_for.date() < window_end
+        }
+
+    before = by_date(previous)
+    after = by_date(current)
+    changes: list[dict[str, float | str]] = []
+    for plan_date in sorted(set(before) & set(after)):
+        old = before[plan_date]
+        new = after[plan_date]
+        if old.workout_type != new.workout_type:
+            continue
+        movement = abs(new.midpoint_miles - old.midpoint_miles)
+        if movement <= max(0.0, tolerance_miles) + 1e-9:
+            continue
+        changes.append(
+            {
+                "date": plan_date.isoformat(),
+                "before_midpoint_miles": old.midpoint_miles,
+                "after_midpoint_miles": new.midpoint_miles,
+                "movement_miles": movement,
+            }
+        )
+    return changes
 
 
 def evaluate_replan_regressions(
@@ -387,6 +434,47 @@ class ProjectionGate:
                             "horizon_days": self.config.stability_horizon_days,
                             "date_changes": date_changes,
                             "workout_type_changes": type_changes,
+                            "material_evidence_reasons": list(
+                                replan.material_evidence_reasons
+                            ),
+                        },
+                    )
+                )
+            distance_changes = _future_distance_changes(
+                previous,
+                replan,
+                horizon_days=self.config.stability_horizon_days,
+                tolerance_miles=(
+                    self.config.distance_stability_tolerance_miles
+                ),
+            )
+            if distance_changes and not replan.material_evidence_reasons:
+                new_failures.append(
+                    ProjectionGateFailure(
+                        code=(
+                            "compliant_upload_distance_churn"
+                            if replan.trigger == "post_upload"
+                            else "no_evidence_distance_churn"
+                        ),
+                        occurred_at=replan.generated_at,
+                        detail=(
+                            "Compliant upload materially changed near-term "
+                            "run distance."
+                            if replan.trigger == "post_upload"
+                            else "No-new-evidence refresh materially changed "
+                            "near-term run distance."
+                        ),
+                        evidence={
+                            "transition": (
+                                f"{previous.trigger}->{replan.trigger}"
+                            ),
+                            "horizon_days": (
+                                self.config.stability_horizon_days
+                            ),
+                            "distance_tolerance_miles": (
+                                self.config.distance_stability_tolerance_miles
+                            ),
+                            "distance_changes": distance_changes,
                             "material_evidence_reasons": list(
                                 replan.material_evidence_reasons
                             ),
