@@ -143,7 +143,7 @@ def _setup_config(**overrides) -> dict:
         "resting_hr": 49,
         "target_hr": 145,
         "zones": {"z1": [128, 140], "z2": [141, 153], "z3": [154, 166], "z4": [167, 180], "z5": [181, 194]},
-        "profile": {"birth_date": "1995-11-28", "sex": "male", "weight_lb": 140.0},
+        "profile": {"birth_date": "1995-11-28", "sex": "male", "weight_lb": 140.0, "height_in": 70},
         "coaching": {"training_goal": "general_fitness"},
         "weather": {"historical_enabled": False, "forecast_enabled": False, "privacy_jitter_radius_km": 2.0},
     }
@@ -183,9 +183,34 @@ def test_confirming_every_step_completes_setup() -> None:
     assert setup_state(connection, config).complete
 
 
-def test_no_runs_is_reported_as_blocking() -> None:
-    """Nothing downstream can be judged without data, so this step is not
-    merely incomplete -- it is the one that stops everything else."""
+def test_adaptive_progression_requires_confirmation_not_just_defaults() -> None:
+    from run_analysis.onboarding import SetupStep, setup_state
+
+    connection = sqlite3.connect(':memory:')
+    _activities(connection, 12)
+    config = _setup_config(
+        adaptive_planner={'engine': 'adaptive_frequency_v3'},
+        setup={'confirmed_steps': [s.value for s in SetupStep if s != SetupStep.PROGRESSION]},
+    )
+    state = setup_state(connection, config)
+    assert not state.complete
+    assert state.next_step.step == SetupStep.PROGRESSION
+    config['setup']['confirmed_steps'].append('progression')
+    assert setup_state(connection, config).complete
+
+
+def test_legacy_setup_does_not_require_adaptive_preferences() -> None:
+    from run_analysis.onboarding import SetupStep, setup_state
+
+    connection = sqlite3.connect(':memory:')
+    _activities(connection, 12)
+    config = _setup_config(setup={'confirmed_steps': [s.value for s in SetupStep if s != SetupStep.PROGRESSION]})
+    state = setup_state(connection, config)
+    assert state.complete
+    assert all(s.step != SetupStep.PROGRESSION for s in state.steps)
+
+
+def test_no_runs_blocks_analysis_but_not_personal_calibration() -> None:
     from run_analysis.onboarding import SetupStep, setup_state
 
     connection = sqlite3.connect(":memory:")
@@ -193,17 +218,33 @@ def test_no_runs_is_reported_as_blocking() -> None:
     state = setup_state(connection, _setup_config())
     runs = next(step for step in state.steps if step.step == SetupStep.RUNS)
     assert not runs.complete and runs.blocking
-    assert state.next_step.step == SetupStep.RUNS
+    assert state.next_step.step == SetupStep.HEART_RATE
+    assert '10–30' not in runs.detail
 
 
-def test_a_comparison_heart_rate_outside_z2_is_called_out() -> None:
+def test_new_athlete_enters_profile_and_zones_before_running_history() -> None:
+    from run_analysis.onboarding import SetupStep, setup_state
+
+    connection = sqlite3.connect(':memory:')
+    _activities(connection, 0)
+    config = _setup_config(profile=None)
+    state = setup_state(connection, config)
+    assert state.next_step.step == SetupStep.PROFILE
+    assert [step.step for step in state.steps][:3] == [SetupStep.PROFILE, SetupStep.HEART_RATE, SetupStep.ZONES]
+    config.update(profile=_setup_config()['profile'], setup={'confirmed_steps': [s.value for s in SetupStep]})
+    assert setup_state(connection, config).next_step.step == SetupStep.RUNS
+
+
+def test_comparison_heart_rate_is_not_a_user_setup_step() -> None:
     from run_analysis.onboarding import SetupStep, setup_state
 
     connection = sqlite3.connect(":memory:")
     _activities(connection, 12)
-    state = setup_state(connection, _setup_config(target_hr=170))
-    step = next(item for item in state.steps if item.step == SetupStep.COMPARISON_HR)
-    assert "outside your Z2" in step.detail
+    config = _setup_config(setup={'confirmed_steps':[s.value for s in SetupStep
+        if s not in {SetupStep.COMPARISON_HR,SetupStep.PROGRESSION}]})
+    state = setup_state(connection, config)
+    assert state.complete
+    assert all(item.step != SetupStep.COMPARISON_HR for item in state.steps)
 
 
 def test_an_estimated_max_says_it_is_the_largest_error_source() -> None:

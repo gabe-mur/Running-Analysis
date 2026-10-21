@@ -1,5 +1,62 @@
 # Modeling methodology: published references, moving fitness
 
+## Active pace estimate — 2026-10-13
+
+`aerobic-v11-observed-comparable-pace` supersedes the HR/time/environmental
+corrections described in the historical sections below. The primary estimate
+now robustly aggregates **recorded speed in the configured Z2 range**, weighted
+toward the automatic comparison HR and established reference portion of the
+run. It does not transform pace to an exact HR, minute, flat course or cool day.
+The benchmark also uses observed pace. Weather is optional context, not an
+eligibility requirement. Sensor, stop/restart, reference-position and
+quality-session comparability checks remain; quality workouts do not inform the
+steady aerobic trend. API field names are retained for compatibility, with
+`pace_basis=observed_comparable` distinguishing the revised meaning.
+
+The dated audit and limitations are in `docs/pace_adjustment_validation.md`.
+Old correction helpers remain solely for reproducible diagnostic tests; they
+are not called by primary scoring or used to calibrate a hidden correction.
+Trend ranges describe observed variability, not every unmeasured bias.
+
+Weather attribution is a separate, read-only research prototype in
+`src/run_analysis/weather_impact.py`. Run `python -m scripts.audit_weather_impact`
+to inspect measured performance/weather associations and their temporal
+confounding checks; see `docs/pace_adjustment_validation.md` for the fixed
+contract, results and limitations. It does not apply corrections to Progress.
+
+The broader `performance-factors-v1` prototype in
+`src/run_analysis/performance_factors.py` analyzes available weather, terrain,
+duration, training history, workout type, local time, device and reported-health
+context jointly. Optional missing context does not discard the whole run; the
+first audit retains 133 runs. Source-resolved feedback is retained separately,
+not mistaken for pre-run readiness. Run `python -m scripts.audit_performance_factors`
+for the read-only report. It estimates associations, not automatic pace credits,
+and does not change the released model or planner.
+
+Acceptance is pragmatic: a defensible provisional estimate can be useful without
+100% individual validation or a statistically significant result. Temporal
+confounding and held-out checks inform confidence and scope, rather than acting
+as a blanket ban on normalization. The historical rationale below must not be
+read as proof that weather/HR/terrain cannot be modeled. See the dated broader
+factor-analysis section in `docs/pace_adjustment_validation.md` for assumptions,
+sensitivity results and the distinction between associations and pace correction.
+
+There is now a usable, separate `comparable-pace-v1` preview at
+`/#pace-comparison`. It combines HRR-based athlete calibration, uphill/downhill
+energy cost, directional wind, within-run drift and shade heat/humidity, retaining
+recorded pace and each correction contribution. Published relationships supply
+broad priors instead of requiring many exact matching sessions. Missing context
+adds uncertainty rather than excluding the whole run. It uses more reliable
+submaximal sections than the main observed model, so its recorded comparison
+is a matched-sample baseline, not necessarily the main Progress headline.
+
+This preview is read-only and does not replace the active estimate described
+above, the VO2 calculation or planner inputs. Its modest between-run comparison
+gain and worse within-run conditional prediction are both documented; neither
+is suppressed or confused with physiological validation. Exact priors, bounds,
+engineering uncertainty allowances and primary-source limitations are recorded
+in the dated usable-preview section of `docs/pace_adjustment_validation.md`.
+
 ## Why the model changed
 
 Fitness is not a fixed nuisance variable. It changes over the same chronology as
@@ -820,8 +877,5 @@ precedence over a split.
 - Riegel (1981). [Athletic records and human endurance](https://pubmed.ncbi.nlm.nih.gov/7272663/).
 - Vickers & Vertosick (2016). [An empirical study of race times in recreational
   endurance runners](https://doi.org/10.1186/s13102-016-0052-y).
-- NHS. [Couch to 5K running plan](https://www.nhs.uk/better-health/get-active/get-running-with-couch-to-5k/).
-- New York Road Runners. [5K low-mileage plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/5k-training-plan_low-2020-5k-pr-series_2-rd5.pdf),
-  [10K beginner plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/10k_training_plan_beginner_rd41.pdf),
-  [half-marathon conservative plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/hm-training-plan_conservative-rd1.pdf), and
-  [marathon conservative plan](https://webassets.nyrr.org/nyrrsitecoreblob/nyrr/pdf/training-guides/2024/nyrr-marathon-conservative-training-plan_rd5.pdf).
+- Our [downstream training-policy inferences](training_policy_inferences.md)
+  distinguish coaching assumptions from physiological or fitted thresholds.

@@ -23,6 +23,47 @@ from run_analysis.web.schemas import (
 )
 
 
+@pytest.mark.parametrize("sort_by,order,expected", [
+    ("date", "desc", [3, 2, 1]),
+    ("distance", "desc", [2, 3, 1]),
+    ("pace", "asc", [2, 1, 3]),
+    ("pace", "desc", [1, 2, 3]),
+    ("heart_rate", "asc", [1, 2, 3]),
+    ("temperature", "asc", [2, 1, 3]),
+    ("temperature", "desc", [1, 2, 3]),
+    ("assessment", "asc", [2, 3, 1]),
+    ("assessment", "desc", [1, 3, 2]),
+    ("data", "asc", [2, 1, 3]),
+    ("data", "desc", [3, 1, 2]),
+])
+def test_run_column_sorting_before_pagination(tmp_path, monkeypatch, sort_by, order, expected):
+    from run_analysis.web.schemas import RunSummary
+    _write_config(tmp_path)
+    database = tmp_path / "data/test.sqlite"
+    database.parent.mkdir(parents=True)
+    with connect(database) as connection:
+        initialize(connection)
+    runs = [RunSummary(
+        activity_id=index, activity_uid=str(index),
+        start_time=datetime(2026, 10, index, tzinfo=timezone.utc),
+        distance_miles=distance, moving_pace_min_mile=pace,
+        average_hr_bpm=hr, temperature_f=temperature,
+        gps_quality="gps_complete", assessment_label=assessment,
+        workout_type="easy", health_tag="normal", data_quality=quality,
+    ) for index, distance, pace, hr, temperature, assessment, quality in [
+        (1, 3, 10, 140, 70, "Zulu", "poor"),
+        (2, 5, 9, 150, 50, "alpha", "good"),
+        (3, 4, None, None, None, "Beta", "partial"),
+    ]]
+    monkeypatch.setattr("run_analysis.web.app.list_runs", lambda *args, **kwargs: runs.copy())
+    with TestClient(create_app(project_root=tmp_path)) as client:
+        result = client.get(f"/api/runs?sort_by={sort_by}&sort_order={order}")
+        assert result.status_code == 200
+        assert [run["activity_id"] for run in result.json()] == expected
+        page = client.get(f"/api/runs?sort_by={sort_by}&sort_order={order}&offset=1&limit=1")
+        assert [run["activity_id"] for run in page.json()] == expected[1:2]
+
+
 def _write_config(root: Path, database: str = "data/test.sqlite") -> None:
     (root / "config.yaml").write_text(
         """

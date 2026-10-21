@@ -8,6 +8,18 @@ let runFilters = { flag: "", sort_by: "date", sort_order: "desc", date_from: "",
 //: How many runs a page adds. Kept as a page size rather than a growing
 //: limit, because "load more" now fetches only the next page and appends it.
 const RUN_PAGE_SIZE = 100;
+const sortColumns = [
+  ["date", "Run Date"], ["distance", "Distance"], ["pace", "Pace and HR"],
+  ["standardized", "Adjusted pace"], ["temperature", "Conditions"],
+  ["assessment", "Assessment"], ["data", "Data"],
+];
+const alphabeticalSorts = new Set(["assessment", "data"]);
+
+function sortHeading(key, label) {
+  const active = runFilters.sort_by === key;
+  const direction = runFilters.sort_order === "asc" ? "ascending" : "descending";
+  return `<button type="button" class="run-sort-heading" data-sort="${key}" aria-pressed="${active}" aria-label="Sort by ${label}${active ? `, ${direction}` : ""}">${label}${active ? `<span aria-hidden="true">${runFilters.sort_order === "asc" ? "↑" : "↓"}</span>` : ""}</button>`;
+}
 
 function runQuery(offset) {
   const query = new URLSearchParams({
@@ -46,13 +58,26 @@ export async function renderRuns() {
   view.innerHTML = `
     <section class="page">
       <div class="page-heading"><div><p class="eyebrow">History</p><h1>Run analysis</h1><p><span id="run-count">${runs.length}</span> activities shown. Open any run for the full analysis.</p></div></div>
-      <form id="run-filters" class="filter-bar"><label>Show<select name="flag"><option value="">All activities</option><option value="easy">Easy</option><option value="hard">Hard</option><option value="long">Long</option><option value="illness">Illness / abnormal</option><option value="no_gps">No GPS</option><option value="excluded">Excluded</option></select></label><label>From<input type="date" name="date_from" value="${runFilters.date_from}"></label><label>To<input type="date" name="date_to" value="${runFilters.date_to}"></label><label>Sort<select name="sort_by"><option value="date">Date</option><option value="distance">Distance</option><option value="pace">Moving pace</option><option value="heart_rate">Average HR</option><option value="standardized">Adjusted pace at ${targetHrLabel()}</option></select></label><label>Order<select name="sort_order"><option value="desc">Newest / highest first</option><option value="asc">Oldest / lowest first</option></select></label><button type="submit">Apply</button></form>
-      <div class="run-table-heading"><span>Run</span><span>Distance</span><span>Pace and HR</span><span>Adjusted pace</span><span>Conditions</span><span>Assessment</span><span>Data</span></div>
+      <form id="run-filters" class="filter-bar"><label>Show<select name="flag"><option value="">All activities</option><option value="easy">Easy</option><option value="hard">Hard</option><option value="long">Long</option><option value="illness">Illness / abnormal</option><option value="no_gps">No GPS</option><option value="excluded">Excluded</option></select></label><label>From<input type="date" name="date_from" value="${runFilters.date_from}"></label><label>To<input type="date" name="date_to" value="${runFilters.date_to}"></label><label>Sort<select name="sort_by"><option value="date">Run Date</option><option value="distance">Distance</option><option value="pace">Moving pace</option><option value="heart_rate">Average HR</option><option value="standardized">Adjusted pace at ${targetHrLabel()}</option><option value="temperature">Conditions (temperature)</option><option value="assessment">Assessment</option><option value="data">Data</option></select></label><label>Order<select name="sort_order"><option value="desc">Descending</option><option value="asc">Ascending</option></select></label><button type="submit">Apply</button></form>
+      <div class="run-table-heading">${sortColumns.map(([key, label]) => sortHeading(key, label)).join("")}</div>
       <div class="run-table">${rows || '<div class="empty-state">No runs match these filters.</div>'}</div>
       ${runs.length === RUN_PAGE_SIZE ? `<button id="load-more-runs" class="load-more" type="button">Load ${RUN_PAGE_SIZE} more</button>` : ""}
     </section>`;
   const form = view.querySelector("#run-filters");
   form.flag.value = runFilters.flag; form.sort_by.value = runFilters.sort_by; form.sort_order.value = runFilters.sort_order;
+  const updateOrderLabels = () => {
+    const key = form.sort_by.value;
+    const labels = alphabeticalSorts.has(key) ? ["Z–A", "A–Z"] : key === "date" ? ["Newest first", "Oldest first"] : ["Highest first", "Lowest first"];
+    [...form.sort_order.options].forEach((option, index) => { option.textContent = labels[index]; });
+  };
+  updateOrderLabels();
+  form.sort_by.addEventListener("change", updateOrderLabels);
+  view.querySelectorAll("[data-sort]").forEach(button => button.addEventListener("click", () => {
+    const key = button.dataset.sort;
+    const order = key === runFilters.sort_by ? (runFilters.sort_order === "asc" ? "desc" : "asc") : alphabeticalSorts.has(key) || ["pace", "standardized"].includes(key) ? "asc" : "desc";
+    runFilters = { ...Object.fromEntries(new FormData(form).entries()), sort_by: key, sort_order: order };
+    renderRuns();
+  }));
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     runFilters = Object.fromEntries(new FormData(form).entries());

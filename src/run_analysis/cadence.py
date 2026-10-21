@@ -27,6 +27,10 @@ ONE_SIDED_CADENCE_SOURCE = "run_cadence_extension"
 #: each of those runs as a walk and drop them from the model.
 FIT_ONE_SIDED_CADENCE_SOURCE = "fit_record_cadence"
 
+# GPX exporters use cadence for steps, strides or pedal revolutions. Preserve
+# the raw reading without classifying running vs walking from ambiguous units.
+GPX_UNSPECIFIED_CADENCE_SOURCE = "gpx_cadence_unspecified"
+
 #: Sources whose recorded value must be doubled to become total steps/minute.
 _ONE_SIDED_SOURCES = frozenset({ONE_SIDED_CADENCE_SOURCE, FIT_ONE_SIDED_CADENCE_SOURCE})
 
@@ -39,7 +43,7 @@ def cadence_spm(recorded: float | int | None, source: str | None) -> float | Non
     instead of dragging averages down.
     """
 
-    if recorded is None:
+    if recorded is None or source == GPX_UNSPECIFIED_CADENCE_SOURCE:
         return None
     value = float(recorded)
     if value <= 0:

@@ -1,0 +1,20 @@
+import AppKit
+
+let image = NSImage(size:NSSize(width:1024,height:1024))
+image.lockFocus()
+let background = NSBezierPath(roundedRect:NSRect(x:36,y:36,width:952,height:952),xRadius:210,yRadius:210)
+NSColor(calibratedRed:0.045,green:0.075,blue:0.10,alpha:1).setFill()
+background.fill()
+NSColor(calibratedRed:0.23,green:0.48,blue:0.42,alpha:1).setStroke()
+background.lineWidth = 16; background.stroke()
+let font = NSFont.systemFont(ofSize:410,weight:.bold)
+let text = NSAttributedString(string:"RC",attributes:[.font:font,.foregroundColor:NSColor(calibratedRed:0.47,green:0.83,blue:0.70,alpha:1)])
+text.draw(at:NSPoint(x:(1024-text.size().width)/2,y:(1024-text.size().height)/2+16))
+let route = NSBezierPath()
+route.move(to:NSPoint(x:260,y:260));route.line(to:NSPoint(x:398,y:260));route.line(to:NSPoint(x:467,y:325))
+route.line(to:NSPoint(x:535,y:210));route.line(to:NSPoint(x:611,y:260));route.line(to:NSPoint(x:764,y:260))
+NSColor(calibratedRed:0.47,green:0.83,blue:0.70,alpha:1).setStroke()
+route.lineWidth = 17;route.lineCapStyle = .round;route.lineJoinStyle = .round;route.stroke()
+image.unlockFocus()
+let rep = NSBitmapImageRep(data:image.tiffRepresentation!)!
+try rep.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:CommandLine.arguments[1]))

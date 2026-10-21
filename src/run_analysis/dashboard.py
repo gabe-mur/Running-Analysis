@@ -10,7 +10,8 @@ from .fitness_state import build_fitness_state
 from .onboarding import setup_state
 from .progress import build_progress, prepare_progress_data
 from .recommendation import recommend_next_run
-from .recommendation_service import ensure_current_weekly_schedule, load_current_status
+from .recommendation_service import load_current_status
+from .plan_refresh import saved_plan_state
 from .training_status import build_training_status
 from .run_feedback import get_run_feedback, list_runs
 from .web.schemas import DashboardResponse
@@ -385,24 +386,10 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         illness_context = "Recent illness/recovery runs still count toward training, but have less influence on the fitness trend."
     short_horizon = _horizon(f"Current {short.window_days}-day aerobic efficiency", short)
     long_horizon = _horizon(f"Sustained {long.window_days}-day aerobic efficiency", long)
-    directional = {FitnessTrend.IMPROVING, FitnessTrend.DECLINING}
-    conflicting_aerobic_directions = (
-        short_horizon.trend in directional
-        and long_horizon.trend in directional
-        and short_horizon.trend != long_horizon.trend
-    )
-    aerobic_horizon = (
-        short_horizon
-        if short_horizon.trend in directional
-        else long_horizon
-        if long_horizon.trend in directional
-        else short_horizon
-    )
-    aerobic_trend = (
-        FitnessTrend.UNCERTAIN
-        if conflicting_aerobic_directions
-        else aerobic_horizon.trend
-    )
+    # The selected Progress window is authoritative for aerobic efficiency.
+    # Keep sustained evidence available, but never silently substitute it.
+    aerobic_horizon = short_horizon
+    aerobic_trend = aerobic_horizon.trend
     aerobic_likely = bool(
         any(
             value
@@ -414,13 +401,7 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
             )
         )
     )
-    if conflicting_aerobic_directions:
-        headline = "Recent and sustained aerobic efficiency point in different directions."
-        summary = (
-            "The recent and sustained comparisons disagree, so neither is being "
-            "collapsed into a single directional claim."
-        )
-    elif aerobic_trend == FitnessTrend.DECLINING and capacity_up:
+    if aerobic_trend == FitnessTrend.DECLINING and capacity_up:
         headline = "Short-term efficiency is down; running capacity is up."
         summary = (
             "These are not contradictory. Pace at the same heart rate has recently been "
@@ -473,7 +454,11 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         headline = "Your fitness looks steady."
         summary = "Pace at the same heart rate and your demonstrated capacity are both about the same."
     elif aerobic_trend in {FitnessTrend.UNCERTAIN, FitnessTrend.INSUFFICIENT_DATA}:
-        headline = "There is no clear fitness change yet."
+        headline = (
+            "Maintaining aerobic efficiency."
+            if aerobic_trend == FitnessTrend.UNCERTAIN
+            else "More comparable runs are needed."
+        )
         summary = (
             "The latest run was less efficient at the comparison heart rate, but one "
             "fatigue-sensitive response does not establish a fitness decline; the "
@@ -498,15 +483,10 @@ def _interpret_fitness(short, long, capacity, state, quality_signal) -> FitnessI
         FitnessSignal(
             label="Aerobic efficiency",
             trend=aerobic_trend,
-            status=(
-                "No clear change"
-                if conflicting_aerobic_directions
-                else _horizon_status(aerobic_horizon)
-            ),
+            status=_horizon_status(aerobic_horizon),
             confidence=aerobic_horizon.confidence,
             detail=(
-                f"Recent evidence uses {short_horizon.window_days} days; sustained "
-                f"evidence uses {long_horizon.window_days} days."
+                f"Last {short_horizon.window_days} days · same window as Progress."
             ),
         ),
         FitnessSignal(
@@ -551,6 +531,9 @@ def build_dashboard(
     config: dict,
     window_days: int = DASHBOARD_WINDOW_DAYS,
     project_root: str | Path = ".",
+    *,
+    fitness_window_days: int | None = None,
+    comparison_report: dict | None = None,
 ) -> DashboardResponse:
     prepared = prepare_progress_data(connection)
     progress = build_progress(
@@ -558,12 +541,14 @@ def build_dashboard(
         window_days,
         config=config,
         prepared=prepared,
+        comparison_report=comparison_report,
     )
     short_progress = build_progress(
         connection,
-        min(28, window_days),
+        fitness_window_days or int(config.get("app", {}).get("default_fitness_window", 28)),
         config=config,
         prepared=prepared,
+        comparison_report=comparison_report,
     )
     long_progress = progress
     capacity_progress = progress
@@ -580,6 +565,9 @@ def build_dashboard(
     recommendation = recommend_next_run(state, status, config)
     latest = list_runs(connection, limit=1)
     feedback = get_run_feedback(connection, config, latest[0].activity_id) if latest else None
+    if feedback is not None and comparison_report is not None:
+        from .comparable_evidence import comparable_run_summary
+        feedback = feedback.model_copy(update={'run':comparable_run_summary(feedback.run,comparison_report)})
     setup = setup_state(connection, config)
     pending = [step for step in setup.steps if not step.complete]
     nudge = SetupNudge(
@@ -591,6 +579,7 @@ def build_dashboard(
             else "Every setting has been confirmed."
         ),
     )
+    saved_plan = saved_plan_state(connection, config)
     return DashboardResponse(
         progress=progress,
         training_status=build_training_status(state, config),
@@ -605,5 +594,6 @@ def build_dashboard(
         recommendation=recommendation,
         current_status=status,
         setup=nudge,
-        weekly_schedule=ensure_current_weekly_schedule(connection, config, project_root),
+        weekly_schedule=saved_plan['schedule'],
+        weekly_plan_needs_refresh=saved_plan['needs_refresh'],
     )

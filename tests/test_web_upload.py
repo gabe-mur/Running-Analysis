@@ -148,10 +148,15 @@ def test_upload_pipeline_imports_and_reports_independent_stage_failures(tmp_path
     assert result.files[0].status == "imported"
     assert result.files[0].activity_ids
     assert result.primary_activity_id == result.files[0].activity_ids[0]
-    assert [stage.name for stage in result.stages] == ["save", "import", "process", "weather", "model", "schedule"]
+    assert [stage.name for stage in result.stages] == ["save", "import", "process", "weather", "comparison_hr", "model", "schedule"]
     assert result.stages[2].status == "complete"
     assert result.stages[3].status == "complete"
     assert '"historical_weather_enabled": false' in result.stages[3].detail
+    assert result.stages[4].status == 'complete'
+    from run_analysis.config import load_config
+    calibrated = load_config(tmp_path / 'config.yaml')
+    assert calibrated['target_hr'] == 147  # First-upload midpoint, without an opt-in.
+    assert calibrated['setup']['comparison_hr_mode'] == 'automatic'
     assert (tmp_path / "uploads").exists()
     assert all(path.parent == tmp_path / "uploads" for path in (tmp_path / "uploads").iterdir())
 

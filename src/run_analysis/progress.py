@@ -9,6 +9,7 @@ import json
 import sqlite3
 
 from .analytics import build_fitness_analytics
+from .read_cache import invariant_read
 from .fitness_evidence import trend_evidence_reason, trend_evidence_weight
 from .quality_phases import detect_continuous_quality_phase
 from .run_feedback import _infer_workout_type, _long_run_threshold_from_connection
@@ -226,6 +227,8 @@ def _scored_runs(
                 included_in_trend=included_in_trend,
                 trend_weight=trend_weight,
                 measurement_quality=str(result.get("estimate_quality") or "full_sensor"),
+                pace_basis=result.get("pace_basis"),
+                observed_average_hr_bpm=result.get("observed_average_hr_bpm"),
             )
         )
         benchmark = result.get("steady_aerobic_benchmark")
@@ -271,6 +274,12 @@ def _scored_runs(
 
 def prepare_progress_data(connection: sqlite3.Connection) -> PreparedProgressData:
     """Load invariant activity/model rows once for a multi-date projection."""
+
+    return invariant_read(connection, ("prepare_progress_data",),
+                          lambda: _prepare_progress_data(connection))
+
+
+def _prepare_progress_data(connection: sqlite3.Connection) -> PreparedProgressData:
 
     long_run_threshold_miles = _long_run_threshold_from_connection(connection)
     sessions, details = _sessions(connection, long_run_threshold_miles)
@@ -593,6 +602,7 @@ def build_progress(
     as_of: datetime | None = None,
     config: dict | None = None,
     prepared: PreparedProgressData | None = None,
+    comparison_report: dict | None = None,
 ) -> ProgressResponse:
     # Every "pace at X bpm" figure below is relative to the configured
     # comparison heart rate. Nothing may hard-code a number here.
@@ -601,6 +611,9 @@ def build_progress(
         (config or {}).get("reference_conditions", {}).get("within_run_minutes", 20)
     )
     prepared = prepared or prepare_progress_data(connection)
+    if comparison_report is not None:
+        from .comparable_evidence import comparable_progress_data
+        prepared = comparable_progress_data(prepared, comparison_report)
     sessions = prepared.sessions
     details = prepared.details
     analytics_rows = list(prepared.analytics_rows)
@@ -646,10 +659,12 @@ def build_progress(
     trend = FitnessTrend.INSUFFICIENT_DATA
     confidence = ConfidenceLevel.UNAVAILABLE
     definition = (
-        f"Estimated pace at {target_hr:g} bpm, minute {reference_minutes:g}, "
-        "and reference conditions "
+        f"Observed aerobic pace near {target_hr:g} bpm and minute {reference_minutes:g}, "
+        "without physiological pace corrections "
         f"over the last {window_days} days"
     )
+    if comparison_report is not None:
+        definition = f'Comparable aerobic pace at {target_hr:g} bpm with shared HR timing, terrain, wind and air-temperature normalization'
     current_standardized = previous_standardized = None
     if analysis.get("available"):
         current = analysis["current"]
@@ -755,6 +770,7 @@ def build_progress(
             steady_trend = FitnessTrend.UNCERTAIN
     steady_summary = FitnessBenchmarkSummary(
         definition=(
+            'The same shared comparable aerobic evidence as the main trend.' if comparison_report is not None else
             f"A simple check of pace near {target_hr:g} bpm around minute "
             f"{reference_minutes:g}. It supports the main trend but does not replace it."
         ),
@@ -914,6 +930,10 @@ def build_progress(
     if sessions and (as_of - sessions[-1].start_time).days > 14:
         blind_spots.append("The latest activity is stale, so current readiness cannot be inferred reliably.")
     blind_spots.append("Sleep, soreness, stress, nutrition, and unrecorded cross-training are not present in TCX data.")
+    coverage = _activity_coverage(connection,current_start,as_of,prepared.long_run_threshold_miles)
+    if comparison_report is not None:
+        from .comparable_evidence import comparable_coverage
+        coverage = comparable_coverage(coverage,comparison_report)
     return ProgressResponse(
         as_of=as_of,
         window_days=window_days,
@@ -933,12 +953,7 @@ def build_progress(
         trend_7d=[item for item in _trend_series(analytics_rows, 7) if item.as_of > chart_start],
         trend_28d=trend_28d_points,
         steady_aerobic=steady_summary,
-        activity_coverage=_activity_coverage(
-            connection,
-            current_start,
-            as_of,
-            prepared.long_run_threshold_miles,
-        ),
+        activity_coverage=coverage,
         quality_performance=_quality_performance(
             connection, current_start, as_of, config or {}
         ),

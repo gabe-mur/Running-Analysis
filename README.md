@@ -1,185 +1,121 @@
-# Local Running Coach
+# Running Coach
 
-A private, local app for analyzing watch data and planning your training. It
-tracks aerobic progress, training load, recovery, and workout history, then uses
-that information to recommend what to run next. Analysis happens on your
-computer using inspectable rules. No account or subscription is required, and
-your run data remains local.
+A local-first app for understanding your running and planning what comes next.
+It combines watch recordings, aerobic performance, training load, recovery and
+your goals into a rolling 21-day schedule. Your history stays on your computer.
+No Running Coach account or subscription is required.
 
-## What you need
+## Mac app
 
-- **Python 3.11 or newer.** If you do not have it, get it from
-  [python.org/downloads](https://www.python.org/downloads/). On Windows, select
-  **"Add python.exe to PATH"** in the installer.
-- **Your runs**, as `.tcx` or `.fit` files (`.fit.gz` works too). Garmin
-  Connect and Strava both export these.
-- Several runs with heart-rate data are needed for a useful fitness trend. The
-  app can import and display a smaller history, but will report limited evidence
-  until enough comparable runs are available.
+The packaged **Running Coach.app** includes its own runtime. You do not need
+Python, Terminal or a development environment. Version 0.2.0 supports **Apple
+Silicon Macs running macOS 14 or later**; it is not an Intel or Windows build.
 
-## Download it
+1. Unzip the application ZIP supplied by the author and move **Running Coach**
+   to Applications.
+2. Open it and follow Setup. Start by importing your runs or connecting
+   Intervals.icu. Without recordings, Setup provides a measured starting run.
+3. Confirm your personal details, heart-rate zones and running preferences.
+   A GPS-capable watch with recorded heart rate is needed for full analysis;
+   a chest-strap heart-rate monitor is recommended.
 
-On this page, click the green **Code** button near the top, then
-**Download ZIP**. Unzip it, and you will have a folder called
-`Running-Analysis-main`.
+The app is ad-hoc signed, not Apple-notarized. macOS may require approval under
+**System Settings → Privacy & Security → Open Anyway** after the first open
+attempt. Only approve an app obtained from a source you trust. No security
+settings need to be disabled globally.
 
-Move the folder to a permanent location before using the app. Runs, settings,
-and analysis data are stored inside it, so deleting the folder also deletes that
-local history.
+### Your data and updates
 
-You can rename or move the folder later. The next launch may take a little
-longer while stored paths are updated.
+Settings, recordings and the database live separately from the application at
+`~/Library/Application Support/Running Coach/`. Use **Running Coach → Open Data
+Folder** to find or back up this folder. Quit the app before copying a backup.
+Replacing the app does not replace your history. Keep a backup before updating;
+an older app may not support a database updated by a newer version.
 
-## Open the app
+The shared application ZIP contains no personal history, API keys, research
+databases or downloaded map tiles. The author's separate **Running Coach Clean**
+demo uses its own empty data folder and cannot change the main app's history.
 
-Double-click the launcher for your computer:
+The green GitHub **Code → Download ZIP** button downloads source code, not the
+ready-built Mac application.
 
-| | |
-|---|---|
-| **Mac** | `1. Open Running Coach - Mac.command` |
-| **Windows** | `1. Open Running Coach - Windows.bat` |
+## Using it
 
-Use the launcher for your operating system. The first launch installs the local
-environment and may take a minute or two; later launches are faster. The app
-opens in your browser automatically. Keep the terminal window open while using
-it, because closing that window stops the local server.
+- **Dashboard:** current training status, aerobic efficiency and load in context.
+- **Progress:** comparable aerobic pace, observed runs, goal distance and pace
+  outlook, VO₂ estimates, volume and quality-session share. Forecast ranges are
+  estimates, not guarantees.
+- **Run Analysis:** individual recordings, splits, heart rate, terrain, weather,
+  workout structure and editable activity details.
+- **Weekly Plan:** the coming seven days of a rolling 21-day schedule, with
+  workout prescriptions, strength sessions, completion tracking and rest-day
+  constraints. A full fresh search can take a couple of minutes.
+- **Settings:** guided Setup, heart-rate sources, running preferences, training
+  goals, weather privacy and the optional Intervals.icu connection.
 
-### If macOS refuses to open it
+Upload `.fit`, `.fit.gz`, `.tcx` or supported activity ZIPs. GPX without heart
+rate cannot supply the same fitness evidence as a complete recording. Sync and
+upload analyze new evidence first; the plan refreshes when Weekly Plan is next
+opened or refreshed. Other views then use the updated saved plan.
 
-macOS blocks files downloaded from the internet until you approve them once.
-**Right-click** (or Control-click) the `.command` file, choose **Open**, then
-click **Open** in the dialog. You only have to do this the first time.
+Runners without recordings can report their established volume, frequency and
+regular long run, then record one normal easy run before the full planner starts.
+New runners have a separate measured run/walk start and a gradual handoff to the
+normal planner, rather than invented training history.
 
-### Then
+## Run from source
 
-1. Drop your run files anywhere on the page, or use **Upload Runs**.
-2. Open **Settings → Setup** and confirm your heart-rate numbers. Until you do,
-   the app uses defaults that may not match you. The same walkthrough lets you
-   set an optional race goal, which changes the plan's priorities.
-3. On **Run analysis**, open any run and use **Edit run details** to correct
-   the workout type or flag illness or injury. Runs tagged that way still count
-   toward your training load but carry less weight in the fitness trend.
-4. Record **how you feel** at the top of the **Weekly Plan**. The plan updates
-   when this changes or when you upload a run.
+For development or platforms without a packaged build, install Python 3.11+
+and run `python3 start.py`, or use the included Mac/Windows launcher. The first
+launch installs dependencies and opens a browser; keep that launcher's terminal
+open. Source-mode data lives in the checkout, **not** the desktop app-data folder.
+Use `--port 8001`, `--no-browser` or `--dev` as needed.
 
-### Prefer a terminal?
+### Build the Mac app
 
-Run `python3 start.py`. Use `--port 8001` to request a specific port,
-`--no-browser` to prevent automatic browser launch, or `--dev` to install test
-dependencies.
+Build on an Apple Silicon Mac with Xcode Command Line Tools installed:
 
-### Updating to a newer version
+```sh
+python3 scripts/prepare_mac_runtime.py --output build/mac-runtime
+build/mac-runtime/env/bin/python scripts/build_mac_app.py --runtime-notices build/mac-runtime/python --output build/mac-release
+```
 
-Downloading a new ZIP gives you an **empty** app — your history stays behind in
-the old folder. To bring it across, copy these from the old folder into the new
-one before opening it:
+The build produces an app, shareable ZIP, checksum and dependency notices. It
+copies only explicit runtime resources, retains implementation sources needed
+for cache validation, and bundles a CA certificate store for verified HTTPS.
+It never copies the development database or credentials into the app.
+The runtime preparation checks a pinned publisher SHA-256 before extraction.
+The build also rejects native dependencies requiring macOS newer than 14.
 
-| | |
-|---|---|
-| `data/` | your database, weather cache, and privacy salt |
-| `uploads/` | the original run files you imported |
-| `config.local.yaml` | your heart rates, zones, goal, and preferences |
-| `run_overrides.csv` | workout-type and health corrections, if present |
+## Method and privacy
 
-Keep the old folder as a backup until you have confirmed the new one works.
+The planner models completed work, expected workout load and recovery, rather
+than treating every workout name as an interchangeable dose. It evaluates
+alternative schedules against the same objective and retains reproducible
+decision inputs for regression checks. Aerobic comparisons account for recorded
+effort, terrain, weather and data quality; they are not laboratory measurements.
 
-## The five screens
-
-- **Dashboard** — a current training status (*building, maintaining,
-  rebuilding, recovering, strained, underloaded*, or *not enough data*) with
-  the supporting signals, plus aerobic efficiency, durability, training
-  capacity, and recent form.
-- **Progress** — your pace at a fixed heart rate over time, adjusted for
-  weather, hills, and how far into the run you were, with the uncertainty
-  shown on the chart. It also includes an estimated VO₂ max, training-intensity
-  distribution, and progress toward your goal.
-- **Run analysis** — details for each run, including splits, heart-rate zones,
-  cadence and stride length, stops, weather, drift, reconstructed interval
-  structure, and the next-run recommendation.
-- **Weekly plan** — the first seven days of an explainable rolling 21-day plan,
-  built from recent and sustained load, workout difficulty, recovery, long-run
-  history, how you feel, the forecast, and an optional validated 5K, 10K,
-  half-marathon, or marathon goal.
-- **Settings** — preferences and a guided **Setup** for the profile information
-  used by the analysis and planner.
-
-## How the algorithm works
-
-The app models fitness, training load, and recovery as related but distinct
-signals.
-
-1. **Interpret each run.** The importer reconstructs moving time, distance,
-   heart-rate zones, terrain, weather, stops, and workout structure. Explicit
-   corrections and matched prescriptions take priority. Otherwise recorded
-   lap boundaries identify structured workouts; pace patterns can reconstruct
-   tentative repetitions in run details but cannot relabel the whole run. A
-   shared classifier identifies easy and long runs. Runs tagged for illness,
-   injury, or fitness-model exclusion remain in the training history.
-2. **Estimate aerobic progress.** Comparable runs estimate pace at the user's
-   selected heart rate and reference point in the run. Weather, grade, cardiac
-   drift, and data quality affect the estimate and its uncertainty. A robust,
-   evidence-weighted trend is calculated from eligible runs using both adjacent
-   equal-length periods and the trajectory within the selected period. The UI
-   distinguishes likely direction from clear 95% evidence; coaching decisions
-   retain the stronger standard. Activities that do not contribute to the trend
-   can still appear on the chart as context with their influence clearly labeled.
-3. **Measure load and recovery.** Distance, duration, and recorded intensity
-   determine session cost. Longer-term training density and short-term recovery
-   change continuously with elapsed time. A workout's actual or expected load,
-   rather than its name alone, determines its recovery cost. Sleep is not
-   modeled because the app does not currently record it.
-4. **Build a rolling plan.** The planner compares 21-day schedules containing
-   different dates, times, workout types, and distances. It considers target
-   mileage, accumulated load, recovery, useful easy volume, long- and
-   quality-session timing, weather, and protected rest days. The translated
-   prior plan is evaluated as an unpreferred search candidate so approximate
-   search cannot discard a still-better calendar. It does not require a fixed
-   number of runs per calendar week. The interface displays the first seven
-   days of the plan.
-5. **Close the loop.** Only the work actually completed becomes training
-   evidence. The app reevaluates the plan as runs are completed, missed, or
-   changed, and when rest-day or health information changes. Actual distance,
-   duration, and intensity determine how completed work affects later sessions.
-   Each generated plan stores the full optimizer input so the exact decision can
-   be replayed during regression testing rather than approximated from today's
-   state.
-
-With no usable running history, a separate calibration plan begins with a
-10–30-minute conversational Zone 2 run or run/walk. Regular mileage, long runs,
-and quality sessions are introduced after enough training history is available.
-An optional race goal can shape progression, workout emphasis, and tapering;
-general-fitness mode also supports gradual progression.
-
-For formulas, evidence thresholds, and limitations, see
-[Modeling methodology](docs/modeling_methodology.md).
-
-## Privacy
-
-Run files, settings, health tags, the database, and any reports stay on your
-computer and are excluded from Git. There is no account or remote application
-server.
-
-Historical weather and forecasts are the only features that use an internet
-connection, and both are optional. When enabled, the app sends Open-Meteo a date
-or planned time and a rounded, randomly offset approximate location. It does not
-send the recorded route. Location-privacy settings are available in Setup.
+Optional Intervals.icu sync contacts that service using locally stored
+credentials. Optional weather uses Open-Meteo and an approximate, privacy-blurred
+location, not the raw route. Explicit terrain downloads request broad public map
+tiles; normal elevation analysis uses local files. There are no analytics or
+advertising trackers.
 
 See [Privacy](docs/privacy.md), [Modeling methodology](docs/modeling_methodology.md),
-and [Application architecture](docs/application_architecture.md) for details.
+[Application architecture](docs/application_architecture.md) and the anonymous
+[training-policy inferences](docs/training_policy_inferences.md). Original
+training-plan research materials are private and are not needed at runtime.
 
-## Disclaimer
+## Rights and third-party software
 
-This is a personal training-analysis tool, not a medical device and not a
-substitute for professional advice.
+Application code is copyright Gabe Murray; all rights reserved. No open-source
+license is granted at this time. See [COPYRIGHT](COPYRIGHT). Bundled dependencies
+retain their own licenses, available in **Running Coach → Third-Party Licenses**.
 
-The fitness trend, VO₂ max estimate, training status, and prescribed workouts
-are estimates derived from recorded data. The app cannot account for sleep,
-stress, nutrition, medical history, pain, illness, or injury unless the relevant
-information is entered, and it does not provide a diagnosis or medical
-clearance.
+## Important
 
-Use your own judgment and seek qualified professional advice when appropriate.
-Consult a doctor before starting or substantially changing a training program,
-and stop and seek medical attention for chest pain, unusual shortness of breath,
-faintness, or pain that worsens while running. The software is provided as-is,
-without warranty.
+This is a personal training tool, not a medical device or medical clearance.
+Fitness, VO₂, load and forecast values are estimates. The app cannot infer every
+effect of sleep, illness, injury, medication, stress or nutrition from a watch.
+Use your judgment, seek qualified advice when appropriate, and stop for chest
+pain, unusual shortness of breath, faintness or worsening pain.

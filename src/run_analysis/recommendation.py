@@ -13,6 +13,7 @@ from math import ceil, floor, sqrt
 from typing import Any
 
 from .environmental_stress import assess_training_weather
+from .selection_objective import RECOVERY_BACKEND
 from .race_goals import (
     RACE_GOALS,
     build_weeks_before_taper,
@@ -501,10 +502,10 @@ def _quality_prescription(kind: QualitySessionType) -> dict[str, Any]:
             "workout_type": WorkoutType.INTERVALS,
             "title": "Hills by terrain",
             "distance": (4.0, 4.5),
-            "zones": ["Z1", "Z2", "strong controlled effort"],
+            "zones": ["Z1", "Z2", "Z4 effort"],
             "structure": [
                 WorkoutStep(instruction="Easy warm-up on flat terrain.", duration_minutes=12, target_zones=["Z1", "Z2"]),
-                WorkoutStep(instruction="Run 8 × 45 seconds uphill at strong controlled effort. Jog gently downhill, regain control, and stop early if form changes.", phase="work", repetitions=8, work_duration_minutes=0.75, target_zones=["strong controlled effort"]),
+                WorkoutStep(instruction="Run 8 × 45 seconds uphill at strong controlled effort. Jog gently downhill, regain control, and stop early if form changes.", phase="work", repetitions=8, work_duration_minutes=0.75, target_zones=["Z4 effort"]),
                 WorkoutStep(instruction="Easy cool-down.", duration_minutes=10, target_zones=["Z1", "Z2"]),
             ],
         },
@@ -516,14 +517,17 @@ def scale_quality_session(
     result: RecommendationResponse,
     original_distance: tuple[float, float],
     allocated_distance: tuple[float, float],
+    *,
+    original_target_miles: float | None = None,
 ) -> RecommendationResponse:
     """Scale the work dose when weekly allocation shortens a quality run."""
 
     kind = result.quality_session_type
     if kind is None or len(result.structure) < 2:
         return result
-    original_midpoint = sum(original_distance) / 2
-    allocated_midpoint = sum(allocated_distance) / 2
+    original_midpoint = original_target_miles if original_target_miles is not None else sum(original_distance) / 2
+    allocated_midpoint = (result.distance_target_miles if result.distance_target_miles is not None
+                          else sum(allocated_distance) / 2)
     # Small range normalization (for example 4.0–5.0 becoming 4.0–4.5)
     # trims discretionary easy mileage, not the coached work segment. Scale
     # the actual quality dose only after a material reduction.
@@ -620,7 +624,7 @@ def scale_quality_session(
                 "Jog gently downhill and stop early if form changes."
             ),
             phase="work", repetitions=repetitions, work_duration_minutes=0.75,
-            target_zones=["strong controlled effort"],
+            target_zones=["Z4 effort"],
         )
     else:
         # A progression workout already defines its work by fractions of the
@@ -721,7 +725,7 @@ def structure_extended_quality_session(
             WorkoutStep(
                 instruction="Complete 2 sets of 4 × 45 seconds uphill at strong controlled effort, jogging gently downhill and running 10 minutes easy between sets.",
                 phase="work", repetitions=8, work_duration_minutes=0.75,
-                target_zones=["strong controlled effort"],
+                target_zones=["Z4 effort"],
             ),
         ),
     }
@@ -796,7 +800,8 @@ def recommend_next_run(
     trace: list[RuleTrace] = []
     health = request.health_status
     easy_distance = typical_easy_distance(state)
-    load_ratio = effective_load_ratio(state.recent_load)
+    load_ratio = (effective_load_ratio(state.recent_load)
+                  if RECOVERY_BACKEND.get() is None else None)
     # Completed/projected load contributes continuously once it exceeds the
     # athlete's capacity reference. A doubling of the reference represents a
     # full-strength adjustment; there is no separate 130% planning cliff.
@@ -814,7 +819,7 @@ def recommend_next_run(
         _moderate_leakage_strength(state, settings)
     )
     z3_leakage = moderate_leakage_strength >= 0.5
-    recovery = estimate_recovery(state)
+    recovery = estimate_recovery(state) if RECOVERY_BACKEND.get() is None else None
 
     trace.append(
         _trace(

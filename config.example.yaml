@@ -36,6 +36,9 @@ moving_time:
   maximum_plausible_speed_mps: 12
 
 elevation:
+  # Optional offline SRTM tiles (NxxWxxx.hgt / NxxExxx.hgt). No network lookups.
+  # Default: elevation_tiles/ beside the activity database; an override must be absolute.
+  # dem_directory: /absolute/path/to/elevation_tiles
   smoothing_window_meters: 60
   grade_cost_window_meters: 60
   minimum_gain_change_meters: 0.5

@@ -30,6 +30,22 @@ class InsufficientModelDataError(ValueError):
     """The local history cannot yet support a defensible fitted score."""
 
 
+def invalidate_comparison_results(connection) -> None:
+    """Discard only derived pace comparisons before changing their coordinate.
+
+    Physical activity evidence is retained. A failed/deferred refit must not
+    leave yesterday's coordinate masquerading as today's comparison HR.
+    """
+    connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_at_target_hr'")
+    connection.execute("DELETE FROM model_metadata WHERE model_name='standardized_pace_at_target_hr'")
+    connection.execute(
+        """UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=NULL,
+           standardized_pace_uncertainty_min_mile=NULL,raw_aerobic_efficiency_min_mile=NULL,
+           environmental_adjustment_min_mile=NULL,selected_model_name=NULL,
+           selected_model_version=NULL"""
+    )
+
+
 def pace_to_speed_mps(pace_min_mile: float) -> float:
     return METERS_PER_MILE / (float(pace_min_mile) * 60.0)
 
@@ -642,11 +658,12 @@ def _fit_data_selected_models(
 
 
 def fit_models(connection: sqlite3.Connection, config: dict, output_path: str | Path) -> ModelFitSummary:
-    """Fit the prespecified published-reference score.
+    """Build observed comparable aerobic-pace scores.
 
     The older data-selected candidate implementation remains above for
     reproducibility and unit-level sensitivity tests, but it no longer drives
     the primary longitudinal score because fitness and season are confounded.
+    Unvalidated physiological pace credits are no longer applied.
     """
     from .objective_modeling import fit_published_reference_model
 

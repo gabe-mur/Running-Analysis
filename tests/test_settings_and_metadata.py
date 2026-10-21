@@ -156,7 +156,7 @@ def test_setup_resubmission_of_unchanged_inputs_preserves_schedule(tmp_path: Pat
             ],
             "setup": {
                 "confirmed_steps": ["heart_rate"],
-                "zone_method": "device",
+                "zone_method": "custom",
             },
         },
     )
@@ -240,7 +240,9 @@ def test_setup_endpoint_reports_what_is_still_defaulted(tmp_path: Path) -> None:
     client = TestClient(create_app(tmp_path))
     payload = client.get("/api/setup").json()
     assert payload["complete"] is False
-    assert payload["next_step"] == "runs"
+    # The UI offers import first; profile/HR calibration is the first saved
+    # setup step for the no-history branch, before prescribing a baseline run.
+    assert payload["next_step"] == "profile"
     assert any(step["blocking"] for step in payload["steps"])
 
 
@@ -286,11 +288,11 @@ def test_confirmations_persist_and_accumulate(tmp_path: Path) -> None:
     client.patch("/api/settings", json={"setup": {"confirmed_steps": ["heart_rate"]}})
     client.patch(
         "/api/settings",
-        json={"setup": {"confirmed_steps": ["heart_rate", "zones"], "zone_method": "device"}},
+        json={"setup": {"confirmed_steps": ["heart_rate", "zones"], "zone_method": "custom"}},
     )
     setup = client.get("/api/settings").json()["setup"]
     assert set(setup["confirmed_steps"]) == {"heart_rate", "zones"}
-    assert setup["zone_method"] == "device"
+    assert setup["zone_method"] == "custom"
 
 
 def test_the_estimated_max_endpoint_states_its_own_uncertainty(tmp_path: Path) -> None:
@@ -374,7 +376,7 @@ def test_setup_saves_everything_in_one_request(tmp_path: Path) -> None:
             "weather_privacy_radius_km": 2.0,
             "setup": {
                 "confirmed_steps": ["heart_rate", "zones", "comparison_hr", "goal", "weather"],
-                "zone_method": "device",
+                "zone_method": "custom",
             },
         },
     )
@@ -382,7 +384,7 @@ def test_setup_saves_everything_in_one_request(tmp_path: Path) -> None:
     saved = response.json()
     assert saved["target_hr"] == 148
     assert saved["resting_hr"] == 49
-    assert saved["setup"]["zone_method"] == "device"
+    assert saved["setup"]["zone_method"] == "custom"
     assert len(saved["setup"]["confirmed_steps"]) == 5
     # And it survives a reload rather than only living in the response.
     assert client.get("/api/settings").json()["target_hr"] == 148

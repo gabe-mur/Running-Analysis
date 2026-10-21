@@ -12,6 +12,7 @@ from run_analysis.db import connect, initialize
 from run_analysis.fit import TimerEvent, parse_fit, timer_pauses
 from run_analysis.importer import import_files, parser_for
 from run_analysis.tcx import parse_tcx
+from run_analysis.gpx import parse_gpx
 
 START = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -114,7 +115,7 @@ def test_repeated_stops_without_starts_do_not_nest() -> None:
 
 @pytest.mark.parametrize(
     "name,expected",
-    [("a.tcx", parse_tcx), ("a.fit", parse_fit), ("a.FIT", parse_fit), ("a.fit.gz", parse_fit), ("a.gpx", None)],
+    [("a.tcx", parse_tcx), ("a.fit", parse_fit), ("a.FIT", parse_fit), ("a.fit.gz", parse_fit), ("a.gpx", parse_gpx)],
 )
 def test_the_parser_is_chosen_by_extension(name: str, expected) -> None:
     assert parser_for(Path(name)) is expected

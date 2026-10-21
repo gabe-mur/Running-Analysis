@@ -75,6 +75,10 @@ def classify_movement(
 
     for index, (first, second) in enumerate(zip(points, points[1:])):
         flags: list[str] = []
+        # GPX segments are separate recordings. No evidence describes motion
+        # or HR between them; do not bridge a break with an invented interval.
+        if 'gpx_segment_start' in second.parse_flags:
+            continue
         if first.timestamp_utc is None or second.timestamp_utc is None:
             diagnostics["invalid_time_intervals"] += 1
             continue

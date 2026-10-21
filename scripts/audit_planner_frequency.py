@@ -54,10 +54,10 @@ def _score_parts(
     target: tuple[float, float],
     completed_miles: dict[int, float],
     projector,
+    reconcile_allocated_prefix: bool = False,
 ) -> dict:
     kwargs = dict(
         completed_miles_by_offset=completed_miles,
-        role_loop_penalty=False,
     )
     base = _adaptive_candidate_cost(
         offsets,
@@ -107,6 +107,7 @@ def _score_parts(
         include_cadence_pressure=True,
         **kwargs,
     )
+    diagnostic_details: dict[str, object] = {}
     joint = _joint_candidate_program_cost(
         offsets,
         states,
@@ -116,6 +117,8 @@ def _score_parts(
         target,
         completed_miles_by_offset=completed_miles,
         expected_target_projector=projector,
+        diagnostic_details=diagnostic_details,
+        reconcile_allocated_prefix=reconcile_allocated_prefix,
     )
     ordinary = sum(typical_easy_distance(states[0])) / 2
     return {
@@ -128,6 +131,16 @@ def _score_parts(
         "aerobic_support_violation": joint[1],
         "shape_violation": joint[2],
         "finalized_recovery": joint[3],
+        "planned_midpoint_miles": diagnostic_details.get(
+            "planned_midpoint_miles"
+        ),
+        "integrated_target_low_miles": diagnostic_details.get(
+            "integrated_target_low_miles"
+        ),
+        "recovery_cost_components": diagnostic_details.get(
+            "recovery_cost_components"
+        ),
+        "allocation_trace": diagnostic_details.get("allocation_trace"),
     }
 
 
@@ -172,6 +185,17 @@ def main() -> None:
         help="Additionally score a comma-separated fixed calendar, such as 3,5,7.",
     )
     parser.add_argument(
+        "--reconcile-fixed",
+        action="store_true",
+        help="Run fixed --score-offsets through final allocation reconciliation.",
+    )
+    parser.add_argument(
+        "--day-zero-hour",
+        type=int,
+        default=None,
+        help="Limit day-zero timing options to one local clock hour.",
+    )
+    parser.add_argument(
         "--use-current-prior",
         action="store_true",
         help="Supply the saved internal calendar as the unpreferred warm start.",
@@ -211,6 +235,17 @@ def main() -> None:
             [FitnessState.model_validate(item) for item in group]
             for group in payload["daily_state_options"]
         ]
+        if args.day_zero_hour is not None:
+            filtered = [
+                state
+                for state in options[0]
+                if state.as_of.hour == args.day_zero_hour
+            ]
+            if not filtered:
+                raise ValueError(
+                    f"No day-zero option at hour {args.day_zero_hour}"
+                )
+            options[0] = filtered
         request = RecommendationRequest.model_validate(payload["request"])
         target = tuple(float(value) for value in payload["target_distance_range"])
         evidence = WeeklyTargetEvidence.model_validate(payload["target_evidence"])
@@ -278,6 +313,7 @@ def main() -> None:
                             target=target,
                             completed_miles=completed_miles,
                             projector=projector,
+                            reconcile_allocated_prefix=args.reconcile_fixed,
                         ),
                     },
                     indent=2,

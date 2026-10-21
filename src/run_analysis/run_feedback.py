@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -10,6 +10,7 @@ import json
 import sqlite3
 
 from .config import load_config, resolve_project_path
+from .read_cache import invariant_read
 from .db import connect, initialize
 from .cadence_feedback import build_cadence_analysis
 from .fitness_evidence import trend_evidence_reason, trend_evidence_weight
@@ -360,6 +361,8 @@ def _fitness_observation(
         standardized_pace_at_target_hr=PaceValue(minutes_per_mile=float(standardized), display=_pace_display(float(standardized))),
         uncertainty_95_min_mile=uncertainty,
         comparable_window_minutes=None,
+        pace_basis=result.get("pace_basis"),
+        observed_average_hr_bpm=result.get("observed_average_hr_bpm"),
         contributions=contributions,
         confidence=confidence,
         included_in_trend=weight > 0,
@@ -392,7 +395,7 @@ def _difficulty(row: sqlite3.Row, workout: WorkoutType, zone_seconds: dict[str, 
     elapsed_s = float(row["elapsed_time_s"] or row["total_elapsed_time_s"] or moving_s)
     load = calculate_session_load(zone_seconds, moving_s)
     distance_miles = float(row["total_distance_m"] or row["analysis_distance_m"] or 0) / METERS_PER_MILE
-    perceived_exertion = int(row["perceived_exertion"]) if row["perceived_exertion"] is not None else None
+    perceived_exertion = float(row["perceived_exertion"]) if row["perceived_exertion"] is not None else None
     elevation_gain_ft = float(row["derived_elevation_gain_m"] or 0) * 3.28084
     elevation_loss_ft = float(row["derived_elevation_loss_m"] or 0) * 3.28084
     flags: list[str] = []
@@ -415,7 +418,9 @@ def _difficulty(row: sqlite3.Row, workout: WorkoutType, zone_seconds: dict[str, 
         stopped_minutes=max(0.0, elapsed_s - moving_s) / 60,
         zone_load=load.zone_load,
         perceived_exertion=perceived_exertion,
-        session_rpe_load=(perceived_exertion * moving_s / 60 if perceived_exertion else None),
+        session_rpe_load=(perceived_exertion * moving_s / 60 if perceived_exertion is not None else None),
+        effort_source=row.get('effort_source'),
+        workout_feel=row.get('workout_feel'),
         elevation_gain_ft=elevation_gain_ft if elevation_gain_ft > 0 else None,
         elevation_loss_ft=elevation_loss_ft if elevation_loss_ft > 0 else None,
         zone_breakdown=_zone_breakdown(zone_seconds, load),
@@ -706,28 +711,58 @@ def _row_summary(row: sqlite3.Row, long_threshold_miles: float = 7.0) -> RunSumm
         prescribed_distance_range_miles=(
             prescription.distance_range_miles if prescription else None
         ),
+        prescribed_distance_target_miles=(
+            prescription.distance_target_miles if prescription else None
+        ),
     )
 
 
 def list_runs(connection: sqlite3.Connection, limit: int = 100, offset: int = 0) -> list[RunSummary]:
+    return invariant_read(connection, ("list_runs", limit, offset),
+                          lambda: _list_runs(connection, limit, offset))
+
+
+def _list_runs(connection: sqlite3.Connection, limit: int, offset: int) -> list[RunSummary]:
+    from .session_feedback import with_session_feedback
     rows = connection.execute(
         RUN_SELECT + " ORDER BY a.start_time_utc_epoch DESC,a.id DESC LIMIT ? OFFSET ?",
         (limit, offset),
     ).fetchall()
     threshold = _long_run_threshold_from_connection(connection)
-    return [_row_summary(row, threshold) for row in rows]
+    return [_row_summary(row, threshold) for row in with_session_feedback(connection, rows)]
 
 
 def get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], activity_id: int) -> RunFeedback | None:
+    def config_value(value):
+        if isinstance(value, (date, datetime)):
+            return {"cache_type": type(value).__name__, "value": value.isoformat()}
+        if isinstance(value, Path):
+            return {"cache_type": "Path", "value": str(value)}
+        raise TypeError("Unsupported configuration value for caching")
+    try:
+        key = ("run_feedback", activity_id, json.dumps(config, sort_keys=True, default=config_value))
+    except TypeError:
+        return _get_run_feedback(connection, config, activity_id)
+    return invariant_read(connection, key, lambda: _get_run_feedback(connection, config, activity_id),
+                          cacheable=lambda result: result is None or result.run.start_time is not None)
+
+
+def _get_run_feedback(connection: sqlite3.Connection, config: dict[str, Any], activity_id: int) -> RunFeedback | None:
+    from .session_feedback import with_session_feedback
     row = connection.execute(RUN_SELECT + " WHERE a.id=?", (activity_id,)).fetchone()
     if row is None:
         return None
+    row = with_session_feedback(connection, [row])[0]
     summary = _row_summary(row, _long_run_threshold_from_connection(connection))
     metadata = RunMetadata(
         workout_type=summary.workout_type,
         health_tag=summary.health_tag,
         include_in_model=bool(row["include_in_model"]) if row["include_in_model"] is not None else None,
-        perceived_exertion=int(row["perceived_exertion"]) if row["perceived_exertion"] is not None else None,
+        perceived_exertion=float(row["perceived_exertion"]) if row["perceived_exertion"] is not None else None,
+        effort_source=row['effort_source'],
+        workout_feel=row['workout_feel'],
+        feeling_source=row['feeling_source'],
+        feedback_conflict=row['feedback_conflict'],
         notes=str(row["override_notes"] or row["notes"] or ""),
         postal_code=str(row["postal_code"]) if row["postal_code"] else None,
         location_label=(

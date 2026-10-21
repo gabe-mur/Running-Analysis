@@ -1,12 +1,80 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pytest
 
 from fastapi.testclient import TestClient
 
 from run_analysis.db import connect, initialize
 from run_analysis.web.app import create_app
 from test_web_phase1 import _write_config
+
+
+def test_recorded_long_run_accomplishment_is_separate_from_supported_capacity(tmp_path,monkeypatch):
+    from datetime import datetime,timedelta,timezone
+    from run_analysis.config import load_config
+    from run_analysis.fitness_state import build_fitness_state
+    from test_progress import _insert_run
+    _write_config(tmp_path);cfg=load_config(tmp_path/'config.yaml')
+    now=datetime.now(timezone.utc)
+    with connect(tmp_path/'data/test.sqlite') as db:
+        initialize(db)
+        _insert_run(db,1,now-timedelta(days=15),9.536,95,100)
+        _insert_run(db,2,now-timedelta(days=40),12,120,100)
+        hike=_insert_run(db,3,now-timedelta(days=1),15,200,100)
+        db.execute("INSERT INTO run_overrides(activity_id,workout_type) VALUES ('external-3','hike')")
+        db.commit()
+        monkeypatch.setattr('run_analysis.fitness_state.supported_long_run_capacity',lambda *args,**kwargs:8.9)
+        state=build_fitness_state(db,cfg,as_of=now)
+    assert state.longest_run_30d_miles==8.9
+    assert state.longest_completed_run_30d_miles==pytest.approx(9.536)
+
+
+@pytest.mark.parametrize("window", [14, 28, 42, 56, 90, 180, 365])
+def test_dashboard_uses_requested_progress_window_without_changing_training_context(tmp_path, window):
+    _write_config(tmp_path)
+    with connect(tmp_path / "data/test.sqlite") as connection:
+        initialize(connection)
+    client = TestClient(create_app(tmp_path))
+    response = client.get(f"/api/dashboard?fitness_window_days={window}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fitness_interpretation"]["short_term"]["window_days"] == window
+    assert payload["progress"]["window_days"] == 90
+    assert payload["fitness_interpretation"]["long_term"]["window_days"] == 90
+    aerobic = payload["fitness_interpretation"]["signals"][0]
+    assert f"Last {window} days" in aerobic["detail"]
+    assert client.get("/api/dashboard?fitness_window_days=30").status_code == 422
+
+
+def test_dashboard_does_not_replace_uncertain_selected_window_with_improving_long_window(tmp_path):
+    from run_analysis.config import load_config
+    from run_analysis.progress import build_progress
+    from run_analysis.fitness_state import build_fitness_state
+    from run_analysis.dashboard import _interpret_fitness
+    from run_analysis.web.schemas import FitnessSignal, FitnessTrend
+    _write_config(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    with connect(tmp_path / "data/test.sqlite") as connection:
+        initialize(connection)
+        short = build_progress(connection, 28, config=cfg).model_copy(update={
+            "period_change": _aerobic_change("improving", "clear", -43),
+            "within_window_trend": _aerobic_change("declining", "clear", 46),
+        })
+        long = build_progress(connection, 90, config=cfg).model_copy(update={
+            "period_change": _aerobic_change("improving", "likely", -16),
+            "fitness_trend": FitnessTrend.IMPROVING,
+        })
+        state = build_fitness_state(connection, cfg)
+        result = _interpret_fitness(short, long, long, state, FitnessSignal(
+            label="High-intensity fitness", trend="insufficient_data", status="Not enough data", confidence="unavailable", detail="Test",
+        ))
+    assert result.short_term.trend == FitnessTrend.UNCERTAIN
+    assert result.long_term.trend == FitnessTrend.IMPROVING
+    assert result.signals[0].trend == FitnessTrend.UNCERTAIN
+    assert result.signals[0].status == "No clear change"
+    assert result.headline == "Maintaining aerobic efficiency."
+    assert "likely improving" not in result.headline
 
 
 def _aerobic_change(direction: str, evidence: str, change: float):
@@ -38,17 +106,22 @@ def test_empty_dashboard_still_provides_conservative_next_step(tmp_path: Path) -
     assert payload["fitness_interpretation"]["short_term"]["window_days"] == 28
     assert payload["fitness_interpretation"]["long_term"]["window_days"] == 90
     assert payload["progress"]["fitness_trend"] == "insufficient_data"
+    assert payload["fitness_interpretation"]["headline"] == "More comparable runs are needed."
     assert payload["recommendation"]["workout_type"] == "easy"
     assert payload["recommendation"]["rule_trace"]
-    assert payload["weekly_schedule"]["run_count"] == 1
-    assert payload["weekly_schedule"]["target_evidence"]["planning_mode"] == "baseline_required"
+    assert payload['weekly_schedule'] is None
+    assert payload['weekly_plan_needs_refresh']
+    # Calibration is still provided when Weekly Plan is explicitly opened.
+    weekly = TestClient(create_app(tmp_path)).get('/api/weekly-schedule/latest').json()
+    assert weekly['run_count'] == 1
+    assert weekly['target_evidence']['planning_mode'] == 'baseline_required'
     baseline = next(
         day["recommendation"]
-        for day in payload["weekly_schedule"]["days"]
+        for day in weekly["days"]
         if day["recommendation"] is not None
     )
     assert baseline["duration_range_minutes"] == [10.0, 30.0]
-    assert "10–30-minute" in payload["weekly_schedule"]["summary"]
+    assert "10–30-minute" in weekly["summary"]
     assert [item["label"] for item in payload["fitness_interpretation"]["signals"]] == [
         "Aerobic efficiency",
         "Durability",

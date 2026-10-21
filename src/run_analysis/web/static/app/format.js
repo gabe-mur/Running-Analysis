@@ -35,7 +35,8 @@ const evidenceLabel = (value) => ({
   high: "Strong evidence", moderate: "Some evidence", low: "Limited evidence",
   unavailable: "Not enough data",
 }[value] ?? "Not enough data");
-const readinessLabel = (value) => ({ ready: "As planned", caution: "Ease if needed", not_ready: "Rest" }[value] ?? titleCase(value));
+const readinessLabel = (value) => ({ ready: "As planned", caution: "Ease if needed", not_ready: "Rest", unknown: "Check readiness" }[value] ?? titleCase(value));
+const readinessClass = (value) => ({ ready: "good", caution: "partial", not_ready: "poor", unknown: "neutral" }[value] ?? "neutral");
 const dataQualityLabel = (value) => ({
   good: "Complete", partial: "Mostly complete", poor: "Limited", unavailable: "Unavailable",
 }[value] ?? titleCase(value));
@@ -66,6 +67,6 @@ export const fitnessWindowLabel = (days) => ({
 
 export {
   escapeHtml, pace, number, dateLabel, calendarDateLabel, daypartLabel, titleCase,
-  trendLabel, evidenceLabel, readinessLabel, dataQualityLabel, gpsQualityLabel,
+  trendLabel, evidenceLabel, readinessLabel, readinessClass, dataQualityLabel, gpsQualityLabel,
   durationLabel, durationSeconds, datetimeLocalValue,
 };

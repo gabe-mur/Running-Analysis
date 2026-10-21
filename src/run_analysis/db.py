@@ -10,7 +10,7 @@ import sqlite3
 from .privacy import private_directory, private_file
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -244,6 +244,7 @@ def initialize(connection: sqlite3.Connection) -> None:
         _migrate_v14(connection)
         _migrate_v15(connection)
         _migrate_v16(connection)
+        _migrate_v17(connection)
         # The marker describes a completed migration, never an attempted one.
         connection.execute(
             "INSERT INTO schema_metadata(key, value) VALUES('schema_version', ?) "
@@ -297,6 +298,10 @@ def _schema_shape_is_current(connection: sqlite3.Connection) -> bool:
             "duration_high_minutes",
         },
         "activity_plan_matches": {"duration_delta_minutes"},
+        "activity_sensor_streams": {
+            "source_file_id", "source_activity_index", "activity_id",
+            "payload_json", "extraction_version",
+        },
     }
     return all(
         expected <= _columns(connection, table)
@@ -697,3 +702,15 @@ def _migrate_v16(connection: sqlite3.Connection) -> None:
             "workout_detection_confidence TEXT",
         ],
     )
+
+
+def _migrate_v17(connection: sqlite3.Connection) -> None:
+    """Preserve source-specific sensor data independently of canonical run choice."""
+    connection.execute("""CREATE TABLE IF NOT EXISTS activity_sensor_streams (
+        source_file_id INTEGER NOT NULL REFERENCES source_files(id) ON DELETE CASCADE,
+        source_activity_index INTEGER NOT NULL,
+        activity_id INTEGER NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        extraction_version INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        PRIMARY KEY(source_file_id, source_activity_index)
+    )""")

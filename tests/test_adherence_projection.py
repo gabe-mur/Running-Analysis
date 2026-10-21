@@ -370,7 +370,7 @@ def test_projection_can_limit_exact_daily_replans_to_scenario_boundary(
         [],
         CONFIG,
         _state().as_of,
-        weeks=1,
+        weeks=13,
         simulation_days=3,
     )
 
@@ -1134,6 +1134,7 @@ def test_in_range_edge_scenarios_execute_exact_prescription_edges(
             DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
             "above prescribed range; more intense than prescribed",
         ),
+        (DeterministicAdherenceScenario.ABOVE_RANGE_EASY, "above prescribed range"),
     ],
 )
 def test_out_of_range_scenarios_emit_material_evidence(
@@ -1174,12 +1175,19 @@ def test_out_of_range_scenarios_emit_material_evidence(
     assert post_upload.material_evidence_reasons == (
         f"deviation: {expected_fragment}",
     )
+    assert post_upload.recovery_surprise_units is not None
+    assert abs(post_upload.recovery_surprise_units) > 1e-4
     following_refresh = [
         snapshot
         for snapshot in projection[0].replan_snapshots
         if snapshot.trigger == "scheduled_refresh"
     ][1]
     assert not following_refresh.material_evidence_reasons
+    # The upload already incorporated this deviation. A refresh must compare
+    # with that observed history, not re-report the original forecast error.
+    assert following_refresh.recovery_surprise_units == pytest.approx(0.0, abs=1e-9)
+    assert following_refresh.continuous_distance_surprise_miles == pytest.approx(0.0, abs=1e-9)
+    assert following_refresh.short_term_distance_surprise_miles == pytest.approx(0.0, abs=1e-9)
 
 
 def test_single_hidden_miss_skips_only_one_prescription(monkeypatch) -> None:

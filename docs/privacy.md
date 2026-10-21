@@ -27,6 +27,24 @@ Entering a ZIP code for a no-GPS run sends that ZIP to Open-Meteo's geocoding
 service once when you save it. The resulting approximate location is stored
 locally; subsequent weather requests use the rounded and randomized location.
 
+Optional Intervals.icu sync sends your API credentials to Intervals.icu over
+verified HTTPS and downloads activity files and available wellness data. The
+credentials are stored in the private local data folder, not the application
+bundle or Git repository. Disconnecting does not delete already imported runs.
+
+Explicit terrain downloads request broad one-degree Tilezen map tiles from AWS
+S3 and the provider's attribution document. They do not send activity files,
+heart rate or routes. Normal elevation analysis reads local terrain and bridge
+geometry and does not make elevation requests. Downloaded maps are not included
+in the shared app ZIP.
+
+The packaged Mac app keeps these files under
+`~/Library/Application Support/Running Coach/`, outside the application bundle.
+Replacing the app preserves this folder. The separate clean demo uses
+`~/Library/Application Support/Running Coach Clean/`. Source-mode launches keep
+their data in the project folder instead. No personal data is bundled in either
+application.
+
 The normal launcher listens only on `127.0.0.1`, so other devices cannot open
 the app. The server accepts only local hostnames, blocks framing and browser
 permissions, sends no-referrer and no-cache headers, and limits scripts,

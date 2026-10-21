@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import asynccontextmanager,closing
 from datetime import date, datetime, timedelta, timezone
 import os
+import json
 import sqlite3
 import time
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -18,13 +21,17 @@ from ..config import load_config, resolve_project_path
 from ..db import connect, initialize
 from ..dashboard import DASHBOARD_WINDOW_DAYS, build_dashboard
 from ..metadata_service import update_run_metadata
+from ..beginner import BeginnerFeedback
 from ..modeling import fit_models
 from ..processing import process_activities
 from ..run_feedback import get_run_feedback, list_runs
-from ..onboarding import derive_zones, estimate_max_hr, recommend_comparison_hr, setup_state
+from ..onboarding import derive_zones, estimate_max_hr, recommend_comparison_hr, automatic_comparison_hr, setup_state
 from dataclasses import asdict
 
 from ..progress import build_progress
+from ..read_cache import invariant_snapshot
+from ..progress_wip import build_progress_wip
+from ..training_overview import build_training_overview
 from ..race_goals import goal_progress
 from ..recommendation_service import (
     current_fitness_state,
@@ -44,6 +51,7 @@ from ..settings_service import (
 )
 from ..weather import save_activity_postal_code, update_weather
 from .schemas import (
+    RacePreparationSettings, RacePreparationApply, RaceEventReport,
     ComparisonHrRecommendation,
     ComparisonHrSupportPoint,
     MaxHrEstimateResponse,
@@ -59,6 +67,7 @@ from .schemas import (
     HealthResponse,
     ProgressResponse,
     RecommendationRequest,
+    CurrentStatusResponse,
     RecommendationResponse,
     RunFeedback,
     RunSummary,
@@ -66,11 +75,15 @@ from .schemas import (
     SettingsPatch,
     SettingsResponse,
     UploadResponse,
+    UploadStage,
     WeeklyScheduleRequest,
     WeeklyScheduleResponse,
     WeeklyRestDayRequest,
+    PlannerJobRequest,
+    StrengthCompletionRequest,
 )
-from .upload_service import MAX_UPLOAD_BYTES, UploadPayload, run_upload_pipeline
+from .upload_service import MAX_UPLOAD_BYTES, UploadPayload, run_locked_upload_pipeline, UploadBusyError
+from starlette.concurrency import run_in_threadpool
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -146,6 +159,7 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
 
     counts: dict[str, int] = {}
     schema_version: int | None = None
+    committed_planner_version: int | None = None
     try:
         # A health check is read-only. URI mode prevents an accidental empty DB.
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
@@ -167,6 +181,10 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
                 ).fetchone()
                 if row:
                     schema_version = int(row[0])
+            if 'app_state' in existing:
+                row=connection.execute("SELECT value_json FROM app_state WHERE key='weekly_schedule_internal'").fetchone()
+                if row:
+                    committed_planner_version=json.loads(row[0]).get('planner_version')
         finally:
             connection.close()
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -180,6 +198,8 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
 
     if not counts.get("activities"):
         warnings.append("No activities have been imported yet.")
+    from ..adaptive.live_bridge import enabled, ENGINE, PLANNER_VERSION
+    from ..weekly_schedule import WEEKLY_PLANNER_VERSION
     return HealthResponse(
         status="ready" if not warnings else "degraded",
         database_path=str(database),
@@ -187,6 +207,10 @@ def _read_health(project_root: Path, config_path: Path) -> HealthResponse:
         schema_version=schema_version,
         counts=counts,
         warnings=warnings,
+        planner_engine=ENGINE if enabled(config) else 'legacy',
+        planner_version=(committed_planner_version or PLANNER_VERSION) if enabled(config) else WEEKLY_PLANNER_VERSION,
+        source_newer_than_process=stale,
+        restart_hint=restart_hint,
     )
 
 
@@ -215,9 +239,17 @@ def create_app(
     if not selected_config.is_absolute():
         selected_config = root / selected_config
 
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            planner_jobs.close()
+
     app = FastAPI(
         title="Local Running Coach API",
-        version="0.1.0",
+        version="0.2.0",
+        lifespan=lifespan,
         description=(
             "Local-first Garmin run analysis. Fitness observations, session "
             "difficulty, training load, and coaching decisions are separate contracts."
@@ -225,10 +257,44 @@ def create_app(
     )
     app.state.project_root = root
     app.state.config_path = selected_config
+    from ..planner_observation import PlannerProgress, finished
+    planner_progress = PlannerProgress()
+    app.state.planner_progress = planner_progress
+    from .planner_jobs import PlannerJobs
+    planner_jobs=PlannerJobs(planner_progress)
+    app.state.planner_jobs=planner_jobs
+    from ..adaptive.live_bridge import LivePlannerReviewRequired
+
+    @app.exception_handler(LivePlannerReviewRequired)
+    async def adaptive_review_required(request, error):
+        return JSONResponse(status_code=409,content={'detail':str(error)})
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "::1", "testserver"],
     )
+
+    @app.middleware("http")
+    async def observe_planning(request, call_next):
+        tracked = request.url.path in {'/api/weekly-schedule/latest',
+            '/api/weekly-schedule', '/api/weekly-schedule/rest-day'}
+        request_id = request.headers.get('X-Planner-Request')
+        if tracked and request_id:
+            try:
+                request_id = str(UUID(request_id))
+            except (ValueError, AttributeError):
+                # Malformed display telemetry cannot change the planner call.
+                request_id = None
+        else:
+            request_id = None
+        # Upload, sync and other callers can own the same expensive live job.
+        # Keep their telemetry available to a refresh queued behind that job.
+        with planner_progress.provide():
+            if not request_id:
+                return await call_next(request)
+            with planner_progress.observe(request_id):
+                response = await call_next(request)
+                finished(response.status_code < 400)
+                return response
 
     @app.middleware("http")
     async def private_response_headers(request, call_next):
@@ -247,6 +313,14 @@ def create_app(
 
     api = APIRouter(prefix="/api")
 
+    @api.get('/weekly-schedule/progress/{request_id}', tags=['coaching'])
+    def weekly_planner_progress(request_id: UUID) -> dict:
+        # No database, model evaluation, or planning side effects.
+        return planner_progress.snapshot(planner_jobs.resolve(str(request_id)))
+
+    from .intervals import connection_router
+    app.include_router(connection_router(root, selected_config))
+
     @api.get("/health", response_model=HealthResponse, tags=["system"])
     def health() -> HealthResponse:
         return _read_health(root, selected_config)
@@ -254,13 +328,21 @@ def create_app(
     @api.post("/uploads", response_model=UploadResponse, tags=["activities"])
     async def upload(files: list[UploadFile] = File(...)) -> UploadResponse:
         if not files:
-            raise HTTPException(status_code=422, detail="At least one TCX file is required")
+            raise HTTPException(status_code=422, detail="At least one activity file is required")
+        if len(files) > 25:
+            raise HTTPException(status_code=422, detail="Maximum 25 files per upload")
         payloads: list[UploadPayload] = []
+        total_bytes = 0
         for uploaded in files:
             content = await uploaded.read(MAX_UPLOAD_BYTES + 1)
+            total_bytes += len(content)
+            if len(content) > MAX_UPLOAD_BYTES or total_bytes > 2 * MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=422, detail="Upload exceeds 50 MB per file or 100 MB total")
             payloads.append(UploadPayload(uploaded.filename or "activity.tcx", content))
         try:
-            return run_upload_pipeline(root, selected_config, payloads)
+            return await run_in_threadpool(run_locked_upload_pipeline, root, selected_config, payloads)
+        except UploadBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -283,6 +365,11 @@ def create_app(
         with connect(database) as connection:
             initialize(connection)
             values = list_runs(connection, limit=5000, offset=0)
+            # Recorded sort fields are unchanged; the adjusted-pace field now
+            # uses exactly the same evidence as Progress and Run Analysis.
+            from ..comparable_evidence import cached_comparable_evidence, comparable_run_summary
+            comparable = cached_comparable_evidence(connection,config)
+            values = [comparable_run_summary(item,comparable) for item in values]
         if workout_type:
             values = [item for item in values if item.workout_type.value == workout_type]
         if health_tag:
@@ -304,15 +391,24 @@ def create_app(
         elif flag == "excluded":
             values = [item for item in values if item.model_included is False]
         key_functions = {
-            "date": lambda item: item.start_time or datetime.min.replace(tzinfo=timezone.utc),
+            "date": lambda item: item.start_time,
             "distance": lambda item: item.distance_miles,
-            "pace": lambda item: item.moving_pace_min_mile or float("inf"),
-            "heart_rate": lambda item: item.average_hr_bpm or 0,
-            "standardized": lambda item: item.fitness_observation.standardized_pace_at_target_hr.minutes_per_mile if item.fitness_observation else float("inf"),
+            "pace": lambda item: item.moving_pace_min_mile,
+            "heart_rate": lambda item: item.average_hr_bpm,
+            "standardized": lambda item: item.fitness_observation.standardized_pace_at_target_hr.minutes_per_mile if item.fitness_observation else None,
+            "temperature": lambda item: item.temperature_f,
+            "assessment": lambda item: item.assessment_label.casefold() if item.assessment_label else None,
+            "data": lambda item: {"good": "Complete", "partial": "Mostly complete", "poor": "Limited", "unavailable": "Unavailable"}.get(item.data_quality.value, item.data_quality.value).casefold(),
         }
         if sort_by not in key_functions or sort_order not in {"asc", "desc"}:
             raise HTTPException(status_code=422, detail="Unsupported run sort")
-        values.sort(key=key_functions[sort_by], reverse=sort_order == "desc")
+        key = key_functions[sort_by]
+        # Missing measurements remain at the end in either direction, and
+        # sorting happens before pagination rather than just within a page.
+        measured = [item for item in values if key(item) is not None]
+        missing = [item for item in values if key(item) is None]
+        measured.sort(key=key, reverse=sort_order == "desc")
+        values = measured + missing
         return values[offset : offset + limit]
 
     @api.get("/runs/{activity_id}", response_model=RunFeedback, tags=["activities"])
@@ -324,6 +420,9 @@ def create_app(
         with connect(database) as connection:
             initialize(connection)
             feedback = get_run_feedback(connection, config, activity_id)
+            if feedback is not None:
+                from ..comparable_evidence import cached_comparable_evidence, comparable_run_summary
+                feedback = feedback.model_copy(update={'run':comparable_run_summary(feedback.run,cached_comparable_evidence(connection,config))})
         if feedback is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return feedback
@@ -367,6 +466,10 @@ def create_app(
             )
             feedback = get_run_feedback(connection, config, activity_id)
         assert feedback is not None
+        # Re-read presentation evidence after the metadata/model transaction.
+        with connect(database) as connection:
+            from ..comparable_evidence import cached_comparable_evidence, comparable_run_summary
+            feedback = feedback.model_copy(update={'run':comparable_run_summary(feedback.run,cached_comparable_evidence(connection,config))})
         return feedback
 
     @api.get("/progress", response_model=ProgressResponse, tags=["analysis"])
@@ -378,7 +481,82 @@ def create_app(
             raise HTTPException(status_code=404, detail="Analysis database does not exist")
         with connect(database) as connection:
             initialize(connection)
-            return build_progress(connection, selected_window, config=config)
+            from ..comparable_evidence import cached_comparable_evidence
+            return build_progress(connection, selected_window, config=config,
+                comparison_report=cached_comparable_evidence(connection,config))
+
+    @api.get("/progress-wip", tags=["analysis"])
+    def progress_wip(window_days: int = Query(default=28, ge=14, le=365),
+                     include_exploratory: bool = True,
+                     include_legacy_aerobic: bool = True,
+                     include_goal_pace_outlook: bool = False) -> dict:
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        # Separate prototype reader: no initialization/migrations or planner calls.
+        with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            try:
+                with invariant_snapshot(connection):
+                    from ..pace_comparability import comparison_view
+                    from ..comparable_evidence import cached_comparable_evidence
+                    comparable = cached_comparable_evidence(connection, config)
+                    result = build_progress_wip(connection, config, root, window_days,
+                                                include_exploratory=include_exploratory,comparison_report=comparable)
+                    # The WIP displays the direct pace curve, not the retired
+                    # Gaussian/bootstrapped exploratory cards. Keep those
+                    # available to the original page without blocking WIP on
+                    # their (much more expensive) cold fit.
+                    if include_legacy_aerobic:
+                        from ..aerobic_candidate import progress_from_comparability
+                        result['aerobic_progress'] = progress_from_comparability(
+                            connection, comparable, as_of=datetime.fromisoformat(result['as_of']),
+                            history_days=window_days, config=config)
+                    from ..aerobic_performance import progress_from_comparability as performance_trend
+                    from ..progress_chart_context import cached_chart_context
+                    result['aerobic_performance'] = performance_trend(
+                        connection, comparable,
+                        as_of=datetime.fromisoformat(result['as_of']), history_days=window_days,
+                        chart_context=cached_chart_context(connection))
+                    if include_goal_pace_outlook:
+                        from ..pace_outlook import pace_outlook
+                        result['goal_journey']['pace_outlook'] = pace_outlook(
+                            connection,comparable,result['aerobic_performance'],result['goal_journey'],
+                            as_of=datetime.fromisoformat(result['as_of']),timezone=result['timezone'])
+                    result['pace_comparison'] = comparison_view(
+                        comparable, window_days,
+                        datetime.fromisoformat(result['as_of']))
+                    return result
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @api.get("/pace-comparability", tags=["analysis"])
+    def pace_comparability(window_days: int = Query(default=90, ge=14, le=365)) -> dict:
+        from ..pace_comparability import comparison_view
+        from ..comparable_evidence import cached_comparable_evidence
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            with invariant_snapshot(connection):
+                report = cached_comparable_evidence(connection,config)
+                result = comparison_view(report,window_days,datetime.now(timezone.utc))
+        result['timezone'] = config.get('timezone_default','America/New_York')
+        return result
+
+    @api.get("/training-overview", tags=["analysis"])
+    def training_overview() -> dict:
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config["paths"]["database"])
+        if not database.exists():
+            raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            with invariant_snapshot(connection):
+                return build_training_overview(connection, config)
 
     @api.get("/fitness-state", response_model=FitnessState, tags=["coaching"])
     def fitness_state() -> FitnessState:
@@ -391,12 +569,17 @@ def create_app(
             return current_fitness_state(connection, config)
 
     @api.get("/dashboard", response_model=DashboardResponse, tags=["analysis"])
-    def dashboard() -> DashboardResponse:
+    def dashboard(fitness_window_days: int | None = Query(default=None, ge=14, le=365)) -> DashboardResponse:
         config = load_config(selected_config)
+        from ..progress import AVAILABLE_WINDOWS
+        if fitness_window_days is not None and fitness_window_days not in AVAILABLE_WINDOWS:
+            raise HTTPException(status_code=422, detail="Unsupported fitness window")
         database = resolve_project_path(root, config["paths"]["database"])
         with connect(database) as connection:
             initialize(connection)
-            return build_dashboard(connection, config, DASHBOARD_WINDOW_DAYS, root)
+            from ..comparable_evidence import cached_comparable_evidence
+            return build_dashboard(connection, config, DASHBOARD_WINDOW_DAYS, root, fitness_window_days=fitness_window_days,
+                comparison_report=cached_comparable_evidence(connection,config))
 
     @api.post("/recommendation", response_model=RecommendationResponse, tags=["coaching"])
     def recommendation(request: RecommendationRequest) -> RecommendationResponse:
@@ -404,19 +587,21 @@ def create_app(
         database = resolve_project_path(root, config["paths"]["database"])
         with connect(database) as connection:
             initialize(connection)
+            from ..health_reports import record_health_report
+            record_health_report(connection,request.health_status,source='POST /recommendation')
             try:
                 _, result = generate_recommendation(connection, config, request, root)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
         return result
 
-    @api.get("/current-status", response_model=RecommendationRequest, tags=["coaching"])
-    def current_status() -> RecommendationRequest:
+    @api.get("/current-status", response_model=CurrentStatusResponse, tags=["coaching"])
+    def current_status() -> CurrentStatusResponse:
         config = load_config(selected_config)
         database = resolve_project_path(root, config["paths"]["database"])
         with connect(database) as connection:
             initialize(connection)
-            return load_current_status(connection)
+            return load_current_status(connection, timezone_name=config['timezone_default'])
 
     @api.get(
         "/recommendation/latest",
@@ -428,7 +613,27 @@ def create_app(
         database = resolve_project_path(root, config["paths"]["database"])
         with connect(database) as connection:
             initialize(connection)
+            from ..adaptive.live_bridge import enabled
+            if enabled(config):
+                program=ensure_current_weekly_schedule(connection,config,root)
+                return next((day.recommendation for day in program.planning_days if day.recommendation),None)
             return load_latest_recommendation(connection)
+
+    @api.post('/beginner-feedback/{activity_id}', tags=['coaching'])
+    def beginner_feedback(activity_id: int, feedback: BeginnerFeedback) -> dict:
+        from ..beginner import save_feedback
+        from ..plan_refresh import mark_plan_refresh
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config['paths']['database'])
+        with connect(database) as connection:
+            initialize(connection)
+            try:
+                save_feedback(connection, config, datetime.now(timezone.utc), activity_id, feedback)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            mark_plan_refresh(connection)
+        # No search in a feedback write. The calendar request owns handoff.
+        return {'saved': True}
 
     @api.post("/weekly-schedule", response_model=WeeklyScheduleResponse, tags=["coaching"])
     def weekly_schedule(request: WeeklyScheduleRequest) -> WeeklyScheduleResponse:
@@ -436,6 +641,8 @@ def create_app(
         database = resolve_project_path(root, config["paths"]["database"])
         with connect(database) as connection:
             initialize(connection)
+            from ..health_reports import record_health_report
+            record_health_report(connection,request.health_status,source='POST /weekly-schedule')
             return generate_weekly_schedule(connection, config, request, root)
 
     @api.post(
@@ -501,6 +708,55 @@ def create_app(
             initialize(connection)
             return ensure_current_weekly_schedule(connection, config, root)
 
+    @api.post('/weekly-schedule/jobs',status_code=202,tags=['coaching'])
+    def start_planner_job(request: PlannerJobRequest) -> dict:
+        # Call the SAME validated live operations, on a dedicated worker with
+        # its own connection. This does not replace publication/input locks.
+        def build():
+            if request.operation=='refresh':return latest_weekly_schedule()
+            if request.operation=='update':return weekly_schedule(request.update)
+            return set_weekly_rest_day(request.rest)
+        try:
+            return planner_jobs.start(str(request.request_id),request.operation,
+                request.model_dump(mode='json',exclude={'request_id'}),build)
+        except ValueError as error:
+            raise HTTPException(status_code=409,detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503,detail=str(error)) from error
+
+    @api.get('/weekly-schedule/jobs/{job_id}',tags=['coaching'])
+    def planner_job_result(job_id: UUID) -> dict:
+        result=planner_jobs.snapshot(str(job_id))
+        if result is None:
+            raise HTTPException(status_code=404,detail='This planner job expired or the app restarted. Update the plan again.')
+        return result
+
+    @api.post('/strength-completions', tags=['coaching'])
+    def strength_completion(request: StrengthCompletionRequest):
+        from ..strength_completion import save_completion
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config['paths']['database'])
+        with connect(database) as connection:
+            initialize(connection)
+            try:
+                receipt = save_completion(connection, config, request.date,
+                    request.session_type, request.completed)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {'date': request.date, 'strength_completion': receipt}
+
+    @api.get('/weekly-schedule/saved', tags=['coaching'])
+    def saved_weekly_schedule() -> dict:
+        from ..plan_refresh import saved_plan_state
+        config = load_config(selected_config)
+        database = resolve_project_path(root, config['paths']['database'])
+        if not database.exists():
+            return {'schedule': None, 'needs_refresh': True}
+        with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            with invariant_snapshot(connection):
+                return saved_plan_state(connection, config)
+
     def _recommendation_model(result) -> ComparisonHrRecommendation:
         return ComparisonHrRecommendation(
             recommended_bpm=result.recommended_bpm,
@@ -523,7 +779,10 @@ def create_app(
     def reset_advanced() -> SettingsResponse:
         """Restore the modelling parameters, and nothing that describes you."""
 
-        config = reset_advanced_overlay(selected_config)
+        try:
+            config = reset_advanced_overlay(selected_config)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         database = resolve_project_path(root, config["paths"]["database"])
         stages: list = []
         if database.exists():
@@ -534,7 +793,7 @@ def create_app(
                 stages = recalculate_for_settings(
                     connection, config, root, SettingsPatch(moving_time=MovingTimeSettings.model_validate(config["moving_time"]))
                 )
-        return settings_response(config, stages)
+        return settings_response(config, stages, project_root=root)
 
     @api.get("/goal-progress", response_model=GoalProgressResponse, tags=["coaching"])
     def goal_progress_route() -> GoalProgressResponse:
@@ -587,28 +846,51 @@ def create_app(
         heart rate, before anything is saved."""
 
         config = load_config(selected_config)
+        watch_recorded_at = None
+        maximum_hr, resting_hr = request.max_hr, request.resting_hr or config['resting_hr']
         database = resolve_project_path(root, config["paths"]["database"])
         if not database.exists():
             raise HTTPException(status_code=404, detail="Analysis database does not exist")
+        # Resolve the source BEFORE validating: watch ranges must be checked
+        # against that same watch's max/rest HR, not stale custom form values.
+        recorded = None
+        if request.method != 'device' and request.max_hr is None:
+            raise HTTPException(status_code=422, detail='Enter a maximum heart rate for this method.')
+        if request.method == 'device':
+            from ..watch_zones import watch_zone_patch
+            try:
+                with connect(database) as connection:
+                    initialize(connection)
+                    recorded = watch_zone_patch({**config,
+                        'setup': {**(config.get('setup') or {}), 'zone_method': 'device'}},
+                        connection, required=True)
+                maximum_hr, resting_hr = recorded['max_hr'], recorded['resting_hr']
+                watch_recorded_at = recorded['watch_zone_import']['recorded_at']
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
             zones = derive_zones(
                 request.method,
-                maximum_hr=request.max_hr,
-                resting_hr=request.resting_hr,
-                boundaries=(
+                maximum_hr=maximum_hr,
+                resting_hr=resting_hr if recorded else request.resting_hr,
+                boundaries=(recorded['zones'] if recorded else
                     {name: (zone.minimum_bpm, zone.maximum_bpm) for name, zone in request.boundaries.items()}
-                    if request.boundaries
-                    else None
-                ),
+                    if request.boundaries or recorded else None),
             )
+            from ..settings_service import validate_config
+            validate_config({**config, 'max_hr': maximum_hr,
+                'resting_hr': resting_hr,
+                'target_hr': sum(zones['z2']) // 2, 'zones': zones})
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         with connect(database) as connection:
             initialize(connection)
-            recommendation = recommend_comparison_hr(connection, zones)
+            recommendation = automatic_comparison_hr(connection, zones, current=config['target_hr'])
         return ZonePreviewResponse(
             method=request.method,
             zones={name: ZoneRange(minimum_bpm=low, maximum_bpm=high) for name, (low, high) in zones.items()},
+            watch_recorded_at=watch_recorded_at,
+            max_hr=maximum_hr, resting_hr=resting_hr,
             comparison_hr=_recommendation_model(recommendation),
         )
 
@@ -620,11 +902,45 @@ def create_app(
             raise HTTPException(status_code=404, detail="Analysis database does not exist")
         with connect(database) as connection:
             initialize(connection)
-            return _recommendation_model(recommend_comparison_hr(connection, config["zones"]))
+            return _recommendation_model(automatic_comparison_hr(connection, config["zones"], current=config['target_hr']))
+
+    @api.post('/settings/race-preparation/preview', tags=['settings'])
+    def race_preparation_preview(draft: RacePreparationSettings):
+        from ..adaptive.race_settings import preview_preparation
+        try:
+            return preview_preparation(load_config(selected_config), root, draft,
+                                       as_of=datetime.now(timezone.utc))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @api.get("/settings", response_model=SettingsResponse, tags=["settings"])
     def get_settings() -> SettingsResponse:
-        return settings_response(load_config(selected_config))
+        return settings_response(load_config(selected_config), project_root=root)
+
+    @api.get('/settings/race-preparation/status', tags=['settings'])
+    def race_goal_status():
+        from ..adaptive.race_settings import goal_status
+        return goal_status(load_config(selected_config),root)
+
+    @api.post('/settings/race-preparation/apply', tags=['settings'])
+    def apply_race_goal(request: RacePreparationApply):
+        from ..adaptive.race_settings import save_race_request
+        try:
+            return save_race_request(load_config(selected_config),root,request.goal,
+                expected_revision=request.expected_revision,as_of=datetime.now(timezone.utc),
+                planner_preferences=request.planner_preferences)
+        except (ValueError,OSError,sqlite3.Error) as error:
+            raise HTTPException(status_code=422,detail=str(error)) from error
+
+    @api.post('/settings/race-preparation/outcome', tags=['settings'])
+    def report_race_outcome(request: RaceEventReport):
+        from ..adaptive.race_settings import save_race_outcome
+        try:
+            return save_race_outcome(load_config(selected_config),root,status=request.status,
+                physical_key=request.physical_key,expected_revision=request.expected_revision,
+                as_of=datetime.now(timezone.utc))
+        except (ValueError,OSError,sqlite3.Error) as error:
+            raise HTTPException(status_code=422,detail=str(error)) from error
 
     @api.patch("/settings", response_model=SettingsResponse, tags=["settings"])
     def patch_settings(patch: SettingsPatch) -> SettingsResponse:
@@ -632,6 +948,25 @@ def create_app(
         database = resolve_project_path(root, base["paths"]["database"])
         stages = []
         try:
+            if 'planner_preferences' in patch.model_fields_set:
+                if patch.model_fields_set != {'planner_preferences'} or patch.planner_preferences is None:
+                    raise ValueError('Save planner preferences separately from calibration and other settings')
+                if not database.exists():
+                    raise ValueError('No analysis database; no planner preferences saved')
+                from datetime import datetime, timezone
+                from run_analysis.adaptive.settings_view import save_planner_preferences
+                with connect(database) as connection:
+                    revision = save_planner_preferences(connection,base,patch.planner_preferences,
+                        as_of=datetime.now(timezone.utc))
+                return settings_response(base, [UploadStage(name='planner_preferences',
+                    status='deferred' if revision else 'unchanged',
+                    detail='Saved a dated preference request. Frequency and long-run day edits apply on the next successful plan re-evaluation; destination-only edits join the next normal replan. The issued plan is unchanged.'
+                        if revision else 'Preferences are unchanged; no new request or search.')], project_root=root)
+            if patch.model_fields_set & {'training_background','beginner_start'} and not database.exists():
+                # A starting-level declaration is usable before the first
+                # upload, but must still verify there is no adopted runtime.
+                with connect(database) as connection:
+                    initialize(connection)
             if database.exists():
                 with connect(database) as connection:
                     initialize(connection)
@@ -649,7 +984,7 @@ def create_app(
                 config = save_settings_overlay(selected_config, patch)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return settings_response(config, stages)
+        return settings_response(config, stages, project_root=root)
 
     app.include_router(api)
     app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")

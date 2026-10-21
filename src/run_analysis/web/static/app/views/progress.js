@@ -1,3 +1,5 @@
+// Deprecated layout: retained for reference, no longer routed. The main Progress
+// view lives in progress-wip.js; the shared Progress calculations remain in use.
 import { api, appSettings, targetHrLabel } from "../api.js";
 import { balanceSentiment, DIRECTION, SENTIMENT, comparisonValue, directionValue, trendValue } from "../components.js";
 import { fitnessChart, vo2Chart } from "../charts.js";

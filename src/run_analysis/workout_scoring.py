@@ -24,6 +24,7 @@ from .web.schemas import (
     IntervalAnalysis,
     IntervalRepetition,
     PrescriptionMatchAnalysis,
+    QualitySessionType,
     RecommendationResponse,
     SessionDifficulty,
     Split,
@@ -143,7 +144,7 @@ def _recorded_lap_analysis(
     z4_floor: float,
 ) -> IntervalAnalysis | None:
     usable = usable_recorded_laps(recorded_laps(connection, activity_id))
-    work_positions = recorded_interval_work_positions(usable)
+    work_positions = recorded_interval_work_positions(usable,intervals)
     if len(work_positions) < 2:
         return None
     first_work, last_work = min(work_positions), max(work_positions)
@@ -523,7 +524,27 @@ def _prescription_analysis(
             target_work += float(step.duration_minutes or 0)
     target_work = target_work or None
     detected_work: float | None = None
+    progression_phase=None
+    progression_start_miles=None
+    progression_start_band=None
+    progression_close=False
     source = "heart_rate_zone_exposure"
+    if prescription.quality_session_type==QualitySessionType.PROGRESSION:
+        progression_phase=detect_continuous_quality_phase(connection,config,activity_id)
+        if progression_phase is not None:
+            detected_work=progression_phase.duration_seconds/60
+            source='recorded_progression_laps'
+            laps=recorded_laps(connection,activity_id)
+            progression_start_miles=sum(float(r['distance_m'] or 0) for r in laps
+                if r['lap_index']<progression_phase.lap_index)/METERS_PER_MILE
+            if prescription.distance_range_miles:
+                progression_start_band=tuple(m/2 for m in prescription.distance_range_miles)
+                low,high=progression_start_band
+                # Use the existing quarter-mile execution margin, not a new
+                # fatigue/adherence weight. Measured early work is still work.
+                progression_close=(low-.25<=progression_start_miles<=high+.25
+                    and progression_phase.distance_miles is not None
+                    and low-.25<=progression_phase.distance_miles<=high+.25)
     if (
         interval_analysis is not None
         and interval_analysis.available
@@ -624,6 +645,8 @@ def _prescription_analysis(
         and terrain_adjusted_adherence >= aerobic_target_share
     )
     work_close = bool(
+        progression_close
+        or
         (
             prescribed_aerobic
             and aerobic_intensity_close
@@ -643,7 +666,15 @@ def _prescription_analysis(
     )
     distance_close = distance_delta_miles <= 0.25
     duration_close = duration_delta_minutes <= 1e-9
-    if (
+    if progression_phase is not None and not progression_close:
+        status='Progression detected; execution differed'
+        expected=(f'{progression_start_band[0]:.1f}–{progression_start_band[1]:.1f} miles'
+            if progression_start_band else 'the first half')
+        summary=(f'Recorded sustained faster/higher-HR work after {progression_start_miles:.1f} miles, '
+            f'rather than after {expected} easy as prescribed. '
+            'The actual quality work counts, but this is not marked fully compliant. '
+            'Total-distance adherence is evaluated separately.')
+    elif (
         requires_work_detection
         and not difficulty.is_quality_session
         and known_hr_minutes > 0
@@ -819,8 +850,10 @@ def analyze_workout(
                 )
                 execution = analysis.execution.model_copy(
                     update={
-                        "status": "Structured threshold work detected",
+                        "status": "Progression finish detected" if phase and phase.structure=='progression_finish' else "Structured threshold work detected",
                         "summary": (
+                            "A manual lap separates the easy start from a sustained faster, higher-HR finish; a cooldown is not required."
+                            if phase and phase.structure=='progression_finish' else
                             "A sustained manual lap separates the threshold "
                             "work from the easy warm-up and cool-down."
                         ),

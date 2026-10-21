@@ -34,6 +34,7 @@ from run_analysis.projection_gate import (
     build_projection_report,
 )
 from run_analysis.weekly_schedule import WEEKLY_WARM_START_MIN_VERSION
+from run_analysis.web.schemas import RecommendationRequest
 
 
 def main() -> None:
@@ -135,6 +136,15 @@ def main() -> None:
         help="Exit nonzero when the projection violates a regression gate.",
     )
     parser.add_argument(
+        "--strict-key-cadence",
+        action="store_true",
+        help=(
+            "Treat the legacy key-session calendar cadence fixture as a hard "
+            "gate. By default recurrence overruns are reported as advisories; "
+            "recovery, load, and stability gates remain strict."
+        ),
+    )
+    parser.add_argument(
         "--stop-on-first-failure",
         action="store_true",
         help="Stop immediately after the first bad daily replan.",
@@ -176,7 +186,10 @@ def main() -> None:
     )
     with connect(database) as connection:
         initialize(connection)
-        state = current_fitness_state(connection, config)
+        state = current_fitness_state(
+            connection, config,
+            RecommendationRequest(planned_at=start_at, health_status="normal"),
+        )
         runs = runs_from_summaries(list_runs(connection, limit=5000))
         initial_schedule = (
             None if args.ignore_saved_plan else load_latest_weekly_schedule(connection)
@@ -201,14 +214,13 @@ def main() -> None:
             # this enabled for imperfect scenarios so legitimate disruption
             # does not grant every subsequent replan a blanket exemption.
             enforce_stability=True,
-            enforce_key_session_cadence=scenario
+            enforce_key_session_cadence=args.strict_key_cadence,
+            audit_key_session_cadence=True,
+            enforce_aerobic_exposure_cadence=scenario
             in {"perfect", "in_range_low", "in_range_high"},
             require_capacity_progression=(
                 scenario == "perfect"
-                and (
-                    args.simulation_days is None
-                    or args.simulation_days >= 91
-                )
+                and (args.simulation_days or max(1, args.weeks) * 7) >= 90
             ),
         ),
         fail_fast=args.stop_on_first_failure,
@@ -286,6 +298,16 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"Projection JSON: {output_path}")
+    if gate.advisories:
+        largest_gap = max(
+            max(item.evidence.get("observed_gaps_days", [0.0]))
+            for item in gate.advisories
+        )
+        print(
+            f"Cadence audit: {len(gate.advisories)} replan/lane advisories; "
+            f"largest legacy calendar gap {largest_gap:.1f} days. "
+            "These remain review findings, not automatic safety failures."
+        )
     if stopped_early:
         if args.fail_on_regression:
             raise SystemExit(1)
@@ -328,8 +350,8 @@ def main() -> None:
         f"{sum(item.skipped_run_count for item in weeks)} skipped, "
         f"{sum(item.unscheduled_run_count for item in weeks)} unscheduled; "
         f"{sum(item.assumed_completed_miles for item in weeks):.1f} actual miles; "
-        f"{sum(item.assumed_completed_miles for item in weeks) / len(weeks):.1f} "
-        "miles per seven days over the full projection; "
+        f"{sum(item.assumed_completed_miles for item in weeks) * 7 / (args.simulation_days or max(1, args.weeks) * 7):.1f} "
+        "miles per seven decision days over the simulated period; "
         f"maximum streak {max(item.maximum_consecutive_run_days for item in weeks)} days; "
         "diagnostic peak rolling-7 load "
         f"{max(item.peak_rolling_7d_miles for item in weeks):.1f} miles."

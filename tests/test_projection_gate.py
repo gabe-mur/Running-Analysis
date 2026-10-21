@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -28,11 +29,12 @@ def _session(
     workout_type: WorkoutType = WorkoutType.EASY,
     *,
     readiness: str | None = None,
+    midpoint_miles: float = 4.0,
 ):
     return ProjectionPlanSession(
         planned_for=OPENING + timedelta(days=day),
         workout_type=workout_type,
-        midpoint_miles=4.0,
+        midpoint_miles=midpoint_miles,
         readiness=readiness,
     )
 
@@ -225,6 +227,85 @@ def test_key_session_cadence_uses_elapsed_gaps_and_recovery_exceptions() -> None
     assert not recovery_rejected
 
 
+def test_key_session_cadence_anchors_recency_to_decision_boundary() -> None:
+    failures = evaluate_replan_regressions(
+        _replan(
+            _session(2, WorkoutType.LONG),
+            _session(10, WorkoutType.LONG),
+            _session(18, WorkoutType.LONG),
+            days_since_long_run=6.2,
+        ),
+        ProjectionGateConfig(enforce_key_session_cadence=True),
+    )
+
+    assert [item.code for item in failures] == ["long_cadence_gap"]
+    assert failures[0].evidence["observed_gaps_days"][0] == 9.0
+
+
+def test_underfunded_established_plan_rejects_unexplained_aerobic_gap() -> None:
+    trajectory = tuple((17.7, 18.7) for _ in range(21))
+    sessions = tuple(
+        _session(day, midpoint_miles=5.8)
+        for day in (1, 3, 5, 10, 12, 14, 17, 19)
+    )
+
+    failures = evaluate_replan_regressions(
+        _replan(
+            *sessions,
+            boundary_session_miles=8.45,
+            target_trajectory=trajectory,
+        ),
+        ProjectionGateConfig(enforce_aerobic_exposure_cadence=True),
+    )
+
+    # The completed long run is large enough to satisfy the legacy aggregate
+    # boundary allowance. It must not hide an internal five-day hole while
+    # the new horizon remains materially below its integrated target.
+    assert "hard_horizon_underfunded" not in {item.code for item in failures}
+    aerobic = [
+        item for item in failures
+        if item.code == "underfunded_aerobic_exposure_gap"
+    ]
+    assert len(aerobic) == 1
+    assert aerobic[0].evidence["maximum_date_separation_days"] == 5
+    assert aerobic[0].evidence["allowed_date_separation_days"] == 4
+
+
+def test_aerobic_gap_gate_is_load_aware_and_accepts_recovery_exceptions() -> None:
+    sparse_sessions = tuple(
+        _session(day) for day in (0, 5, 10, 15, 20)
+    )
+    low_volume_trajectory = tuple((8.0, 9.0) for _ in range(21))
+    high_volume_trajectory = tuple((17.7, 18.7) for _ in range(21))
+    config = ProjectionGateConfig(enforce_aerobic_exposure_cadence=True)
+
+    low_volume = evaluate_replan_regressions(
+        _replan(
+            *sparse_sessions,
+            target=(8.0, 9.0),
+            target_trajectory=low_volume_trajectory,
+        ),
+        config,
+    )
+    recovery_limited = evaluate_replan_regressions(
+        _replan(
+            *sparse_sessions,
+            target_trajectory=high_volume_trajectory,
+            cadence_exception_reasons=(
+                "Recovery screening deferred the next aerobic exposure.",
+            ),
+        ),
+        config,
+    )
+
+    assert "underfunded_aerobic_exposure_gap" not in {
+        item.code for item in low_volume
+    }
+    assert "underfunded_aerobic_exposure_gap" not in {
+        item.code for item in recovery_limited
+    }
+
+
 def test_gate_distinguishes_zero_target_from_empty_positive_plan() -> None:
     zero_target = evaluate_replan_regressions(
         _replan(target=(0.0, 0.0)),
@@ -241,15 +322,81 @@ def test_gate_distinguishes_zero_target_from_empty_positive_plan() -> None:
     ]
 
 
+@pytest.mark.parametrize("ending,failed", [(15.0, True), (16.0, True), (17.0, False)])
+def test_progression_uses_last_decision_not_weekly_row(ending, failed) -> None:
+    gate = ProjectionGate(ProjectionGateConfig(require_capacity_progression=True))
+    gate.snapshots = [
+        _replan(),
+        replace(
+            _replan(generated_at=OPENING + timedelta(days=89)),
+            capacity_reference_miles=ending,
+        ),
+    ]
+    gate.finalize([])
+    assert bool(gate.failures) is failed
+    if failed:
+        assert gate.failures[0].code == "no_capacity_progression"
+        assert gate.failures[0].evidence["final_capacity_miles"] == ending
+
+
+def test_missing_capacity_endpoint_cannot_pass_progression() -> None:
+    gate = ProjectionGate(ProjectionGateConfig(require_capacity_progression=True))
+    gate.snapshots = [_replan(), replace(_replan(), capacity_reference_miles=None)]
+    gate.finalize([])
+    assert gate.failures[0].code == "missing_capacity_endpoint"
+
+
+def test_capacity_audit_reports_intermediate_drawdown() -> None:
+    gate = ProjectionGate(ProjectionGateConfig())
+    gate.snapshots = [
+        replace(_replan(), capacity_reference_miles=value)
+        for value in (16.0, 20.0, 15.0, 21.0)
+    ]
+    report = build_projection_report(
+        mode="perfect", seed=1, replan_interval_days=1,
+        weeks=[], gate=gate, stopped_early=False,
+    )
+    assert report["capacity_audit"] == {
+        "opening_decision_miles": 16.0, "final_decision_miles": 21.0,
+        "minimum_miles": 15.0, "maximum_miles": 21.0,
+        "largest_drawdown_miles": 5.0, "observations": 4,
+    }
+
+
+def test_advisory_cadence_is_reported_without_disabling_other_gates() -> None:
+    gate = ProjectionGate(ProjectionGateConfig(audit_key_session_cadence=True))
+    # Enough work to fund the horizon; long exposures are intentionally late.
+    sessions = tuple(
+        _session(
+            day, WorkoutType.LONG if day in {6, 14} else WorkoutType.EASY,
+            midpoint_miles=4.75,
+        )
+        for day in range(0, 21, 2)
+    )
+    gate.observe(_replan(*sessions, days_since_long_run=6.0))
+    assert any(item.code == "long_cadence_gap" for item in gate.advisories)
+    assert not any(item.code == "long_cadence_gap" for item in gate.failures)
+    assert not gate.failures
+    gate.observe(_replan(days_since_long_run=6.0))
+    assert any(item.code == "empty_positive_target_plan" for item in gate.failures)
+    report = build_projection_report(
+        mode="perfect", seed=1, replan_interval_days=1,
+        weeks=[], gate=gate, stopped_early=False,
+    )
+    assert report["advisories"]
+    assert report["gate_policy"]["audit_key_session_cadence"] is True
+    assert report["status"] == "failed"
+
+
 def test_gate_excludes_consumed_date_but_catches_future_date_move() -> None:
     gate = ProjectionGate(
         ProjectionGateConfig(enforce_stability=True),
     )
     gate.observe(_replan(_session(1), _session(3)))
     gate.observe(
-        _replan(
-            _session(3),
-            generated_at=OPENING + timedelta(days=1),
+        replace(
+            _replan(_session(3), generated_at=OPENING + timedelta(days=1)),
+            decision_start_date=(OPENING + timedelta(days=2)).date(),
         )
     )
     assert not gate.failures
@@ -265,6 +412,27 @@ def test_gate_excludes_consumed_date_but_catches_future_date_move() -> None:
         (OPENING + timedelta(days=3)).date().isoformat(),
         (OPENING + timedelta(days=4)).date().isoformat(),
     ]
+
+
+@pytest.mark.parametrize("remove_today", [True, False])
+def test_refresh_catches_unconsumed_today_date_and_distance_churn(remove_today) -> None:
+    gate = ProjectionGate(ProjectionGateConfig(enforce_stability=True))
+    gate.observe(_replan(_session(0), _session(3)))
+    after = [_session(3)]
+    if not remove_today:
+        after.append(_session(0, midpoint_miles=2.0))
+    gate.observe(_replan(*after, generated_at=OPENING + timedelta(hours=1)))
+    expected_code = (
+        "no_evidence_refresh_churn" if remove_today else "no_evidence_distance_churn"
+    )
+    assert any(item.code == expected_code for item in gate.failures)
+
+
+def test_checking_today_does_not_drop_fourth_future_day_from_gate() -> None:
+    gate = ProjectionGate(ProjectionGateConfig(enforce_stability=True))
+    gate.observe(_replan(_session(4)))
+    gate.observe(_replan(_session(5), generated_at=OPENING + timedelta(hours=1)))
+    assert any(item.code == "no_evidence_refresh_churn" for item in gate.failures)
 
 
 def test_distance_only_edit_is_reported_but_does_not_fail_stability() -> None:

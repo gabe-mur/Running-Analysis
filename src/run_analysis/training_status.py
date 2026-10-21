@@ -304,6 +304,9 @@ def build_training_status(state: FitnessState, config: dict | None = None) -> Tr
             near_capacity_ratio=NEAR_CAPACITY_RATIO,
             quality_sessions_14d=state.quality_sessions_14d,
             fitness_trend=state.fitness_trend.value,
+            capacity_reference_miles=capacity,
+            previous_capacity_reference_miles=state.recent_load.previous_capacity_reference_miles,
+            improvement_supported=improving,
         )
     )
     if building:

@@ -1,8 +1,7 @@
-"""Prior-anchored, auditable aerobic-efficiency scoring.
+"""Comparable observed aerobic pace, with no unvalidated pace credits.
 
-Published evidence supplies environmental priors. Personal evidence may update
-them only through local hot/cool matches, so a changing multi-year fitness trend
-cannot freely determine an environmental coefficient.
+Historical correction helpers remain for diagnostic reproduction only. The
+primary score does not apply their HR, time, grade, or weather transformations.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from .physiology import estimated_shade_wbgt_f
 from .quality_phases import ContinuousQualityPhase, detect_continuous_quality_phase
 
 METERS_PER_MILE = 1609.344
-MODEL_VERSION = "aerobic-v10-quality-phase-aware"
+MODEL_VERSION = "aerobic-v11-observed-comparable-pace"
 
 
 def pace_to_speed_mps(pace_min_mile: float) -> float:
@@ -225,7 +224,7 @@ def _pre_quality_indexes(
 ) -> list[int]:
     """Keep only windows completed before a structured quality block starts."""
 
-    if phase is None:
+    if phase is None or not indexes:
         return indexes
     activity_start = datetime.fromisoformat(rows[indexes[0]]["start_time_utc"])
     quality_start = activity_start.timestamp() + phase.start_offset_seconds
@@ -244,7 +243,6 @@ def _weighted_mean(values: list[float], weights: list[float]) -> float:
 def _shared_parameter_eligible(row: dict[str, Any]) -> bool:
     return (
         bool(row.get("gps_sufficient_for_shared_parameters", True))
-        and not bool(row.get("weather_location_estimated"))
         and str(row.get("health_tag") or "normal") == "normal"
         and str(row.get("workout_type") or "unknown")
         not in {"intervals", "tempo_threshold", "race", "run_walk", "hike", "bike"}
@@ -601,27 +599,18 @@ def fit_published_reference_model(
     if len({int(row["activity_id"]) for row in rows}) < 10:
         raise ValueError("At least 10 runs with reliable steady-state windows are required")
 
-    calibration_speeds = [_prior_corrected_speed(row, config) for row in calibration_rows]
-    hr_slope, time_slope, slope_diagnostics = _within_run_hr_time_slopes(
-        calibration_rows, calibration_speeds
-    )
+    from .pace_validation import validate_pace_normalization
+
+    validation = validate_pace_normalization(calibration_rows)
+    # Slopes are tested above, never silently reused as primary-score credits.
+    hr_slope = time_slope = 0.0
+    slope_diagnostics = {"method": "not applied; observed pace only", "validation": validation}
     target_hr = float(config["target_hr"])
     reference_minutes = float(config["reference_conditions"]["within_run_minutes"])
     raw_window_speeds = [pace_to_speed_mps(float(row["moving_pace_min_mile"])) for row in rows]
-    raw_hr_window_speeds = [
-        speed + hr_slope * (target_hr - float(row["average_hr_bpm"]))
-        for speed, row in zip(raw_window_speeds, rows)
-    ]
-    raw_hr_time_window_speeds = [
-        speed
-        + time_slope
-        * (reference_minutes - float(row["moving_minutes_into_run"]))
-        for speed, row in zip(raw_hr_window_speeds, rows)
-    ]
-    grade_window_speeds = [
-        speed * (float(row["grade_energy_ratio"]) if row.get("grade_energy_ratio") is not None else 1.0)
-        for speed, row in zip(raw_hr_time_window_speeds, rows)
-    ]
+    raw_hr_window_speeds = raw_window_speeds
+    raw_hr_time_window_speeds = raw_window_speeds
+    grade_window_speeds = raw_window_speeds
 
     grouped: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
@@ -635,69 +624,29 @@ def fit_published_reference_model(
             quality_phases[activity_id] = phase
     # Use every reliable overlapping window. Relevance and transition quality
     # affect weight continuously; no best-section selection determines the run.
-    comparable_grouped = grouped
+    z2_low, z2_high = map(float, config["zones"]["z2"])
+    comparable_grouped = {
+        activity_id: [index for index in indexes
+                      if z2_low <= float(rows[index]["average_hr_bpm"]) <= z2_high]
+        for activity_id, indexes in grouped.items()
+    }
     window_weights = [_primary_window_weight(row, config) for row in rows]
-    heat_evidence_rows = []
-    for activity_id, indexes in comparable_grouped.items():
-        if not _shared_parameter_eligible(rows[indexes[0]]):
-            continue
-        weights = [window_weights[index] for index in indexes]
-        heat_evidence_rows.append(
-            {
-                "activity_id": activity_id,
-                "start_time_utc": rows[indexes[0]]["start_time_utc"],
-                "pace_before_heat": speed_to_pace_min_mile(
-                    _robust_weighted_speed(
-                        [grade_window_speeds[index] for index in indexes], weights
-                    )
-                ),
-                "heat_exposure_c": _weighted_mean(
-                    [_heat_exposure_c(rows[index], config) for index in indexes], weights
-                ),
-            }
-        )
-    heat_posterior = _estimate_heat_posterior(heat_evidence_rows, config)
-    heat_coefficient = float(heat_posterior["posterior_mean_fraction_per_c"])
-    temperature_log_factors = []
-    dewpoint_log_factors = []
-    for row in rows:
-        temperature_factor, dewpoint_factor = _temperature_dew_log_factors(
-            row, config, heat_coefficient
-        )
-        temperature_log_factors.append(temperature_factor)
-        dewpoint_log_factors.append(dewpoint_factor)
-    standardized_window_speeds = [
-        speed * math.exp(temperature + dewpoint)
-        for speed, temperature, dewpoint in zip(
-            grade_window_speeds, temperature_log_factors, dewpoint_log_factors
-        )
-    ]
-    temperature_window_speeds = [
-        speed * math.exp(temperature)
-        for speed, temperature in zip(grade_window_speeds, temperature_log_factors)
-    ]
+    standardized_window_speeds = raw_window_speeds
+    temperature_window_speeds = raw_window_speeds
     benchmark_rows = rows if benchmark_seconds == primary_seconds else window_sets[benchmark_seconds]
     benchmark_raw_speeds = [
         pace_to_speed_mps(float(row["moving_pace_min_mile"])) for row in benchmark_rows
     ]
-    benchmark_hr_speeds = [
-        speed + hr_slope * (target_hr - float(row["average_hr_bpm"]))
-        for speed, row in zip(benchmark_raw_speeds, benchmark_rows)
-    ]
-    benchmark_grade_speeds = [
-        speed * (float(row["grade_energy_ratio"]) if row.get("grade_energy_ratio") is not None else 1.0)
-        for speed, row in zip(benchmark_hr_speeds, benchmark_rows)
-    ]
-    benchmark_standardized_speeds = [
-        speed * math.exp(sum(_temperature_dew_log_factors(row, config, heat_coefficient)))
-        for speed, row in zip(benchmark_grade_speeds, benchmark_rows)
-    ]
+    benchmark_hr_speeds = benchmark_raw_speeds
+    benchmark_standardized_speeds = benchmark_raw_speeds
     benchmark_grouped: dict[int, list[int]] = defaultdict(list)
     for index, row in enumerate(benchmark_rows):
         benchmark_grouped[int(row["activity_id"])].append(index)
     phase_safe_benchmark_grouped = {
         activity_id: _pre_quality_indexes(
-            benchmark_rows, indexes, quality_phases.get(activity_id)
+            benchmark_rows,
+            [index for index in indexes if z2_low <= float(benchmark_rows[index]["average_hr_bpm"]) <= z2_high],
+            quality_phases.get(activity_id)
         )
         for activity_id, indexes in benchmark_grouped.items()
     }
@@ -712,33 +661,32 @@ def fit_published_reference_model(
         if indexes
     }
     centered_residuals = []
-    for indexes in grouped.values():
-        if not _shared_parameter_eligible(rows[indexes[0]]):
+    for indexes in comparable_grouped.values():
+        if not indexes:
             continue
         weights = [window_weights[index] for index in indexes]
         center = _robust_weighted_speed(
             [standardized_window_speeds[index] for index in indexes], weights
         )
         centered_residuals.extend(standardized_window_speeds[index] - center for index in indexes)
+    if not centered_residuals:
+        raise ValueError("At least 10 runs with reliable steady-state windows are required; no comparable Z2 pace samples")
     residual_sigma = 1.4826 * median(abs(value - median(centered_residuals)) for value in centered_residuals)
     residual_sigma = max(residual_sigma, 1e-6)
 
     version_payload = {
         "model_version": MODEL_VERSION,
         "window_seconds": primary_seconds,
-        "heat_prior_fraction_per_c": config["model"]["fixed_heat_loss_fraction_per_c"],
-        "heat_posterior_fraction_per_c": heat_posterior[
-            "posterior_mean_fraction_per_c"
-        ],
         "target_hr": target_hr,
         "hr_slope_method": slope_diagnostics["method"],
         "shared_time_slope_mps_per_minute": time_slope,
         "comparable_reference_minutes": reference_minutes,
         "window_stride_seconds": primary_stride,
-        "aggregation": "shared HR/time fixed effects plus robust run offset",
+        "aggregation": "robust observed Z2 speed near comparison HR/time; no pace credits",
+        "observed_hr_bounds": [z2_low, z2_high],
     }
     version = hashlib.sha256(json.dumps(version_payload, sort_keys=True).encode()).hexdigest()[:16]
-    selected_name = "literature-prior + locally matched personal evidence"
+    selected_name = "observed comparable aerobic pace"
     connection.execute("DELETE FROM model_runs WHERE model_name='standardized_pace_at_target_hr'")
     connection.execute(
         """UPDATE activity_metrics SET standardized_pace_at_target_hr_min_mile=NULL,
@@ -749,7 +697,7 @@ def fit_published_reference_model(
     connection.execute(
         "UPDATE activity_metrics SET exclusion_reason=NULL "
         "WHERE exclusion_reason IN "
-        "('reference_time_unsupported_by_run_windows','no_pre_quality_aerobic_windows')"
+        "('reference_time_unsupported_by_run_windows','no_pre_quality_aerobic_windows','no_comparable_aerobic_windows')"
     )
 
     run_paces = []
@@ -759,7 +707,7 @@ def fit_published_reference_model(
         if not indexes:
             connection.execute(
                 "UPDATE activity_metrics SET exclusion_reason=? WHERE activity_id=?",
-                ("no_pre_quality_aerobic_windows", activity_id),
+                ("no_pre_quality_aerobic_windows" if phase else "no_comparable_aerobic_windows", activity_id),
             )
             continue
         run_rows = [rows[index] for index in indexes]
@@ -809,18 +757,8 @@ def fit_published_reference_model(
         low = speed_to_pace_min_mile(final_speed + speed_uncertainty)
         high = speed_to_pace_min_mile(max(0.1, final_speed - speed_uncertainty))
         measurement_uncertainty = (high - low) / 2.0 * time_support_multiplier
-        run_heat_exposure = _weighted_mean(
-            [_heat_exposure_c(row, config) for row in run_rows], weights
-        )
-        heat_coefficient_uncertainty = (
-            1.96
-            * standardized_pace
-            * float(heat_posterior["posterior_sd_fraction_per_c"])
-            * run_heat_exposure
-        )
-        uncertainty = math.sqrt(
-            measurement_uncertainty**2 + heat_coefficient_uncertainty**2
-        )
+        heat_coefficient_uncertainty = 0.0
+        uncertainty = measurement_uncertainty
         run_gps_coverage = _weighted_mean(
             [float(row.get("gps_complete_fraction") or 0.0) for row in run_rows],
             weights,
@@ -839,12 +777,6 @@ def fit_published_reference_model(
                 float(config["model"].get("device_distance_fallback_uncertainty_seconds_per_mile", 30))
                 * gps_coverage_shortfall
             ) ** 2
-            + (
-                float(config["model"].get("estimated_weather_location_uncertainty_seconds_per_mile", 10))
-                if uses_estimated_weather_location
-                else 0.0
-            )
-            ** 2
         )
         uncertainty = math.sqrt(uncertainty**2 + (fallback_penalty_seconds / 60.0) ** 2)
 
@@ -869,69 +801,20 @@ def fit_published_reference_model(
                 "drift_adjustment",
             )
         )
-        grade_adjusted_count = sum(
-            row.get("grade_energy_ratio") is not None for row in run_rows
-        )
-        if grade_adjusted_count == len(run_rows):
-            grade_confidence = "high"
-        elif grade_adjusted_count:
-            grade_confidence = "moderate"
-        else:
-            grade_confidence = "unavailable"
-        support_count = int(
-            heat_posterior["run_support_counts"].get(str(activity_id), 0)
-        )
-        if heat_posterior["confidence"] == "high" and support_count >= 8:
-            run_heat_confidence = "high"
-        elif heat_posterior["confidence"] in {"high", "moderate"} and support_count >= 3:
-            run_heat_confidence = "moderate"
-        else:
-            run_heat_confidence = "low"
+        grade_adjusted_count = 0
         adjustment_evidence = {
-            "heart_rate": {
-                "confidence": "moderate",
-                "basis": "within-run centered personal calibration",
-                "personal_data_weight": 1.0,
-            },
-            "time": {
-                "confidence": "moderate",
-                "basis": "shared run-centered time effect across normal non-quality runs",
-                "personal_data_weight": 1.0,
-            },
-            "grade": {
-                "confidence": grade_confidence,
-                "basis": "published Minetti transform plus recorded altitude coverage",
-                "personal_data_weight": 0.0,
-            },
-            "temperature": {
-                "confidence": run_heat_confidence,
-                "basis": "literature prior updated by local hot/cool matches",
-                "personal_data_weight": heat_posterior["personal_data_weight"],
-                "local_match_count": support_count,
-            },
-            "dew_point": {
-                "confidence": run_heat_confidence,
-                "basis": "WBGT Shapley decomposition of the same heat posterior",
-                "personal_data_weight": heat_posterior["personal_data_weight"],
-                "local_match_count": support_count,
-            },
-            "wind": {
-                "confidence": "unavailable",
-                "basis": "reported but not adjusted",
-                "personal_data_weight": 0.0,
-            },
-            "drift": {
-                "confidence": "unavailable",
-                "basis": "filtered and reported, not adjusted",
-                "personal_data_weight": 0.0,
-            },
+            name: {"confidence": "unavailable", "basis": "not applied; correction not validated for this pace estimate",
+                   "personal_data_weight": 0.0}
+            for name in ("heart_rate", "time", "grade", "temperature", "dew_point", "wind", "drift")
         }
         result = {
             "activity_id": run_rows[0]["external_activity_id"],
-            # The heart rate every "at target HR" figure in this result refers
-            # to. Stored per run so a later configuration change is visible
-            # instead of silently relabeling old estimates.
+            # Comparison reference, not a claim that the recorded samples
+            # occurred at exactly this HR. Keep their actual mean alongside it.
             "target_hr_bpm": float(config["target_hr"]),
+            "pace_basis": "observed_comparable",
+            "observed_average_hr_bpm": _weighted_mean([float(row["average_hr_bpm"]) for row in run_rows], weights),
+            "observed_hr_bounds_bpm": [z2_low, z2_high],
             "observed_segment_pace_min_mile": observed_pace,
             "raw_pace_at_target_hr_min_mile": raw_pace_at_target_hr,
             "environmental_adjustment_min_mile": environmental_adjustment,
@@ -985,9 +868,9 @@ def fit_published_reference_model(
             "interpretation": (
                 "pre-quality aerobic windows only; work and cooldown are tracked separately"
                 if phase is not None
-                else "higher-uncertainty estimate from Garmin device-distance windows at reference HR/time/conditions"
+                else "higher-uncertainty observed aerobic pace from Garmin device-distance windows"
                 if uses_device_fallback
-                else "shared HR/time effects plus robust run-specific performance offset at reference conditions"
+                else "observed aerobic pace near comparison HR and time; no physiological pace corrections"
             ),
         }
         strict_benchmark_indexes = selected_benchmark.get(activity_id, [])
@@ -1009,9 +892,9 @@ def fit_published_reference_model(
             benchmark_low = speed_to_pace_min_mile(benchmark_speed + benchmark_speed_uncertainty)
             benchmark_high = speed_to_pace_min_mile(max(0.1, benchmark_speed - benchmark_speed_uncertainty))
             benchmark_measurement_uncertainty = (benchmark_high - benchmark_low) / 2.0
-            benchmark_fallback_penalty = _distance_fallback_penalty_seconds(
-                benchmark_row, config
-            )
+            benchmark_gps_shortfall = max(0.0, 1.0 - float(benchmark_row.get("gps_complete_fraction") or 0.0)
+                                          / max(float(config["model"]["minimum_gps_coverage"]), 1e-9))
+            benchmark_fallback_penalty = float(config["model"].get("device_distance_fallback_uncertainty_seconds_per_mile", 30)) * benchmark_gps_shortfall
             benchmark_uncertainty = math.sqrt(
                 benchmark_measurement_uncertainty**2
                 + (benchmark_fallback_penalty / 60.0) ** 2
@@ -1042,7 +925,7 @@ def fit_published_reference_model(
                 "definition": (
                     "one continuous, stable aerobic window nearest minute 20"
                     if strict_observation
-                    else "nearest reliable fixed-time window, HR-normalized and uncertainty-weighted"
+                    else "nearest reliable fixed-time window; observed pace, not HR-normalized"
                 ),
             }
         else:
@@ -1075,6 +958,8 @@ def fit_published_reference_model(
         }
         for seconds, sensitivity_rows in sorted(window_sets.items())
     }
+    if not run_paces:
+        raise ValueError("At least 10 runs with reliable steady-state windows are required; no comparable Z2 pace samples")
     reference_pace = float(median(run_paces))
     reliability = dict(primary_diagnostics)
     reliability["grade_unavailable_retained"] = sum(
@@ -1083,22 +968,23 @@ def fit_published_reference_model(
     metadata = {
         "model_version": MODEL_VERSION,
         "version": version,
-        "method_kind": "prior_anchored",
+        "method_kind": "observed_comparable",
         "selected_model": selected_name,
-        "grade_supported": True,
-        "weather_supported": True,
-        "weather_basis": "literature prior updated by calendar-local hot/cool contrasts",
+        "grade_supported": False,
+        "weather_supported": False,
+        "weather_basis": "context only; no race-performance prior transferred to fixed-HR pace",
         "wind_load_supported": False,
         "selection_decisions": [
-            "No environmental coefficient is freely fitted against the multi-year fitness trend.",
-            "Minetti grade cost is applied only to windows with adequate altitude coverage; other windows remain scoreable.",
-            f"Heat starts at a 0.2%/C WBGT literature prior; matched personal evidence currently has {heat_posterior['personal_data_weight'] * 100:.1f}% posterior weight.",
+            "HR, time, grade and heat transformations are not applied to the primary score or its calibration.",
+            "Earlier-run / later-run validation is recorded as a diagnostic, not a causal physiological proof.",
+            "Recorded Z2 windows near the comparison HR and reference time determine observed pace; no best-pace selection.",
             "Wind remains diagnostic because an objective drag correction needs runner drag area and reliable local wind exposure.",
             "All reliable overlapping windows contribute in speed space; HR distance, target-time distance, stops, HR change, and speed change alter weight continuously.",
             "Low-GPS runs may be scored from reliable Garmin device-distance windows; they cannot calibrate shared parameters, and their uncertainty grows continuously as GPS coverage falls. Trend aggregation then downweights them by inverse variance.",
         ],
         "window_count": len(rows),
-        "run_count": len(grouped),
+        "run_count": len(run_paces),
+        "candidate_run_count": len(grouped),
         "shared_parameter_run_count": len(
             {
                 int(row["activity_id"])
@@ -1111,9 +997,8 @@ def fit_published_reference_model(
             f"{primary_seconds}-second windows every {primary_stride} seconds from raw trackpoints"
         ),
         "run_aggregation": (
-            f"shared run-centered HR/time effects evaluated at HR {target_hr:g} and "
-            f"{reference_minutes:g} moving minutes, followed by a robust run-specific performance offset; "
-            "total run duration is not a predictor"
+            f"robust recorded speed in Z2, weighted toward HR {target_hr:g} and "
+            f"{reference_minutes:g} moving minutes; not transformed to exact HR/time or ideal conditions"
         ),
         "steady_aerobic_corroboration": {
             "window_seconds": benchmark_seconds,
@@ -1135,10 +1020,9 @@ def fit_published_reference_model(
         },
         "window_resolution_sensitivity": sensitivity,
         "grouped_cross_validation": {},
-        "time_blocked_cross_validation": {},
+        "time_blocked_cross_validation": validation,
         "candidate_models": {},
         "hr_calibration": slope_diagnostics,
-        "heat_posterior": heat_posterior,
         "residual_standard_deviation_seconds_per_mile": (
             abs(speed_to_pace_min_mile(pace_to_speed_mps(reference_pace) - residual_sigma) - reference_pace)
             * 60.0
@@ -1148,20 +1032,20 @@ def fit_published_reference_model(
             "shade_wbgt_c": _reference_wbgt_c(config),
         },
         "reference_population_pace_min_mile": reference_pace,
-        "heat_response": _heat_table(config, reference_pace, rows, heat_posterior),
-        "heat_response_model": "literature prior plus locally matched personal evidence",
-        "heat_response_trusted_for_primary_score": True,
+        "heat_response": [],
+        "heat_response_model": "not applied",
+        "heat_response_trusted_for_primary_score": False,
         "scientific_basis": {
-            "hr_speed": "personal slope from within-run centered steady-state windows; fitness level cancels within each run",
-            "grade": "Minetti et al. 2002 measured metabolic running-cost polynomial",
-            "heat": "conservative marathon population prior updated by calendar-local matched run contrasts",
-            "humidity": "Stull 2011 wet-bulb approximation",
+            "hr_speed": "observed pace in the configured aerobic zone, weighted near comparison HR; no fitted slope correction",
+            "grade": "metabolic cost formula retained for diagnostics, not assumed to validate outdoor pace correction",
+            "heat": "race evidence does not establish a fixed-HR easy-running correction",
+            "humidity": "weather context only",
             "drift": "not fitted or corrected; early HR-lag and post-60-minute windows are excluded",
         },
         "limitations": [
-            "The heat prior comes from population race evidence and local matching cannot remove every training/fatigue confounder.",
-            "Shade WBGT omits direct solar radiation and is not measured outdoor WBGT.",
-            "Grade is left unadjusted—not imputed—where altitude coverage is inadequate.",
+            "Weather, terrain, fatigue and variation in observed HR/time remain possible explanations for pace changes.",
+            "This is descriptive aerobic performance evidence, not an isolated fitness measurement or an exact pace at a fixed HR.",
+            "Uncertainty bands describe observed variability, not all unmeasured physiological and sensor biases.",
             "Wind is reported but not corrected without defensible drag-area and street-level exposure inputs.",
             "Individual points are per-run estimates; 7- and 28-day trends are descriptive smoothers, not fitted fitness states.",
         ],

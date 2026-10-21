@@ -22,6 +22,47 @@
 *.db-*
 *.xlsx
 
+# Local reference corpus, extracts, and source-specific research tooling.
+# Publish only anonymous downstream policy inferences, never source calendars.
+/tmp/
+/data/reference/
+/scripts/*popular_plan*.py
+/scripts/*plan_reference.py
+/scripts/*short_race_reference.py
+/scripts/import_public_training_sessions.py
+/scripts/audit_training_plan_progression.py
+/scripts/audit_training_phase_transitions.py
+/scripts/audit_supporting_volume_target.py
+/scripts/audit_easy_run_proportions.py
+/scripts/audit_public_plan_scaling.py
+/scripts/close_public_plan_investigation.py
+/scripts/audit_race_preparation_reference.py
+/scripts/audit_short_race_closeout.py
+/tests/test_*popular_plan*.py
+/tests/test_*plan_reference.py
+/tests/test_*short_race_reference.py
+/tests/test_public_training_sessions.py
+/tests/test_public_plan*.py
+/tests/test_training_plan_progression.py
+/tests/test_training_phase_transitions.py
+/tests/test_supporting_volume_target.py
+/tests/test_easy_run_proportions.py
+/tests/test_race_preparation_reference.py
+/tests/test_race_reference_closeout.py
+
+# Private research notes that mix source identities with implementation history.
+# The public distilled policy is docs/training_policy_inferences.md.
+/docs/short_race_reference_review.md
+/docs/recovery_scheduler_reconciliation.md
+/docs/adaptive_scheduler_plan.md
+/docs/staged_progression_candidate.md
+/docs/easy_distribution_choice.md
+/docs/evidence_led_training_policy.md
+/docs/endurance_contract_construction.md
+/docs/operational_feasibility_policy.md
+/docs/delivered_training_dose.md
+/docs/aerobic_entry_and_distribution.md
+
 # Python environments, caches, coverage, and builds
 /.venv/
 /venv/

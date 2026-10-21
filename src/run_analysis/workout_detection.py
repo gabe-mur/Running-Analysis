@@ -27,26 +27,10 @@ class StructuredWorkoutDetection:
 def recorded_laps(
     connection: sqlite3.Connection, activity_id: int
 ) -> list[sqlite3.Row]:
-    try:
-        return connection.execute(
-            """
-            SELECT lap_index,total_time_s,distance_m,average_hr_bpm,
-                   maximum_hr_bpm,intensity,trigger_method
-            FROM laps WHERE activity_id=? ORDER BY lap_index
-            """,
-            (activity_id,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        # Small synthetic databases created by older tooling may carry only the
-        # core lap columns. Missing trigger metadata is neutral evidence.
-        return connection.execute(
-            """
-            SELECT lap_index,total_time_s,distance_m,average_hr_bpm,
-                   maximum_hr_bpm
-            FROM laps WHERE activity_id=? ORDER BY lap_index
-            """,
-            (activity_id,),
-        ).fetchall()
+    # Optional trigger/intensity/timestamp columns must remain visible when
+    # present; old small synthetic tables need not manufacture those columns.
+    return connection.execute('SELECT * FROM laps WHERE activity_id=? ORDER BY lap_index',
+        (activity_id,)).fetchall()
 
 
 def usable_recorded_laps(rows) -> list:
@@ -58,7 +42,11 @@ def usable_recorded_laps(rows) -> list:
     ]
 
 
-def recorded_interval_work_positions(rows) -> set[int]:
+def _lap_value(row, name):
+    return row[name] if name in row.keys() else None
+
+
+def recorded_interval_work_positions(rows, intervals=()) -> set[int]:
     """Return alternating work laps, using recorded boundaries as ground truth."""
 
     usable = usable_recorded_laps(rows)
@@ -68,14 +56,49 @@ def recorded_interval_work_positions(rows) -> set[int]:
         float(row["distance_m"]) / float(row["total_time_s"])
         for row in usable
     ]
-    return {
-        position
-        for position in range(1, len(usable) - 1)
-        if speeds[position] >= speeds[position - 1] * 1.10
-        and speeds[position] >= speeds[position + 1] * 1.10
-        and float(usable[position]["total_time_s"]) >= 30
-        and float(usable[position]["distance_m"]) >= 100
-    }
+    intensity = [str(_lap_value(row, 'intensity') or '').casefold() for row in usable]
+    # Recorded Active/Rest alternation is useful for hills, whose uphill work
+    # may be SLOWER than the downhill recovery. All-Active auto laps are neutral.
+    declared = {p for p in range(1, len(usable)-1)
+        if intensity[p] == 'active' and intensity[p+1] in {'rest', 'resting'}
+        and float(usable[p]['total_time_s']) >= 30}
+    if len(declared)>=2:
+        return declared # Declared recovery must not become work just because it is faster downhill.
+    by_lap = {}
+    for item in intervals:
+        if item.start.lap_index == item.end.lap_index:
+            by_lap.setdefault(item.start.lap_index, []).append(item)
+    def grade(position):
+        items=by_lap.get(usable[position]['lap_index'], ())
+        values=[i for i in items if i.start.altitude_m is not None and i.end.altitude_m is not None
+            and not {'large_recording_gap','implausible_distance_speed','distance_reset'} & set(i.flags)]
+        distance=sum(i.distance_m for i in values)
+        gain=sum(i.end.altitude_m-i.start.altitude_m for i in values)
+        return gain/distance if distance>0 and abs(gain)>=3 else 0.
+    selected=set();hills=set()
+    for p in range(1,len(usable)-1):
+        row=usable[p]
+        if float(row['total_time_s']) < 30:
+            continue
+        if p in declared:
+            selected.add(p)
+            continue
+        if intensity[p] in {'rest','resting'}:
+            continue
+        if not _manual_boundary(row):
+            continue
+        contrast=speeds[p]>=speeds[p-1]*1.10 and speeds[p]>=speeds[p+1]*1.10
+        # A manually bounded 45-second hill/pickup need not cover100meters.
+        minimum_distance=30 if str(_lap_value(row,'trigger_method') or '').casefold()=='manual' else 100
+        uphill,following=grade(p),grade(p+1)
+        hill=uphill>=.02 and following<=-.02
+        downhill_recovery=uphill<=-.02 and following>=.02
+        if float(row['distance_m'])>=minimum_distance:
+            if hill:
+                hills.add(p)
+            elif contrast and not downhill_recovery:
+                selected.add(p)
+    return hills if len(hills)>=2 else selected|hills
 
 
 def _manual_boundary(row) -> bool:
@@ -86,17 +109,19 @@ def _manual_boundary(row) -> bool:
     return trigger is None or str(trigger).casefold() == "manual"
 
 
-def _continuous_quality_lap(rows, z3_floor: float) -> bool:
-    """Recognize warm-up / sustained work / cool-down lap structure.
+def recorded_continuous_work(rows, z3_floor: float):
+    """Recognize recorded sustained work with or without a cooldown lap.
 
     The manual interior boundary is the primary structural evidence. Pace or HR
     must merely corroborate that the middle lap was work rather than an
-    arbitrary marker; neither signal is used to invent its boundaries.
+    arbitrary marker; neither signal is used to invent its boundaries. A finish
+    without cooldown requires both contrasts and an explicit manual boundary.
     """
 
     usable = usable_recorded_laps(rows)
-    if len(usable) < 3:
-        return False
+    if len(usable) < 2:
+        return None
+    candidates=[]
     for position, row in enumerate(usable[1:-1], start=1):
         duration = float(row["total_time_s"] or 0)
         if not 8 * 60 <= duration <= 40 * 60 or not _manual_boundary(row):
@@ -110,8 +135,26 @@ def _continuous_quality_lap(rows, z3_floor: float) -> bool:
         if speed >= surrounding_speed * 1.05 or (
             hr is not None and float(hr) >= z3_floor
         ):
-            return True
-    return False
+            candidates.append((position,'interior_work'))
+    # Progressions often end at the work effort: no artificial cooldown lap
+    # is required. The boundary ending the warmup must be explicitly manual;
+    # an auto-mile split plus HR drift must not turn an easy run into quality.
+    warm,work=usable[:-1],usable[-1]
+    seconds=float(work['total_time_s'])
+    warm_seconds=sum(float(r['total_time_s']) for r in warm)
+    known_warm=[r for r in warm if r['average_hr_bpm'] is not None]
+    warm_hr=(sum(float(r['average_hr_bpm'])*float(r['total_time_s']) for r in known_warm)
+        /sum(float(r['total_time_s']) for r in known_warm)) if known_warm else None
+    warm_speed=sum(float(r['distance_m']) for r in warm)/warm_seconds
+    hr=work['average_hr_bpm']
+    if (8*60<=seconds<=40*60 and warm_seconds>=3*60
+            and str(_lap_value(warm[-1],'trigger_method') or '').casefold()=='manual'
+            and hr is not None and warm_hr is not None
+            and float(hr)>=z3_floor and float(hr)>=warm_hr+5
+            and float(work['distance_m'])/seconds>=warm_speed*1.05):
+        candidates.append((len(usable)-1,'progression_finish'))
+    return max(candidates,key=lambda p:(float(usable[p[0]]['average_hr_bpm'] or 0),
+        float(usable[p[0]]['total_time_s']))) if candidates else None
 
 
 def smoothed_speeds(intervals: list[MovementInterval]) -> list[float]:
@@ -189,16 +232,17 @@ def detect_structured_workout(
     """Classify a structured session only from recorded workout boundaries."""
 
     laps = recorded_laps(connection, activity_id)
-    if len(recorded_interval_work_positions(laps)) >= 2:
+    if len(recorded_interval_work_positions(laps,intervals)) >= 2:
         return StructuredWorkoutDetection(
             WorkoutType.INTERVALS,
             "recorded_lap_structure",
             ConfidenceLevel.HIGH,
         )
-    if _continuous_quality_lap(laps, z3_floor):
+    continuous=recorded_continuous_work(laps,z3_floor)
+    if continuous is not None:
         return StructuredWorkoutDetection(
             WorkoutType.TEMPO_THRESHOLD,
-            "recorded_lap_structure",
+            "recorded_progression_laps" if continuous[1]=='progression_finish' else "recorded_lap_structure",
             ConfidenceLevel.HIGH,
         )
     return None

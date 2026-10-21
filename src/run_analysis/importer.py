@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -11,9 +11,10 @@ import json
 import sqlite3
 
 from .db import initialize, transaction
-from .models import Activity
+from .models import Activity, SENSOR_EXTRACTION_VERSION
 from .fit import parse_fit
 from .tcx import parse_tcx
+from .gpx import parse_gpx
 
 
 @dataclass(slots=True)
@@ -26,12 +27,14 @@ class ImportSummary:
     activities_added: int = 0
     duplicate_activities: int = 0
     trackpoints_added: int = 0
+    # Accepted source/provenance is not necessarily new physical evidence.
+    evidence_changed_activity_ids: list[int] = field(default_factory=list)
 
 
 #: Every extension the importer knows how to read, mapped to its parser.
 #: ``.gz`` is included because Strava hands back whatever was uploaded, and a
 #: gzipped FIT is a common shape for that.
-SUPPORTED_SUFFIXES = (".tcx", ".fit", ".fit.gz")
+SUPPORTED_SUFFIXES = (".tcx", ".fit", ".fit.gz", ".gpx")
 
 
 def parser_for(path: Path):
@@ -41,6 +44,8 @@ def parser_for(path: Path):
         return parse_fit
     if name.endswith(".tcx"):
         return parse_tcx
+    if name.endswith(".gpx"):
+        return parse_gpx
     return None
 
 
@@ -514,9 +519,37 @@ def import_files(
         path = source_path.resolve()
         digest = sha256_file(path)
         existing = connection.execute(
-            "SELECT id, sha256 FROM source_files WHERE path = ?", (str(path),)
+            "SELECT id, sha256, parse_status FROM source_files WHERE path = ?", (str(path),)
         ).fetchone()
-        if existing and existing["sha256"] == digest and not force:
+        if (existing and existing["sha256"] == digest
+                and existing["parse_status"] != "failed" and not force):
+            # Add sensor streams to an old FIT import without replacing the
+            # canonical activity, plan matches, or already-calculated metrics.
+            if parser_for(path) is parse_fit:
+                links = connection.execute("""SELECT s.activity_id,s.source_activity_index
+                    FROM activity_sources s LEFT JOIN activity_sensor_streams r
+                    ON r.source_file_id=s.source_file_id
+                    AND r.source_activity_index=s.source_activity_index
+                    WHERE s.source_file_id=? AND (r.source_file_id IS NULL OR r.extraction_version < ?)""",
+                    (existing["id"], SENSOR_EXTRACTION_VERSION)).fetchall()
+                if links:
+                    try:
+                        parsed = parse_fit(path, default_timezone=default_timezone)
+                        if any(link['source_activity_index'] >= len(parsed.activities) for link in links):
+                            raise ValueError('Sensor backfill activity-index mismatch')
+                        changed_ids = set()
+                        with transaction(connection):
+                            for link in links:
+                                changed = _store_sensor_stream(connection, existing['id'],
+                                    link['source_activity_index'], link['activity_id'],
+                                    parsed.activities[link['source_activity_index']])
+                                if changed:
+                                    changed_ids.add(int(link['activity_id']))
+                        summary.evidence_changed_activity_ids.extend(
+                            sorted(changed_ids - set(summary.evidence_changed_activity_ids)))
+                    except Exception:
+                        summary.failed_files += 1
+                        continue
             summary.unchanged_files += 1
             continue
         parse = parser_for(path)
@@ -525,6 +558,8 @@ def import_files(
             continue
         try:
             parsed = parse(path, default_timezone=default_timezone)
+            if not parsed.activities:
+                raise ValueError('No recorded activities were found in this activity file')
         except Exception as error:
             # A temporarily truncated or corrupt replacement must not erase a
             # previously successful import. Keep the last-known-good source
@@ -569,6 +604,8 @@ def import_files(
                         connection, activity_row_id
                     ):
                         _replace_activity_data(connection, activity_row_id, activity)
+                        if activity_row_id not in summary.evidence_changed_activity_ids:
+                            summary.evidence_changed_activity_ids.append(activity_row_id)
                         reason = "richer_duplicate_replaced_canonical"
                         is_primary = 1
                     else:
@@ -579,6 +616,7 @@ def import_files(
                     is_primary = 1
                     summary.activities_added += 1
                     summary.trackpoints_added += len(activity.trackpoints)
+                    summary.evidence_changed_activity_ids.append(activity_row_id)
                 connection.execute(
                     """
                     INSERT INTO activity_sources(
@@ -587,7 +625,35 @@ def import_files(
                     """,
                     (activity_row_id, source_id, activity_index, is_primary, reason),
                 )
+                changed = _store_sensor_stream(connection, source_id, activity_index, activity_row_id, activity)
+                if changed and activity_row_id not in summary.evidence_changed_activity_ids:
+                    summary.evidence_changed_activity_ids.append(activity_row_id)
         summary.imported_files += 1
         if parsed.warnings:
             summary.warning_files += 1
     return summary
+
+
+def _store_sensor_stream(connection, source_id, activity_index, activity_id, activity) -> bool:
+    """Keep source provenance; report whether extracted evidence differs."""
+    if activity.sensor_stream is None:
+        return False
+    payload = json.dumps(asdict(activity.sensor_stream), default=lambda value: value.isoformat(),
+                         allow_nan=False)
+    previous = connection.execute("""SELECT payload_json FROM activity_sensor_streams
+        WHERE source_file_id=? AND source_activity_index=?""",(source_id,activity_index)).fetchone()
+    if previous is None:
+        previous = connection.execute("""SELECT payload_json FROM activity_sensor_streams
+            WHERE activity_id=? ORDER BY source_file_id DESC,source_activity_index DESC LIMIT 1""",
+            (activity_id,)).fetchone()
+    # Backfilling passive power/dynamics must not manufacture changed planner
+    # evidence. HRV, feedback, timer, device and watch-zone changes still count.
+    passive = {'extraction_version','performance_records','performance_session_fields'}
+    evidence = lambda value: {k:v for k,v in value.items() if k not in passive}
+    changed = previous is None or evidence(json.loads(previous[0])) != evidence(json.loads(payload))
+    connection.execute("""INSERT INTO activity_sensor_streams
+        (source_file_id,source_activity_index,activity_id,extraction_version,payload_json)
+        VALUES (?,?,?,?,?) ON CONFLICT(source_file_id,source_activity_index) DO UPDATE SET
+        extraction_version=excluded.extraction_version,payload_json=excluded.payload_json""", (source_id, activity_index, activity_id,
+            activity.sensor_stream.extraction_version, payload))
+    return changed

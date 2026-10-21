@@ -1,8 +1,48 @@
 """Shared conversion from a structured prescription to expected intensity."""
 
 from __future__ import annotations
+from math import isfinite
 
 from .web.schemas import RecommendationResponse
+
+
+def structured_duration_bounds(result: RecommendationResponse) -> tuple[float, float]:
+    """Known running-time bounds, including between-rep recovery exactly once.
+
+    A work block's total and its rep details describe the same time, not two
+    additive blocks. Distance-only steps contribute no invented clock duration.
+    """
+    low = high = 0.0
+    for step in result.structure:
+        block = step.duration_minutes or 0.0
+        if step.phase == 'work' or step.repetitions:
+            count = step.repetitions or 1
+            if step.work_duration_minutes is not None:
+                work_low = work_high = step.work_duration_minutes
+            elif step.work_duration_range_minutes is not None:
+                work_low, work_high = step.work_duration_range_minutes
+            else:
+                work_low = work_high = 0.0
+            recovery = max(0, count-1)*(step.recovery_duration_minutes or 0.0)
+            low += max(block, count*work_low+recovery)
+            high += max(block, count*work_high+recovery)
+        else:
+            low += block
+            high += block
+    return low, high
+
+
+def projected_running_minutes(result: RecommendationResponse, miles: float,
+                              pace_min_mile: float, *, honor_structure=True) -> float:
+    """Shared forecast/synthetic-completion duration; never modify measured time.
+
+    Honor the upper structured bound so a projected total can accommodate all
+    prescribed work-duration options. This does not require a real runner to
+    select the upper end of each range. No distance target is increased.
+    """
+    if not all(isfinite(x) and x > 0 for x in (miles, pace_min_mile)):
+        raise ValueError('Positive finite projected distance and pace required')
+    return max(miles*pace_min_mile, structured_duration_bounds(result)[1] if honor_structure else 0.0)
 
 
 def prescribed_zone_minutes(

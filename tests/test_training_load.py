@@ -11,9 +11,32 @@ from run_analysis.training_load import (
     continuous_distance_rate,
     continuous_fatigue_load,
     distance_capacity,
+    _daily_distance_windows,
     rolling_load,
     short_term_density_half_life_days,
 )
+
+
+@pytest.mark.parametrize('seed', range(10))
+def test_fast_distance_windows_exactly_match_original_scans(seed):
+    from random import Random
+    rng = Random(seed)
+    start = datetime(2026, 1, 1).date()
+    offsets = list(range(-40, 405, 3))
+    rng.shuffle(offsets)  # preserve arbitrary insertion/summation order exactly
+    daily = {start + timedelta(days=i): rng.random() * 20 for i in offsets}
+    end = start + timedelta(days=364)
+    seven, twenty_eight = _daily_distance_windows(daily, start, end)
+    for i in range(365):
+        at = start + timedelta(days=i)
+        assert seven[i] == sum(m for d, m in daily.items() if at-timedelta(days=6) <= d <= at)
+        assert twenty_eight[i] == sum(m for d, m in daily.items() if at-timedelta(days=27) <= d <= at)
+
+
+def test_fast_distance_windows_empty_range():
+    day = datetime(2026, 1, 1).date()
+    assert _daily_distance_windows({}, day, day) == ([0.], [0.])
+    assert _daily_distance_windows({day: 4.}, day, day-timedelta(days=1)) == ([], [])
 
 
 def test_session_load_preserves_distance_independent_intensity_context() -> None:

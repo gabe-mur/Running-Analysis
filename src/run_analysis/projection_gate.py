@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from datetime import date, datetime, time, timedelta
 from enum import Enum
+from math import ceil
 from statistics import median
 from typing import Any
+from .aerobic_acceptance import assess_aerobic_exposure
 
 from .adherence_projection import (
     ProjectionReplan,
     ProjectionWeek,
+    replan_churn_window,
     summarize_replan_churn,
 )
 
@@ -33,6 +36,8 @@ class ProjectionGateConfig:
     recovery_surprise_tolerance_units: float = 0.01
     enforce_stability: bool = False
     enforce_key_session_cadence: bool = False
+    audit_key_session_cadence: bool = False
+    enforce_aerobic_exposure_cadence: bool = False
     require_capacity_progression: bool = False
 
 
@@ -82,13 +87,7 @@ def _future_schedule_changes(
 ) -> tuple[list[str], list[str]]:
     """Return date-slot and workout-type changes after consumed work."""
 
-    window_start = (
-        current.decision_start_date
-        if current.trigger == "post_upload"
-        and current.decision_start_date is not None
-        else current.generated_at.date() + timedelta(days=1)
-    )
-    window_end = window_start + timedelta(days=horizon_days)
+    window_start, window_end = replan_churn_window(current, horizon_days)
 
     def by_date(replan: ProjectionReplan) -> dict[date, str]:
         return {
@@ -117,13 +116,7 @@ def _future_distance_changes(
 ) -> list[dict[str, float | str]]:
     """Return material same-date, same-workout dose rewrites."""
 
-    window_start = (
-        current.decision_start_date
-        if current.trigger == "post_upload"
-        and current.decision_start_date is not None
-        else current.generated_at.date() + timedelta(days=1)
-    )
-    window_end = window_start + timedelta(days=horizon_days)
+    window_start, window_end = replan_churn_window(current, horizon_days)
 
     def by_date(replan: ProjectionReplan) -> dict[date, Any]:
         return {
@@ -288,6 +281,18 @@ def evaluate_replan_regressions(
                     },
                 )
             )
+        assessment = assess_aerobic_exposure(
+            sessions=((s.planned_for.date(), s.midpoint_miles) for s in replan.planned_sessions),
+            target_trajectory=replan.target_trajectory, ordinary_miles=ordinary,
+            planning_mode=replan.planning_mode, exception_reasons=replan.cadence_exception_reasons,
+            rounding_miles=config.funding_rounding_tolerance_miles,
+            enabled=config.enforce_aerobic_exposure_cadence)
+        if assessment.rejected:
+            failures.append(ProjectionGateFailure(
+                code="underfunded_aerobic_exposure_gap", occurred_at=replan.generated_at,
+                detail=("An underfunded established plan leaves "
+                        f"{assessment.evidence['maximum_date_separation_days']} days between aerobic "
+                        "exposures without a recovery exception."), evidence=assessment.evidence))
     recovery_surprise = replan.recovery_surprise_units
     if (
         recovery_surprise is not None
@@ -352,7 +357,25 @@ def evaluate_replan_regressions(
             )
             observed_gaps: list[float] = []
             if offsets:
-                observed_gaps.append(opening_age + offsets[0])
+                # Cadence is a rolling calendar-date rule. Recovery remains
+                # exact-hour sensitive, but a morning-versus-evening choice
+                # on the same available date must not turn an eight-day lane
+                # into an 8.2-day hard failure.
+                opening_at = datetime.combine(
+                    replan.decision_start_date,
+                    time.min,
+                    tzinfo=replan.generated_at.tzinfo,
+                )
+                last_session_date = (
+                    opening_at - timedelta(days=opening_age)
+                ).date()
+                first_session_date = (
+                    replan.decision_start_date
+                    + timedelta(days=offsets[0])
+                )
+                observed_gaps.append(
+                    float((first_session_date - last_session_date).days)
+                )
                 observed_gaps.extend(
                     float(current - previous)
                     for previous, current in zip(offsets, offsets[1:])
@@ -397,11 +420,26 @@ class ProjectionGate:
         self.fail_fast = fail_fast
         self.snapshots: list[ProjectionReplan] = []
         self.failures: list[ProjectionGateFailure] = []
+        self.advisories: list[ProjectionGateFailure] = []
 
     def observe(self, replan: ProjectionReplan) -> None:
         previous = self.snapshots[-1] if self.snapshots else None
         self.snapshots.append(replan)
         new_failures = list(evaluate_replan_regressions(replan, self.config))
+        if (
+            self.config.audit_key_session_cadence
+            and not self.config.enforce_key_session_cadence
+        ):
+            # Recurrence is a soft training objective in the adaptive policy.
+            # Keep the old strict fixture available and report its findings,
+            # without redefining every overrun as unsafe or a search failure.
+            self.advisories.extend(
+                finding
+                for finding in evaluate_replan_regressions(
+                    replan, replace(self.config, enforce_key_session_cadence=True),
+                )
+                if finding.code in {"long_cadence_gap", "quality_cadence_gap"}
+            )
         if previous is not None and self.config.enforce_stability:
             date_changes, type_changes = _future_schedule_changes(
                 previous,
@@ -486,10 +524,28 @@ class ProjectionGate:
             raise ProjectionGateTriggered(new_failures[0])
 
     def finalize(self, weeks: list[ProjectionWeek]) -> None:
-        if not self.config.require_capacity_progression or not weeks:
+        if not self.config.require_capacity_progression:
             return
-        opening = weeks[0].capacity_reference_miles
-        final = weeks[-1].capacity_reference_miles
+        # Weekly rows contain capacity at the start of each reporting slice,
+        # not the final simulated decision. They cannot certify the endpoint.
+        if len(self.snapshots) < 2:
+            raise ValueError("Progression requires at least two decision snapshots")
+        opening = self.snapshots[0].capacity_reference_miles
+        final = self.snapshots[-1].capacity_reference_miles
+        if opening is None or final is None:
+            failure = ProjectionGateFailure(
+                code="missing_capacity_endpoint",
+                occurred_at=self.snapshots[-1].generated_at,
+                detail="Cannot assess progression without both decision capacities.",
+                evidence={
+                    "opening_capacity_miles": opening,
+                    "final_capacity_miles": final,
+                },
+            )
+            self.failures.append(failure)
+            if self.fail_fast:
+                raise ProjectionGateTriggered(failure)
+            return
         if final <= opening + 1e-9:
             failure = ProjectionGateFailure(
                 code="no_capacity_progression",
@@ -501,6 +557,8 @@ class ProjectionGate:
                 evidence={
                     "opening_capacity_miles": opening,
                     "final_capacity_miles": final,
+                    "opening_decision_at": self.snapshots[0].generated_at,
+                    "final_decision_at": self.snapshots[-1].generated_at,
                 },
             )
             self.failures.append(failure)
@@ -538,6 +596,17 @@ def build_projection_report(
         for item in gate.snapshots
         if item.planning_seconds is not None
     ]
+    capacities = [
+        item.capacity_reference_miles for item in gate.snapshots
+        if item.capacity_reference_miles is not None
+    ]
+    prior_peak = 0.0
+    largest_capacity_drawdown = 0.0
+    for capacity in capacities:
+        prior_peak = max(prior_peak, capacity)
+        largest_capacity_drawdown = max(
+            largest_capacity_drawdown, prior_peak - capacity
+        )
     churn = {
         str(horizon): _json_ready(
             summarize_replan_churn(gate.snapshots, horizon_days=horizon)
@@ -614,6 +683,22 @@ def build_projection_report(
         "post_upload_replan_count": post_upload_replan_count,
         "replan_count": len(gate.snapshots),
         "failures": _json_ready(gate.failures),
+        "advisories": _json_ready(gate.advisories),
+        "gate_policy": _json_ready(gate.config),
+        "capacity_audit": {
+            "opening_decision_miles": (
+                gate.snapshots[0].capacity_reference_miles
+                if gate.snapshots else None
+            ),
+            "final_decision_miles": (
+                gate.snapshots[-1].capacity_reference_miles
+                if gate.snapshots else None
+            ),
+            "minimum_miles": min(capacities) if capacities else None,
+            "maximum_miles": max(capacities) if capacities else None,
+            "largest_drawdown_miles": largest_capacity_drawdown if capacities else None,
+            "observations": len(capacities),
+        },
         "planner_timing_seconds": {
             "median": median(timings) if timings else None,
             "maximum": max(timings) if timings else None,

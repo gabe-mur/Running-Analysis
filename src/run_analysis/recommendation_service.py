@@ -38,6 +38,7 @@ from .weekly_schedule import (
 from .web.schemas import (
     FitnessState,
     RecommendationRequest,
+    CurrentStatusResponse,
     RecommendationResponse,
     WeeklyScheduleRequest,
     WeeklyScheduleResponse,
@@ -83,6 +84,16 @@ def generate_recommendation(
         raise ValueError("The planned run time is in the past. Choose a current or future time.")
     if planned > now + timedelta(days=16):
         raise ValueError("Choose a time within the next 16 days; later training is not yet knowable.")
+    from .adaptive.live_bridge import enabled, schedule, LivePlannerReviewRequired
+    if enabled(config):
+        from .adaptive.reported_start import start_if_needed
+        program=start_if_needed(connection,config,project_root,request=request) or schedule(connection,config,project_root)
+        selected=next((d.recommendation for d in (program.planning_days or program.days)
+            if d.date==planned.astimezone(ZoneInfo(config['timezone_default'])).date()),None)
+        if selected is None:
+            raise LivePlannerReviewRequired(program.planner_review_reason or
+                'No run is issued for that date. Use the adaptive weekly plan; no independent legacy workout was generated.')
+        return current_fitness_state(connection,config,request),selected
     state = current_fitness_state(connection, config, request)
     forecast = get_planned_forecast(connection, config, project_root, request.planned_at)
     state = state.model_copy(update={"planned_weather": forecast})
@@ -111,11 +122,22 @@ def generate_recommendation(
     return state, result
 
 
-def load_current_status(connection: sqlite3.Connection) -> RecommendationRequest:
+def load_current_status(connection: sqlite3.Connection, *, as_of=None,
+                        timezone_name="UTC") -> CurrentStatusResponse:
+    from .health_reports import read_health_reports
+    now = as_of or datetime.now(timezone.utc)
+    reports = read_health_reports(connection, as_of=now)
+    if reports:
+        report = reports[-1]
+        zone = ZoneInfo(timezone_name)
+        return CurrentStatusResponse(health_status=report['status'],
+            health_reported_at=report['reported_at'],
+            health_report_current=report['reported_at'].astimezone(zone).date() == now.astimezone(zone).date())
+    # The legacy cache preserves a preference, not a dated user check-in.
     row = connection.execute("SELECT value_json FROM app_state WHERE key='current_health'").fetchone()
     if not row:
-        return RecommendationRequest(health_status="normal")
-    return RecommendationRequest.model_validate(json.loads(row[0]))
+        return CurrentStatusResponse(health_status="normal")
+    return CurrentStatusResponse.model_validate(json.loads(row[0]))
 
 
 def load_latest_recommendation(connection: sqlite3.Connection) -> RecommendationResponse | None:
@@ -165,7 +187,28 @@ def generate_weekly_schedule(
     *,
     discard_prior_schedule: bool = False,
 ) -> WeeklyScheduleResponse:
+    from .plan_refresh import complete_plan_refresh
+    return complete_plan_refresh(connection, lambda: _generate_weekly_schedule(
+        connection, config, request, project_root,
+        discard_prior_schedule=discard_prior_schedule))
+
+
+def _generate_weekly_schedule(
+    connection: sqlite3.Connection,
+    config: dict,
+    request: WeeklyScheduleRequest,
+    project_root: str | Path,
+    *,
+    discard_prior_schedule: bool = False,
+) -> WeeklyScheduleResponse:
     """Create and persist the next seven uncompleted calendar days."""
+    from .adaptive.reported_start import start_if_needed
+    started = start_if_needed(connection,config,project_root,request=request)
+    if started is not None:
+        return started
+    from .adaptive.live_bridge import enabled, schedule
+    if enabled(config):
+        return schedule(connection,config,project_root)
     prior_schedule = load_latest_weekly_schedule(connection)
     if discard_prior_schedule:
         # A forced-rest schedule is a temporary constrained solution, not a
@@ -259,6 +302,7 @@ def generate_weekly_schedule(
             target_distance_miles=adherence_normalized_distance(
                 run.distance_miles,
                 run.prescribed_distance_range_miles,
+                prescribed_target_miles=run.prescribed_distance_target_miles,
             ),
         )
         for run in run_history
@@ -743,7 +787,8 @@ def load_latest_weekly_schedule(connection: sqlite3.Connection) -> WeeklySchedul
     # The builder's summary may explain forced-rest constraints, deferred
     # sessions, or readiness substitutions in addition to mileage alignment.
     # Preserve that context when the saved plan is reloaded.
-    return result
+    from .strength_completion import with_strength_records
+    return with_strength_records(connection, result)
 
 
 def load_latest_weekly_planning_days(
@@ -922,7 +967,7 @@ def _enrich_saved_schedule_load_context(
     if not planning_days:
         planning_days = list(schedule.days)
     visible_scheduled = sum(
-        sum(day.recommendation.distance_range_miles) / 2
+        day.recommendation.planned_distance_miles
         for day in schedule.days
         if day.recommendation is not None
         and day.recommendation.workout_type != WorkoutType.REST
@@ -934,7 +979,7 @@ def _enrich_saved_schedule_load_context(
         for day in context_days
         for activity in day.completed_activities
     ) + sum(
-        sum(day.recommendation.distance_range_miles) / 2
+        day.recommendation.planned_distance_miles
         for day in context_days
         if day.recommendation is not None
         and day.recommendation.workout_type != WorkoutType.REST
@@ -1244,6 +1289,13 @@ def ensure_current_weekly_schedule(
 ) -> WeeklyScheduleResponse:
     """Return today's leading schedule, regenerating stale saved state."""
 
+    from .adaptive.live_bridge import enabled, schedule
+    if enabled(config):
+        from .plan_refresh import complete_plan_refresh
+        from .adaptive.reported_start import start_if_needed
+        return complete_plan_refresh(connection, lambda:
+            start_if_needed(connection,config,project_root) or schedule(connection,config,project_root))
+
     current = load_latest_weekly_schedule(connection)
     local_now = datetime.now(timezone.utc).astimezone(
         ZoneInfo(str(config.get("timezone_default", "UTC")))
@@ -1260,9 +1312,11 @@ def ensure_current_weekly_schedule(
             )
         )
     )
+    from .plan_refresh import pending_refresh
     reusable = (
         current is not None
         and boundary_is_current
+        and pending_refresh(connection) is None
         and not _today_plan_time_is_stale(current, local_now, config)
         and not _weekly_plan_shape_is_stale(current)
     )

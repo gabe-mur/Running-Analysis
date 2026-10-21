@@ -207,6 +207,11 @@ def test_growing_capacity_alone_can_make_it_building() -> None:
         )
     )
     assert summary.status == TrainingStatus.BUILDING
+    facts = next(item.facts for item in summary.rule_trace if item.rule_id == 'status_building')
+    assert facts['improvement_supported'] is True
+    assert facts['capacity_reference_miles'] == 22.0
+    assert facts['previous_capacity_reference_miles'] == 18.0
+    assert facts['fitness_trend'] == 'stable'
 
 
 def test_steady_training_without_quality_is_maintaining_and_says_why() -> None:

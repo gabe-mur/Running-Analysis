@@ -581,6 +581,10 @@ def build_fitness_state(
         last_run_prescribed_intensity_factor=latest_prescribed_intensity_factor,
         recovery_residual_load=recovery_residual_load,
         longest_run_30d_miles=recent_long_capacity,
+        longest_completed_run_30d_miles=max((run.distance_miles for run in runs
+            if evaluation_time-run.start_time.astimezone(timezone.utc) <= timedelta(days=30)
+            and run.health_tag.value == "normal"
+            and run.workout_type not in {WorkoutType.RUN_WALK, WorkoutType.HIKE, WorkoutType.BIKE}), default=0.),
         retained_long_run_capacity_miles=retained_long_capacity,
         quality_sessions_14d=progress_14.consistency.quality_sessions,
         completed_quality_session_count=len(quality),

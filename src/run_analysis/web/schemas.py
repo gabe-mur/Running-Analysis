@@ -10,12 +10,15 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from ..intensity_balance import IntensityBalance
 from ..onboarding import SetupStep, ZoneMethod
 from ..race_goals import GoalStatus
+from ..training_background import TrainingBackground
 
 
 class ApiModel(BaseModel):
@@ -127,6 +130,8 @@ class ContextEvidence(ApiModel):
 class HealthResponse(ApiModel):
     status: str
     service: str = "running-coach"
+    planner_engine: str = "legacy"
+    planner_version: int | None = None
     schema_version: int | None = None
     database_path: str
     database_exists: bool
@@ -172,6 +177,8 @@ class FitnessObservation(ApiModel):
     included_in_trend: bool
     trend_weight: float = Field(default=0.0, ge=0, le=1)
     exclusion_reasons: list[str] = Field(default_factory=list)
+    pace_basis: str | None = None
+    observed_average_hr_bpm: float | None = None
 
 
 class ZoneBreakdown(ApiModel):
@@ -188,7 +195,9 @@ class SessionDifficulty(ApiModel):
     elapsed_minutes: float = Field(ge=0)
     stopped_minutes: float = Field(ge=0)
     zone_load: float | None = Field(default=None, ge=0)
-    perceived_exertion: int | None = Field(default=None, ge=1, le=10)
+    perceived_exertion: float | None = Field(default=None, ge=0, le=10)
+    effort_source: str | None = None
+    workout_feel: float | None = Field(default=None, ge=0, le=100)
     session_rpe_load: float | None = Field(default=None, ge=0)
     elevation_gain_ft: float | None = Field(default=None, ge=0)
     elevation_loss_ft: float | None = Field(default=None, ge=0)
@@ -273,7 +282,11 @@ class RunMetadata(ApiModel):
     workout_type: WorkoutType = WorkoutType.UNKNOWN
     health_tag: ActivityHealthTag = ActivityHealthTag.NORMAL
     include_in_model: bool | None = None
-    perceived_exertion: int | None = Field(default=None, ge=1, le=10)
+    perceived_exertion: float | None = Field(default=None, ge=0, le=10)
+    effort_source: str | None = None
+    workout_feel: float | None = Field(default=None, ge=0, le=100)
+    feeling_source: str | None = None
+    feedback_conflict: bool = False
     notes: str = Field(default="", max_length=4000)
     postal_code: str | None = Field(default=None, pattern=r"^\d{5}$")
     location_label: str | None = None
@@ -283,7 +296,7 @@ class RunMetadataPatch(ApiModel):
     workout_type: WorkoutType | None = None
     health_tag: ActivityHealthTag | None = None
     include_in_model: bool | None = None
-    perceived_exertion: int | None = Field(default=None, ge=1, le=10)
+    perceived_exertion: float | None = Field(default=None, ge=0, le=10)
     notes: str | None = Field(default=None, max_length=4000)
     postal_code: str | None = Field(default=None, pattern=r"^\d{5}$")
 
@@ -315,6 +328,7 @@ class RunSummary(ApiModel):
     prescribed_workout_type: WorkoutType | None = None
     prescribed_planning_role: str | None = None
     prescribed_distance_range_miles: tuple[float, float] | None = None
+    prescribed_distance_target_miles: float | None = None
 
 
 class Split(ApiModel):
@@ -531,6 +545,8 @@ class FitnessPoint(ApiModel):
     trend_weight: float = Field(default=1.0, ge=0, le=1)
     measurement_quality: str | None = None
     benchmark_quality: str | None = None
+    pace_basis: str | None = None
+    observed_average_hr_bpm: float | None = None
 
 
 class FitnessTrendPoint(ApiModel):
@@ -736,6 +752,7 @@ class DashboardResponse(ApiModel):
     recommendation: RecommendationResponse
     current_status: RecommendationRequest
     weekly_schedule: "WeeklyScheduleResponse | None" = None
+    weekly_plan_needs_refresh: bool = False
     setup: SetupNudge | None = None
 
 
@@ -781,6 +798,8 @@ class FitnessState(ApiModel):
         ),
     )
     longest_run_30d_miles: float = Field(default=0, ge=0)
+    longest_completed_run_30d_miles: float | None = Field(default=None, ge=0,
+        description="Actual recorded recent longest run for display, without prescription caps or capacity decay.")
     retained_long_run_capacity_miles: float = Field(default=0, ge=0)
     quality_sessions_14d: int = Field(default=0, ge=0)
     completed_quality_session_count: int = Field(default=0, ge=0)
@@ -846,8 +865,14 @@ class RecommendationRequest(ApiModel):
     desired_distance_miles: float | None = Field(default=None, gt=0, le=50)
 
 
+class CurrentStatusResponse(RecommendationRequest):
+    health_reported_at: datetime | None = None
+    health_report_current: bool = False
+
+
 class WorkoutStep(ApiModel):
     instruction: str
+    prescription_basis: Literal['distance', 'time', 'portion'] | None = None
     duration_minutes: float | None = Field(default=None, gt=0)
     distance_miles: float | None = Field(default=None, gt=0)
     target_zones: list[str] = Field(default_factory=list)
@@ -883,6 +908,7 @@ class RecommendationResponse(ApiModel):
     planning_role: str | None = None
     title: str
     distance_range_miles: tuple[float, float] | None = None
+    distance_target_miles: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     duration_range_minutes: tuple[float, float] | None = None
     target_zones: list[str] = Field(default_factory=list)
     structure: list[WorkoutStep] = Field(default_factory=list)
@@ -892,10 +918,26 @@ class RecommendationResponse(ApiModel):
     confidence: ConfidenceLevel
     readiness: ReadinessFlag
     readiness_reason: str = ""
+    readiness_label: str | None = None
+    time_recommendation_basis: str | None = None
     rule_trace: list[RuleTrace] = Field(default_factory=list)
+
+    @property
+    def planned_distance_miles(self) -> float | None:
+        """Legacy prescriptions retain their original range-derived target."""
+        if self.distance_target_miles is not None:
+            return self.distance_target_miles
+        return sum(self.distance_range_miles) / 2 if self.distance_range_miles else None
 
     @model_validator(mode="after")
     def require_workout_extent(self) -> "RecommendationResponse":
+        if self.distance_target_miles is not None:
+            target = self.distance_target_miles
+            if abs(target * 10 - round(target * 10)) > 1e-8:
+                raise ValueError('Distance targets must use one decimal place')
+            if (self.workout_type == WorkoutType.REST or self.distance_range_miles is None
+                    or not self.distance_range_miles[0] <= target <= self.distance_range_miles[1]):
+                raise ValueError('Distance target must be inside its non-rest adherence range')
         if (
             self.workout_type != WorkoutType.REST
             and self.distance_range_miles is None
@@ -917,6 +959,19 @@ class WeeklyRestDayRequest(ApiModel):
     is_rest_day: bool = True
 
 
+class PlannerJobRequest(ApiModel):
+    request_id: UUID
+    operation: Literal['refresh','update','rest']
+    update: WeeklyScheduleRequest | None = None
+    rest: WeeklyRestDayRequest | None = None
+
+    @model_validator(mode='after')
+    def operation_payload(self):
+        if (self.update is not None)!=(self.operation=='update') or (self.rest is not None)!=(self.operation=='rest'):
+            raise ValueError('Provide only the payload for the selected planner operation')
+        return self
+
+
 class StrengthSessionType(StrEnum):
     FULL_UPPER = "full_upper"
     PUSH = "push"
@@ -933,11 +988,25 @@ class StrengthSuggestion(ApiModel):
     rationale: str
 
 
+class StrengthCompletion(ApiModel):
+    session: StrengthSuggestion
+    # The calendar date identifies the workout; backfilling a past day does
+    # not give us its actual start/finish time. This is the attestation time.
+    recorded_at: datetime = Field(validation_alias=AliasChoices('recorded_at', 'completed_at'))
+
+
+class StrengthCompletionRequest(ApiModel):
+    date: date
+    session_type: StrengthSessionType
+    completed: bool
+
+
 class WeeklyScheduleDay(ApiModel):
     date: date
     planned_at: datetime | None = None
     recommendation: RecommendationResponse | None = None
     strength_suggestion: StrengthSuggestion | None = None
+    strength_completion: StrengthCompletion | None = None
     day_role: str
     rationale: str
     forced_rest: bool = False
@@ -957,6 +1026,8 @@ class TrailingCalendarDay(ApiModel):
     day_role: str
     total_distance_miles: float = Field(ge=0)
     activities: list[TrailingDayActivity] = Field(default_factory=list)
+    strength_suggestion: StrengthSuggestion | None = None
+    strength_completion: StrengthCompletion | None = None
 
 
 class WeeklyPlanningMode(StrEnum):
@@ -994,9 +1065,12 @@ class PlannerScoreBreakdown(ApiModel):
     support_violation: float
     shape_violation: float
     finalized_recovery_cost: float
+    distance_switching_cost: float = 0.0
     fragmentation_violation: float | None = None
     long_shape_violation: float | None = None
     medium_long_shape_violation: float | None = None
+    planned_midpoint_miles: float | None = None
+    integrated_target_low_miles: float | None = None
     allocation_trace: list[str] = Field(default_factory=list)
     projected_state_trace: list[str] = Field(default_factory=list)
     recovery_cost_components: dict[str, float] = Field(default_factory=dict)
@@ -1008,6 +1082,7 @@ class PlannerDiagnostics(ApiModel):
     candidate_count: int = Field(default=0, ge=0)
     full_score_count: int = Field(default=0, ge=0)
     winning_candidate: PlannerScoreBreakdown | None = None
+    published_candidate: PlannerScoreBreakdown | None = None
     translated_prior_candidate: PlannerScoreBreakdown | None = None
     prior_continuation_candidate: PlannerScoreBreakdown | None = None
     near_term_stable_candidate: PlannerScoreBreakdown | None = None
@@ -1018,9 +1093,13 @@ class PlannerDiagnostics(ApiModel):
     unconstrained_winning_candidate: PlannerScoreBreakdown | None = None
     stability_tie_break_applied: bool = False
     stability_tolerance: float | None = None
+    continuation_selection: dict[str, Any] | None = None
 
 
 class WeeklyScheduleResponse(ApiModel):
+    beginner_training: dict[str, Any] | None = None
+    planner_status: Literal['ready', 'review_required'] = 'ready'
+    planner_review_reason: str | None = None
     planner_version: int = Field(default=1, ge=1)
     generated_at: datetime
     emergency_alerts_checked_at: datetime | None = None
@@ -1159,6 +1238,7 @@ class CoachingSettings(ApiModel):
     long_run_recency_reference_days: float = Field(ge=5, le=30)
     reduced_volume_factor: float = Field(gt=0, le=1)
     quality_sessions: QualitySessionSettings = Field(default_factory=QualitySessionSettings)
+    quality_focus: Literal['variety', 'vo2max'] = 'variety'
     strength_training: StrengthTrainingSettings = Field(
         default_factory=StrengthTrainingSettings
     )
@@ -1177,10 +1257,10 @@ class ProfileSettings(ApiModel):
     sex: str = Field(pattern="^(male|female)$")
     weight_lb: float = Field(gt=50, le=1000)
     height_in: float = Field(gt=36, le=100)
-    #: Whether max_hr came from a real maximal effort or an age formula. It is
+    #: Whether max_hr came from a maximal effort, age formula, or watch config. It is
     #: the largest single source of error in the VO2 estimate, so the estimate
     #: says which one it assumed.
-    max_hr_source: str = Field(default="estimated", pattern="^(measured|estimated)$")
+    max_hr_source: str = Field(default="estimated", pattern="^(measured|estimated|watch)$")
 
 
 class GoalProgressResponse(ApiModel):
@@ -1206,6 +1286,7 @@ class SetupSettings(ApiModel):
 
     confirmed_steps: list[SetupStep] = Field(default_factory=list)
     zone_method: ZoneMethod | None = None
+    comparison_hr_mode: Literal['automatic', 'manual'] | None = None
 
 
 class SetupStepStatus(ApiModel):
@@ -1240,7 +1321,7 @@ class ComparisonHrRecommendation(ApiModel):
 
 class ZonePreviewRequest(ApiModel):
     method: ZoneMethod
-    max_hr: int = Field(gt=0, le=250)
+    max_hr: int | None = Field(default=None, gt=0, le=250)
     resting_hr: int | None = Field(default=None, gt=0, lt=150)
     boundaries: dict[str, ZoneRange] | None = None
 
@@ -1248,6 +1329,9 @@ class ZonePreviewRequest(ApiModel):
 class ZonePreviewResponse(ApiModel):
     method: ZoneMethod
     zones: dict[str, ZoneRange]
+    watch_recorded_at: datetime | None = None
+    max_hr: int | None = None
+    resting_hr: int | None = None
     #: Recomputed against the previewed zones, because moving Z2 moves where
     #: the evidence for a comparison heart rate is.
     comparison_hr: ComparisonHrRecommendation
@@ -1259,7 +1343,87 @@ class MaxHrEstimateResponse(ApiModel):
     caveat: str
 
 
+class PlannerPreferencesPatch(ApiModel):
+    long_run_goal_miles: float = Field(gt=0, le=100)
+    run_frequency: str = Field(pattern="^(fewer|balanced|more)$")
+    expected_revision: str
+    long_run_weekday: int | None = Field(default=None, ge=0, le=6, strict=True)
+
+
+class PlannerSettingsStatus(ApiModel):
+    """Effective adopted policy, not a second set of editable defaults."""
+    engine: str
+    status: str
+    detail: str
+    issued_at: datetime | None = None
+    snapshot_fingerprint: str | None = None
+    long_goal_miles: float | None = None
+    long_target_miles: float | None = None
+    volume_start_miles_per_7: float | None = None
+    volume_destination_miles_per_7: float | None = None
+    review_days: int | None = None
+    growth_fraction: float | None = None
+    long_cadence_days: float | None = None
+    quality_cadence_days: float | None = None
+    frequency_lower_per_7: float | None = None
+    frequency_upper_per_7: float | None = None
+    frequency_preference_fraction: float | None = None
+    minimum_running_minutes: float | None = None
+    penalty_free_running_minutes: float | None = None
+    demand_memory_days: float | None = None
+    demand_delivery_exchange: float | None = None
+    run_frequency: str = 'balanced'
+    requested_long_goal_miles: float | None = None
+    requested_run_frequency: str | None = None
+    long_run_weekday: int | None = None
+    requested_long_run_weekday: int | None = None
+    long_run_not_before: date | None = None
+    requested_long_run_not_before: date | None = None
+    preferences_revision: str | None = None
+    preferences_pending: bool = False
+    preferences_requested_at: datetime | None = None
+
+
+class RacePreparationSettings(ApiModel):
+    """Saved preparation draft; deliberately not an accepted planner objective."""
+    distance: Literal['general_fitness', '5k', '10k', 'half_marathon', 'marathon'] = 'general_fitness'
+    race_date: date | None = None
+    preparation_mode: Literal['shorter', 'balanced', 'more'] = 'balanced'
+
+    @model_validator(mode='after')
+    def coherent_goal(self):
+        if self.distance == 'general_fitness':
+            if self.race_date is not None or self.preparation_mode != 'balanced':
+                raise ValueError('General fitness has no race date or preparation option')
+        elif self.race_date is None:
+            raise ValueError('Choose a race date')
+        elif self.distance != 'marathon' and self.preparation_mode != 'balanced':
+            raise ValueError('Shorter/more preparation options currently apply only to marathon')
+        return self
+
+
+class RacePreparationApply(ApiModel):
+    goal: RacePreparationSettings
+    expected_revision: str = Field(min_length=1)
+    planner_preferences: PlannerPreferencesPatch | None = None
+
+    @model_validator(mode='after')
+    def general_target_only(self):
+        if self.planner_preferences is not None and self.goal.distance!='general_fitness':
+            raise ValueError('The weekly long-run target applies only to general fitness')
+        return self
+
+
+class RaceEventReport(ApiModel):
+    status: Literal['recorded', 'did_not_start']
+    physical_key: str | None = None
+    expected_revision: str = Field(min_length=1)
+
+
 class SettingsResponse(ApiModel):
+    beginner_start: bool = False
+    training_background: TrainingBackground | None = None
+    training_background_reported_at: datetime | None = None
     max_hr: int = Field(gt=0)
     resting_hr: int = Field(gt=0)
     target_hr: int = Field(gt=0)
@@ -1278,10 +1442,16 @@ class SettingsResponse(ApiModel):
     coaching: CoachingSettings
     profile: ProfileSettings | None = None
     setup: SetupSettings = Field(default_factory=SetupSettings)
+    planner: PlannerSettingsStatus | None = None
+    race_preparation: RacePreparationSettings = Field(default_factory=RacePreparationSettings)
     recalculation: list[UploadStage] = Field(default_factory=list)
 
 
 class SettingsPatch(ApiModel):
+    beginner_start: bool | None = None
+    training_background: TrainingBackground | None = None
+    planner_preferences: PlannerPreferencesPatch | None = None
+    race_preparation: RacePreparationSettings | None = None
     max_hr: int | None = Field(default=None, gt=0)
     resting_hr: int | None = Field(default=None, gt=0)
     target_hr: int | None = Field(default=None, gt=0)

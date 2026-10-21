@@ -8,6 +8,9 @@ from enum import Enum
 from random import Random
 from time import perf_counter
 from typing import Any, Callable
+from .aerobic_acceptance import cadence_exceptions
+from .selection_objective import build_with_selection_history
+from .prescription_load import projected_running_minutes
 
 from .durability import supported_long_run_capacity
 from .easy_baseline import (
@@ -25,7 +28,6 @@ from .training_load import (
     continuous_fatigue_load,
     continuous_distance_rate,
     short_term_density_half_life_days,
-    rolling_load,
 )
 from .weekly_schedule import (
     PLANNING_HORIZON_DAYS,
@@ -113,6 +115,7 @@ class ProjectionRun:
     completed_prescribed_workout: bool | None = None
     prescribed_low_miles: float | None = None
     prescribed_high_miles: float | None = None
+    prescribed_target_miles: float | None = None
     prescription_title: str | None = None
     quality_session_type: QualitySessionType | None = None
     adherence_note: str | None = None
@@ -160,6 +163,8 @@ class DeterministicAdherenceScenario(str, Enum):
     IN_RANGE_HIGH = "in_range_high"
     BELOW_RANGE_EASY = "below_range_easy"
     ABOVE_RANGE_OR_HARDER = "above_range_or_harder"
+    ABOVE_RANGE_EASY = "above_range_easy"
+    HARDER_SAME_DISTANCE = "harder_same_distance"
     SINGLE_HIDDEN_MISS = "single_hidden_miss"
     KNOWN_FORCED_REST = "known_forced_rest"
     HIDDEN_VACATION = "hidden_vacation"
@@ -239,6 +244,8 @@ class ProjectionReplan:
     cadence_exception_reasons: tuple[str, ...] = ()
     trigger: str = "scheduled_refresh"
     source_activity_at: datetime | None = None
+    expectation_reference: str = "latest_plan"
+    published_forecast_comparison: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +256,26 @@ class _ExpectedOpeningState:
     recovery_residual_load: float | None
     continuous_distance_miles: float | None
     continuous_short_term_distance_miles: float | None
+
+
+def _published_forecast_comparison(expected: _ExpectedOpeningState | None,
+                                   actual: FitnessState) -> dict[str, Any] | None:
+    """Keep forecast disagreement distinct from same-contract execution error."""
+    if expected is None:
+        return None
+    comparable = expected.as_of == actual.as_of
+    observed = (actual.recovery_residual_load, actual.recent_load.continuous_distance_miles,
+                actual.recent_load.continuous_short_term_distance_miles)
+    predicted = (expected.recovery_residual_load, expected.continuous_distance_miles,
+                 expected.continuous_short_term_distance_miles)
+    keys = ("recovery_residual_load", "continuous_distance_miles", "continuous_short_term_distance_miles")
+    return {
+        "expected_at": expected.as_of.isoformat(), "actual_at": actual.as_of.isoformat(),
+        "comparable": comparable,
+        "expected": dict(zip(keys, predicted)), "actual": dict(zip(keys, observed)),
+        "actual_minus_published": {key: value - forecast if comparable and value is not None and forecast is not None else None
+                                   for key, value, forecast in zip(keys, observed, predicted)},
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +291,17 @@ class ProjectionChurnSummary:
     distance_changes: int
 
 
+def replan_churn_window(
+    current: ProjectionReplan, horizon_days: int,
+) -> tuple[date, date]:
+    """Cover future dates plus today when it has not been consumed."""
+
+    tomorrow = current.generated_at.date() + timedelta(days=1)
+    start = current.decision_start_date or tomorrow
+    # Keep all previously protected future days when also checking today.
+    return start, max(start, tomorrow) + timedelta(days=horizon_days)
+
+
 def summarize_replan_churn(
     replans: list[ProjectionReplan] | tuple[ProjectionReplan, ...],
     *,
@@ -273,8 +311,8 @@ def summarize_replan_churn(
     """Measure future-plan churn without counting already-consumed sessions.
 
     Each comparison uses the later refresh's next ``horizon_days`` calendar
-    dates. The refresh date itself is excluded because a prescribed run may
-    have been completed before that refresh; its disappearance is compliance,
+    dates, plus today if the decision boundary says it remains unconsumed.
+    Completed dates are excluded; disappearance of their run is compliance,
     not instability. Date/type changes are kept separate from distance-only
     edits because moving a run is more disruptive than resizing it.
     """
@@ -293,13 +331,7 @@ def summarize_replan_churn(
             and current.trigger != transition_trigger
         ):
             continue
-        window_start = (
-            current.decision_start_date
-            if current.trigger == "post_upload"
-            and current.decision_start_date is not None
-            else current.generated_at.date() + timedelta(days=1)
-        )
-        window_end = window_start + timedelta(days=horizon_days)
+        window_start, window_end = replan_churn_window(current, horizon_days)
 
         def future_by_date(
             replan: ProjectionReplan,
@@ -519,6 +551,7 @@ def runs_from_summaries(values: list[RunSummary]) -> list[ProjectionRun]:
                 difficulty=difficulty,
                 planning_role=run.prescribed_planning_role,
                 prescribed_workout_type=run.prescribed_workout_type,
+                prescribed_target_miles=run.prescribed_distance_target_miles,
                 prescribed_low_miles=(
                     run.prescribed_distance_range_miles[0]
                     if run.prescribed_distance_range_miles is not None
@@ -556,30 +589,38 @@ def _completed_activities_on_plan_date(
 
 
 def _load_window(runs: list[ProjectionRun], as_of: datetime, days: int) -> LoadWindow:
-    load = rolling_load(
-        [
-            TrainingSession(
-                activity_id=index,
-                start_time=run.start_time,
-                distance_miles=run.distance_miles,
-                moving_minutes=run.moving_minutes,
-                zone_load=run.difficulty.zone_load,
-                hard_minutes=run.difficulty.zone_breakdown.hard_minutes,
-            )
-            for index, run in enumerate(runs)
-        ],
-        as_of,
-        days,
-    )
+    # Identical window and summation order to rolling_load, directly over the
+    # conditional ledger. Search queries these windows many thousands of times;
+    # converting every historical run to another object on every query adds no
+    # evidence or validation (ProjectionRun already contains these fields).
+    start = as_of - timedelta(days=days)
+    selected = [run for run in runs if start < run.start_time <= as_of]
+    zone_loads = [run.difficulty.zone_load for run in selected if run.difficulty.zone_load is not None]
     return LoadWindow(
         days=days,
-        distance_miles=load.distance_miles,
-        moving_minutes=load.moving_minutes,
-        zone_load=load.zone_load,
-        hard_minutes=load.hard_minutes,
-        activity_count=load.activity_count,
-        zone_load_activity_count=load.zone_load_activity_count,
+        distance_miles=sum(run.distance_miles for run in selected),
+        moving_minutes=sum(run.moving_minutes for run in selected),
+        zone_load=sum(zone_loads) if zone_loads else None,
+        hard_minutes=sum(run.difficulty.zone_breakdown.hard_minutes for run in selected),
+        activity_count=len(selected),
+        zone_load_activity_count=len(zone_loads),
     )
+
+
+def planning_activities_for(values: list[ProjectionRun]) -> list[PlanningActivity]:
+    """One target-evidence conversion for executed and conditional ledgers."""
+    return [PlanningActivity(
+        run.start_time, run.distance_miles, moving_minutes=run.moving_minutes,
+        easy_minutes=run.difficulty.zone_breakdown.easy_minutes,
+        baseline_eligible=(run.workout_type in {
+            WorkoutType.EASY, WorkoutType.RECOVERY, WorkoutType.RUN_WALK, WorkoutType.UNKNOWN,
+        } and not run.difficulty.is_long_run and not run.difficulty.is_quality_session
+            and run.planning_role not in {"support_easy", "medium_long"}),
+        target_distance_miles=adherence_normalized_distance(run.distance_miles,
+            (run.prescribed_low_miles, run.prescribed_high_miles)
+            if run.prescribed_low_miles is not None and run.prescribed_high_miles is not None else None,
+            prescribed_target_miles=run.prescribed_target_miles),
+    ) for run in values]
 
 
 def _state_at(
@@ -873,7 +914,7 @@ def _projected_difficulty(
     miles: float,
     pace_min_mile: float,
 ) -> SessionDifficulty:
-    minutes = miles * pace_min_mile
+    minutes = projected_running_minutes(recommendation, miles, pace_min_mile)
     workout_type = recommendation.workout_type
     if workout_type in QUALITY_TYPES:
         moderate = hard = 0.0
@@ -999,7 +1040,8 @@ def _observed_human_difficulty(
 ) -> SessionDifficulty:
     """Create plausible observed HR evidence for a deviated workout."""
 
-    minutes = miles * pace_min_mile
+    minutes = projected_running_minutes(recommendation, miles, pace_min_mile,
+                                        honor_structure=actual_type == recommendation.workout_type)
     if actual_type in QUALITY_TYPES:
         shaped = _projected_difficulty(
             recommendation.model_copy(update={"workout_type": actual_type}),
@@ -1067,6 +1109,12 @@ def simulate_adherence(
     simulation_days: int | None = None,
     replan_observer: Callable[[ProjectionReplan], None] | None = None,
     emit_post_upload_replans: bool = True,
+    execution_schedule_selector: Callable[
+        [datetime, datetime, WeeklyScheduleResponse], list[RecommendationResponse]
+    ] | None = None,
+    execution_observer: Callable[
+        [ProjectionRun, RecommendationResponse | None], None
+    ] | None = None,
 ) -> list[ProjectionWeek]:
     """Roll the real planner forward under controlled adherence behavior.
 
@@ -1077,6 +1125,12 @@ def simulate_adherence(
     Daily replanning is the production-fidelity default: only work scheduled
     before the next reload is committed. Longer intervals are an explicit
     coarse-test mode and must not be used to draw calendar-spacing conclusions.
+
+    An optional sandbox selector can execute an earlier issued prescription.
+    It does not replace the planner's output or warm start. Same-contract
+    recovery checks use the issued execution prescription. Differences from
+    the latest published forecast are retained separately, not erased or
+    interpreted as physiological errors. This is not database matching.
     """
 
     if not 1 <= replan_interval_days <= 7:
@@ -1117,6 +1171,7 @@ def simulate_adherence(
     deterministic_candidate_count = 0
     deterministic_trigger_complete = False
     expected_openings: dict[datetime, _ExpectedOpeningState] = {}
+    published_expected_openings: dict[datetime, _ExpectedOpeningState] = {}
     overload_trigger_date: date | None = None
     unscheduled_overload_complete = False
     candidate_hours = sorted(
@@ -1183,40 +1238,35 @@ def simulate_adherence(
     previous_schedule = initial_schedule
     last_replan_at: datetime | None = None
 
-    def planning_activities_for(
-        values: list[ProjectionRun],
-    ) -> list[PlanningActivity]:
-        return [
-            PlanningActivity(
-                run.start_time,
-                run.distance_miles,
-                moving_minutes=run.moving_minutes,
-                easy_minutes=run.difficulty.zone_breakdown.easy_minutes,
-                baseline_eligible=(
-                    run.workout_type
-                    in {
-                        WorkoutType.EASY,
-                        WorkoutType.RECOVERY,
-                        WorkoutType.RUN_WALK,
-                        WorkoutType.UNKNOWN,
-                    }
-                    and not run.difficulty.is_long_run
-                    and not run.difficulty.is_quality_session
-                    and run.planning_role
-                    not in {"support_easy", "medium_long"}
-                ),
-                target_distance_miles=adherence_normalized_distance(
-                    run.distance_miles,
-                    (
-                        (run.prescribed_low_miles, run.prescribed_high_miles)
-                        if run.prescribed_low_miles is not None
-                        and run.prescribed_high_miles is not None
-                        else None
-                    ),
-                ),
-            )
-            for run in values
-        ]
+    def expected_opening_for(
+        known_history: list[ProjectionRun], prescriptions: list[RecommendationResponse],
+        evaluated_at: datetime, pace: float,
+    ) -> _ExpectedOpeningState:
+        # Only issued prescriptions and pre-execution history enter this
+        # forecast; never use realized mileage to manufacture perfect agreement.
+        expected_runs = []
+        for item in prescriptions:
+            miles = item.planned_distance_miles
+            expected_runs.append(ProjectionRun(
+                start_time=item.planned_for, distance_miles=miles,
+                moving_minutes=projected_running_minutes(item, miles, pace), workout_type=item.workout_type,
+                difficulty=_projected_difficulty(item, miles, pace), projected=True,
+                planning_role=_completed_planning_role(item, item.workout_type),
+                prescribed_workout_type=item.workout_type, completed_prescribed_workout=True,
+                prescribed_target_miles=item.distance_target_miles, prescribed_low_miles=item.distance_range_miles[0], prescribed_high_miles=item.distance_range_miles[1],
+                prescription_title=item.title,
+                quality_session_type=item.quality_session_type if item.workout_type in QUALITY_TYPES else None,
+            ))
+        expected_history = sorted([*known_history, *expected_runs], key=lambda run: run.start_time)
+        completed_today = _completed_activities_on_plan_date(expected_history, evaluated_at)
+        decision_date = evaluated_at.date() + timedelta(days=1 if completed_today else 0)
+        as_of = datetime.combine(decision_date, time.min, tzinfo=start_at.tzinfo)
+        _, _, evidence = derive_weekly_target(planning_activities_for(expected_history), as_of, config)
+        state = _state_at(template, expected_history, as_of, evidence.capacity_reference_miles,
+            easy_baseline_half_life_days=float(config.get("coaching", {}).get("capacity_retention_half_life_days", 84)),
+            fatigue_half_life_days=float(config.get("coaching", {}).get("continuous_fatigue_half_life_days", 7)))
+        return _ExpectedOpeningState(state.as_of, state.recovery_residual_load,
+            state.recent_load.continuous_distance_miles, state.recent_load.continuous_short_term_distance_miles)
 
     def build_post_upload_replan(
         *,
@@ -1224,6 +1274,7 @@ def simulate_adherence(
         source_activity_at: datetime,
         prior_schedule: WeeklyScheduleResponse,
         expected_opening: _ExpectedOpeningState | None,
+        published_expected_opening: _ExpectedOpeningState | None = None,
     ) -> tuple[WeeklyScheduleResponse, ProjectionReplan]:
         """Regenerate from uploaded evidence before the next clock refresh.
 
@@ -1357,7 +1408,7 @@ def simulate_adherence(
                 if block_start <= state.as_of.date() < block_end
             }
         planning_started = perf_counter()
-        schedule = build_weekly_schedule(
+        schedule = build_with_selection_history(build_weekly_schedule, template, history,
             daily_states,
             RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
             config,
@@ -1431,7 +1482,7 @@ def simulate_adherence(
                 ProjectionPlanSession(
                     planned_for=item.planned_for,
                     workout_type=item.workout_type,
-                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    midpoint_miles=item.planned_distance_miles,
                     distance_low_miles=item.distance_range_miles[0],
                     distance_high_miles=item.distance_range_miles[1],
                     planning_role=item.planning_role,
@@ -1513,26 +1564,32 @@ def simulate_adherence(
                     7,
                 )
             ),
-            cadence_exception_reasons=tuple(
-                dict.fromkeys(
-                    reason
-                    for day in (schedule.planning_days or schedule.days)
-                    if day.recommendation is not None
-                    for reason in day.recommendation.reasons
-                    if any(
-                        marker in reason.casefold()
-                        for marker in (
-                            "replaced with aerobic",
-                            "recovery guardrail",
-                            "readiness guardrail",
-                            "recovery is incomplete",
-                        )
-                    )
-                )
-            ),
+            cadence_exception_reasons=cadence_exceptions(
+                reason for day in (schedule.planning_days or schedule.days)
+                if day.recommendation is not None for reason in day.recommendation.reasons),
             trigger="post_upload",
             source_activity_at=source_activity_at,
+            expectation_reference="issued_execution_contract" if execution_schedule_selector is not None else "latest_plan",
+            published_forecast_comparison=_published_forecast_comparison(published_expected_opening, daily_states[0]),
         )
+        # A completed upload is now known history. A later refresh of the
+        # same decision boundary must not rediscover its pre-upload forecast
+        # error. Preserve that error in the upload snapshot above, then rebase
+        # only expectations for this exact opening timestamp. This does not
+        # exempt any future date/dose churn or predict a different boundary.
+        for refresh_at, cached in list(expected_openings.items()):
+            if refresh_at > upload_at and cached.as_of == daily_states[0].as_of:
+                expected_openings[refresh_at] = _ExpectedOpeningState(
+                    as_of=daily_states[0].as_of,
+                    recovery_residual_load=actual_recovery_residual,
+                    continuous_distance_miles=actual_continuous_distance,
+                    continuous_short_term_distance_miles=actual_short_term_distance,
+                )
+        for refresh_at, cached in list(published_expected_openings.items()):
+            if refresh_at > upload_at and cached.as_of == daily_states[0].as_of:
+                published_expected_openings[refresh_at] = _ExpectedOpeningState(
+                    daily_states[0].as_of, actual_recovery_residual,
+                    actual_continuous_distance, actual_short_term_distance)
         return schedule, snapshot
 
     for plan_offset in range(0, total_days, replan_interval_days):
@@ -1670,7 +1727,7 @@ def simulate_adherence(
                 for offset, state in enumerate(daily_states)
                 if block_start <= state.as_of.date() < block_end
             }
-        schedule = build_weekly_schedule(
+        schedule = build_with_selection_history(build_weekly_schedule, template, history,
             daily_states,
             RecommendationRequest(health_status=CurrentHealthStatus.NORMAL),
             config,
@@ -1693,6 +1750,20 @@ def simulate_adherence(
             and day.recommendation.planned_for
             and plan_start <= day.recommendation.planned_for < commit_end
         ]
+        forecast_committed = committed
+        if execution_schedule_selector is not None:
+            committed = execution_schedule_selector(plan_start, commit_end, schedule)
+            execution_dates: set[date] = set()
+            for item in committed:
+                if (
+                    item.planned_for is None
+                    or not plan_start <= item.planned_for < commit_end
+                    or item.distance_range_miles is None
+                    or item.workout_type == WorkoutType.REST
+                    or item.planned_for.date() in execution_dates
+                ):
+                    raise ValueError("Execution selector must return unique run dates inside the decision window")
+                execution_dates.add(item.planned_for.date())
         opening = (
             daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
             if daily_states[0].recent_load.continuous_fatigue_to_capacity_ratio
@@ -1722,7 +1793,7 @@ def simulate_adherence(
             f"; target {target_range[0]:.1f}–{target_range[1]:.1f}; horizon "
             + ", ".join(
                 f"{item.planned_for.strftime('%a')} {item.workout_type.value} "
-                f"{sum(item.distance_range_miles) / 2:.1f}"
+                f"{item.planned_distance_miles:.1f}"
                 for item in visible_plan
                 if item.planned_for and item.distance_range_miles
             )
@@ -1745,6 +1816,7 @@ def simulate_adherence(
             else ()
         )
         expected_opening = expected_openings.pop(plan_start, None)
+        published_expected_opening = published_expected_openings.pop(plan_start, None)
         expected_state_at = (
             expected_opening.as_of if expected_opening is not None else None
         )
@@ -1779,6 +1851,8 @@ def simulate_adherence(
         )
         snapshot = ProjectionReplan(
             generated_at=plan_start,
+            expectation_reference="issued_execution_contract" if execution_schedule_selector is not None else "latest_plan",
+            published_forecast_comparison=_published_forecast_comparison(published_expected_opening, daily_states[0]),
             opening_load_ratio=opening,
             target_low_miles=target_range[0],
             target_high_miles=target_range[1],
@@ -1786,7 +1860,7 @@ def simulate_adherence(
                 ProjectionPlanSession(
                     planned_for=item.planned_for,
                     workout_type=item.workout_type,
-                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    midpoint_miles=item.planned_distance_miles,
                     distance_low_miles=item.distance_range_miles[0],
                     distance_high_miles=item.distance_range_miles[1],
                     planning_role=item.planning_role,
@@ -1799,7 +1873,7 @@ def simulate_adherence(
                 ProjectionPlanSession(
                     planned_for=item.planned_for,
                     workout_type=item.workout_type,
-                    midpoint_miles=sum(item.distance_range_miles) / 2,
+                    midpoint_miles=item.planned_distance_miles,
                     distance_low_miles=item.distance_range_miles[0],
                     distance_high_miles=item.distance_range_miles[1],
                     planning_role=item.planning_role,
@@ -1892,23 +1966,9 @@ def simulate_adherence(
                     7,
                 )
             ),
-            cadence_exception_reasons=tuple(
-                dict.fromkeys(
-                    reason
-                    for day in (schedule.planning_days or schedule.days)
-                    if day.recommendation is not None
-                    for reason in day.recommendation.reasons
-                    if any(
-                        marker in reason.casefold()
-                        for marker in (
-                            "replaced with aerobic",
-                            "recovery guardrail",
-                            "readiness guardrail",
-                            "recovery is incomplete",
-                        )
-                    )
-                )
-            ),
+            cadence_exception_reasons=cadence_exceptions(
+                reason for day in (schedule.planning_days or schedule.days)
+                if day.recommendation is not None for reason in day.recommendation.reasons),
         )
         summary["snapshots"].append(snapshot)
         if replan_observer is not None:
@@ -1921,14 +1981,14 @@ def simulate_adherence(
             expected_committed_runs = [
                 ProjectionRun(
                     start_time=item.planned_for,
-                    distance_miles=sum(item.distance_range_miles) / 2.0,
+                    distance_miles=item.planned_distance_miles,
                     moving_minutes=(
-                        sum(item.distance_range_miles) / 2.0 * pace
+                        item.planned_distance_miles * pace
                     ),
                     workout_type=item.workout_type,
                     difficulty=_projected_difficulty(
                         item,
-                        sum(item.distance_range_miles) / 2.0,
+                        item.planned_distance_miles,
                         pace,
                     ),
                     projected=True,
@@ -1938,7 +1998,7 @@ def simulate_adherence(
                     ),
                     prescribed_workout_type=item.workout_type,
                     completed_prescribed_workout=True,
-                    prescribed_low_miles=item.distance_range_miles[0],
+                    prescribed_target_miles=item.distance_target_miles, prescribed_low_miles=item.distance_range_miles[0],
                     prescribed_high_miles=item.distance_range_miles[1],
                     prescription_title=item.title,
                     quality_session_type=(
@@ -1947,7 +2007,7 @@ def simulate_adherence(
                         else None
                     ),
                 )
-                for item in committed
+                for item in forecast_committed
                 if item.planned_for is not None
                 and item.distance_range_miles is not None
             ]
@@ -2002,6 +2062,10 @@ def simulate_adherence(
                     .continuous_short_term_distance_miles
                 ),
             )
+            if execution_schedule_selector is not None:
+                published_expected_openings[next_plan_start] = expected_openings[next_plan_start]
+                expected_openings[next_plan_start] = expected_opening_for(
+                    history, committed, next_plan_start, pace)
         for item in committed:
             if not item.distance_range_miles or not item.planned_for:
                 continue
@@ -2012,7 +2076,9 @@ def simulate_adherence(
             ):
                 deterministic_eligible = bool(
                     deterministic_profile.scenario
-                    != DeterministicAdherenceScenario.BELOW_RANGE_EASY
+                    not in {DeterministicAdherenceScenario.BELOW_RANGE_EASY,
+                            DeterministicAdherenceScenario.ABOVE_RANGE_EASY,
+                            DeterministicAdherenceScenario.HARDER_SAME_DISTANCE}
                     or item.workout_type
                     in {WorkoutType.EASY, WorkoutType.RECOVERY}
                 )
@@ -2072,7 +2138,7 @@ def simulate_adherence(
                     )
                 )
                 continue
-            miles = sum(item.distance_range_miles) / 2.0
+            miles = item.planned_distance_miles
             notes: list[str] = []
             if deterministic_profile is not None:
                 if (
@@ -2102,7 +2168,8 @@ def simulate_adherence(
                     notes.append("below prescribed range")
                 elif (
                     deterministic_profile.scenario
-                    == DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER
+                    in {DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
+                        DeterministicAdherenceScenario.ABOVE_RANGE_EASY}
                     and deterministic_triggered
                 ):
                     ordinary_miles = daily_states[0].typical_easy_run_miles
@@ -2153,10 +2220,12 @@ def simulate_adherence(
             if (
                 deterministic_profile is not None
                 and deterministic_profile.scenario
-                == DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER
+                in {DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
+                    DeterministicAdherenceScenario.HARDER_SAME_DISTANCE}
                 and deterministic_triggered
             ):
                 too_intense = True
+                deterministic_trigger_complete = True
             if too_intense:
                 notes.append("more intense than prescribed")
             if overload_profile is not None:
@@ -2204,8 +2273,18 @@ def simulate_adherence(
                     in {
                         DeterministicAdherenceScenario.BELOW_RANGE_EASY,
                         DeterministicAdherenceScenario.ABOVE_RANGE_OR_HARDER,
+                        DeterministicAdherenceScenario.ABOVE_RANGE_EASY,
+                        DeterministicAdherenceScenario.HARDER_SAME_DISTANCE,
                     }
                 )
+            )
+            # Scenario membership controls adherence reporting, not HR evidence.
+            # A distance-only deterministic run has the same unknown-HR channel
+            # as its forecast. Only the explicitly harder execution introduces
+            # synthetic intensity evidence; subsequent compliant runs revert.
+            # Keep the existing human/overload evidence contracts unchanged.
+            simulate_observed_hr = bool(
+                human_profile or overload_profile or too_intense
             )
             if notes:
                 adherence_events.append(
@@ -2227,7 +2306,8 @@ def simulate_adherence(
             completed_run = ProjectionRun(
                     start_time=item.planned_for,
                     distance_miles=miles,
-                    moving_minutes=miles * pace,
+                    moving_minutes=projected_running_minutes(item, miles, pace,
+                        honor_structure=actual_type == item.workout_type),
                     workout_type=actual_type,
                     difficulty=(
                         _observed_human_difficulty(
@@ -2237,7 +2317,7 @@ def simulate_adherence(
                             actual_type,
                             too_intense=too_intense,
                         )
-                        if observed_deviation
+                        if simulate_observed_hr
                         else _projected_difficulty(item, miles, pace)
                     ),
                     projected=True,
@@ -2250,7 +2330,7 @@ def simulate_adherence(
                             and item.workout_type in QUALITY_TYPES
                         )
                     ),
-                    prescribed_low_miles=item.distance_range_miles[0],
+                    prescribed_target_miles=item.distance_target_miles, prescribed_low_miles=item.distance_range_miles[0],
                     prescribed_high_miles=item.distance_range_miles[1],
                     prescription_title=item.title,
                     quality_session_type=(
@@ -2267,39 +2347,48 @@ def simulate_adherence(
             history.append(completed_run)
             history.sort(key=lambda run: run.start_time)
 
+            forecast_item = next(
+                (candidate for candidate in forecast_committed
+                 if candidate.planned_for.date() == item.planned_for.date()),
+                None,
+            )
+            if execution_observer is not None:
+                execution_observer(completed_run, forecast_item)
+
             upload_at = item.planned_for + timedelta(
                 minutes=max(1.0, completed_run.moving_minutes)
             )
             if emit_post_upload_replans and upload_at < simulation_end_at:
-                expected_miles = sum(item.distance_range_miles) / 2.0
+                expected_item = forecast_item or item
+                expected_miles = expected_item.planned_distance_miles
                 expected_run = ProjectionRun(
-                    start_time=item.planned_for,
+                    start_time=expected_item.planned_for,
                     distance_miles=expected_miles,
-                    moving_minutes=expected_miles * pace,
-                    workout_type=item.workout_type,
+                    moving_minutes=projected_running_minutes(expected_item, expected_miles, pace),
+                    workout_type=expected_item.workout_type,
                     difficulty=_projected_difficulty(
-                        item,
+                        expected_item,
                         expected_miles,
                         pace,
                     ),
                     projected=True,
                     planning_role=_completed_planning_role(
-                        item,
-                        item.workout_type,
+                        expected_item,
+                        expected_item.workout_type,
                     ),
-                    prescribed_workout_type=item.workout_type,
+                    prescribed_workout_type=expected_item.workout_type,
                     completed_prescribed_workout=True,
-                    prescribed_low_miles=item.distance_range_miles[0],
-                    prescribed_high_miles=item.distance_range_miles[1],
-                    prescription_title=item.title,
+                    prescribed_target_miles=expected_item.distance_target_miles, prescribed_low_miles=expected_item.distance_range_miles[0],
+                    prescribed_high_miles=expected_item.distance_range_miles[1],
+                    prescription_title=expected_item.title,
                     quality_session_type=(
-                        item.quality_session_type
-                        if item.workout_type in QUALITY_TYPES
+                        expected_item.quality_session_type
+                        if expected_item.workout_type in QUALITY_TYPES
                         else None
                     ),
                 )
                 expected_history = sorted(
-                    [*history_before_run, expected_run],
+                    [*history_before_run, *([expected_run] if forecast_item is not None else [])],
                     key=lambda run: run.start_time,
                 )
                 expected_completed_today = (
@@ -2344,7 +2433,8 @@ def simulate_adherence(
                         upload_at=upload_at,
                         source_activity_at=item.planned_for,
                         prior_schedule=previous_schedule,
-                        expected_opening=_ExpectedOpeningState(
+                        expected_opening=(expected_opening_for(history_before_run, [item], upload_at, pace)
+                                          if execution_schedule_selector is not None else _ExpectedOpeningState(
                             as_of=expected_state.as_of,
                             recovery_residual_load=(
                                 expected_state.recovery_residual_load
@@ -2359,7 +2449,12 @@ def simulate_adherence(
                                 .recent_load
                                 .continuous_short_term_distance_miles
                             ),
-                        ),
+                        )),
+                        published_expected_opening=(
+                            _ExpectedOpeningState(expected_state.as_of, expected_state.recovery_residual_load,
+                                expected_state.recent_load.continuous_distance_miles,
+                                expected_state.recent_load.continuous_short_term_distance_miles)
+                            if execution_schedule_selector is not None else None),
                     )
                 )
                 summary["snapshots"].append(post_upload_snapshot)
@@ -2482,7 +2577,7 @@ def simulate_adherence(
                     ProjectionRun(
                         start_time=unscheduled_at,
                         distance_miles=miles,
-                        moving_minutes=miles * pace,
+                        moving_minutes=projected_running_minutes(synthetic, miles, pace),
                         workout_type=WorkoutType.EASY,
                         difficulty=_observed_human_difficulty(
                             synthetic,
@@ -2555,9 +2650,11 @@ def simulate_adherence(
     )
 
     results: list[ProjectionWeek] = []
-    for week_index in range(weeks):
+    for week_index in range((total_days + 6) // 7):
         week_start_date = simulation_start_date + timedelta(days=week_index * 7)
-        week_end_date = week_start_date + timedelta(days=7)
+        week_end_date = min(
+            week_start_date + timedelta(days=7), simulation_end_at.date()
+        )
         week_start = (
             start_at
             if week_index == 0
@@ -2589,6 +2686,7 @@ def simulate_adherence(
                             and run.prescribed_high_miles is not None
                             else None
                         ),
+                        prescribed_target_miles=run.prescribed_target_miles,
                     ),
                 )
                 for run in history_at_open
@@ -2628,7 +2726,8 @@ def simulate_adherence(
             key=lambda run: run.start_time,
         )
         evaluation_times = [
-            week_start + timedelta(days=offset) for offset in range(8)
+            min(week_start + timedelta(days=offset), week_end)
+            for offset in range((week_end_date - week_start_date).days + 1)
         ] + [
             run.start_time
             for run in history

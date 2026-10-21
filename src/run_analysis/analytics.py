@@ -7,6 +7,8 @@ from math import erf, sqrt
 from statistics import median
 from typing import Any
 
+from .uncertainty import overlapping_variance
+
 
 MIN_MEASUREMENT_SIGMA_MIN_MILE = 10.0 / 60.0
 LIKELY_DIRECTION_PROBABILITY = 0.80
@@ -281,8 +283,7 @@ def _window_trend(
                 distance_effect_se_min_mile_per_added_mile
             )
     slope_se = sqrt(
-        measurement_slope_se**2
-        + between_run_slope_se**2
+        overlapping_variance(measurement_slope_se**2, between_run_slope_se**2)
         + distance_calibration_slope_se**2
     )
     # Describe change only across the span actually supported by observations.
@@ -389,7 +390,7 @@ def _window_estimate(
     ) / weight_sum
     measurement_se = sqrt(1.0 / weight_sum)
     between_run_se = sqrt(weighted_variance / max(1.0, effective_n))
-    uncertainty_95 = 1.96 * sqrt(measurement_se**2 + between_run_se**2)
+    uncertainty_95 = 1.96 * sqrt(overlapping_variance(measurement_se**2, between_run_se**2))
     coverage_span_days = (
         max(_date(row) for row in selected) - min(_date(row) for row in selected)
     ).total_seconds() / 86400.0
@@ -530,7 +531,7 @@ def _distance_adjusted_comparison(
         weighted_variance
         / max(1e-12, effective_n * normalized_period_variance)
     )
-    change_se = sqrt(measurement_se**2 + between_run_se**2)
+    change_se = sqrt(overlapping_variance(measurement_se**2, between_run_se**2))
     period_line_for_distance = _weighted_line(
         period_values, distance_values, weights
     )
@@ -554,7 +555,7 @@ def _distance_adjusted_comparison(
                 / max(1e-12, effective_n * normalized_distance_variance)
             )
             distance_effect_se = sqrt(
-                distance_measurement_se**2 + distance_between_run_se**2
+                overlapping_variance(distance_measurement_se**2, distance_between_run_se**2)
             )
     directional = _directional_evidence(period_change, change_se)
     direction = (

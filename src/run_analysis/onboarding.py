@@ -15,7 +15,9 @@ history actually has evidence rather than from a round number.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+import json
 import sqlite3
 
 ZONE_NAMES: tuple[str, ...] = ("z1", "z2", "z3", "z4", "z5")
@@ -223,15 +225,80 @@ def recommend_comparison_hr(
     )
 
 
+def automatic_comparison_hr(connection, zones, *, current=None, as_of=None):
+    """Recent comparable aerobic evidence, with a provisional Z2 midpoint.
+
+    This is an analysis coordinate, not a workout target or a fitness signal.
+    Re-evaluate all displayed history at one coordinate after it changes. The
+    90-day window limits old training's influence; distinct runs limit a long
+    run's influence. Prefer the current coordinate when support is tied.
+    """
+    as_of = as_of or datetime.now(timezone.utc)
+    lower, upper = map(int, zones['z2'])
+    cutoff = as_of - timedelta(days=90)
+    candidates = []
+    if connection is not None:
+        from .run_feedback import _infer_workout_type, _long_run_threshold_from_connection
+
+        long_threshold = _long_run_threshold_from_connection(connection)
+        rows = connection.execute('''
+            SELECT CAST(ROUND(s.average_hr_bpm) AS INTEGER) AS bpm,
+                   a.id, COUNT(*) AS segments, o.workout_type,
+                   m.detected_workout_type, a.total_distance_m,
+                   m.calculated_moving_time_s, m.device_timer_time_s,
+                   m.hr_zone_seconds_json
+            FROM segments s JOIN activities a ON a.id=s.activity_id
+            JOIN activity_metrics m ON m.activity_id=a.id
+            LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
+            WHERE a.sport='Running'
+              AND julianday(a.start_time_utc) BETWEEN julianday(?) AND julianday(?)
+              AND s.average_hr_bpm BETWEEN ? AND ? AND s.is_pathological=0
+              AND m.model_eligible=1 AND COALESCE(o.illness,0)=0
+              AND COALESCE(o.health_tag,'normal')='normal'
+              AND COALESCE(o.include_in_model,1)!=0
+            GROUP BY a.id,bpm ORDER BY bpm,a.id
+        ''', (cutoff.isoformat(), as_of.isoformat(), lower, upper)).fetchall()
+        # detected_workout_type records structured sessions, not every ordinary
+        # easy/long run. Resolve roles exactly as Run Analysis/Progress do;
+        # absence of a structured-workout label is not absence of evidence.
+        roles = {}
+        support = {}
+        for bpm, activity_id, segments, explicit, detected, distance, moving, timer, zone_json in rows:
+            if activity_id not in roles:
+                roles[activity_id] = _infer_workout_type(
+                    explicit, detected, float(distance or 0) / 1609.344,
+                    float(moving or timer or 0) / 60,
+                    json.loads(zone_json or '{}'), long_threshold,
+                ).value
+            if roles[activity_id] not in {'easy', 'long', 'recovery'}:
+                continue
+            run_ids, segment_count = support.get(int(bpm), (set(), 0))
+            run_ids.add(activity_id)
+            support[int(bpm)] = run_ids, segment_count + int(segments)
+        candidates = [ComparisonHrCandidate(bpm, len(run_ids), segments)
+            for bpm, (run_ids, segments) in sorted(support.items())]
+    midpoint = (lower + upper) // 2
+    best = max(candidates, key=lambda item: (item.run_count,
+        item.heart_rate_bpm == current, item.segment_count,
+        -abs(item.heart_rate_bpm - midpoint)), default=None)
+    supported = best is not None and best.run_count >= MINIMUM_SUPPORTING_RUNS
+    chosen = best.heart_rate_bpm if supported else midpoint
+    return ComparisonHrRecommendation(chosen, best.run_count if best else 0,
+        best.segment_count if best else 0, lower, upper,
+        'Chosen from your recent easy running.' if supported else
+        'Using the middle of Z2 until enough comparable easy runs are available.', candidates)
+
+
 class SetupStep(StrEnum):
     """The decisions that must be real before the numbers mean anything."""
 
     RUNS = "runs"
     HEART_RATE = "heart_rate"
     ZONES = "zones"
-    COMPARISON_HR = "comparison_hr"
+    COMPARISON_HR = "comparison_hr"  # Legacy saved confirmations; no user setup step.
     PROFILE = "profile"
     GOAL = "goal"
+    PROGRESSION = "progression"
     WEATHER = "weather"
 
 
@@ -275,6 +342,11 @@ def setup_state(connection, config: dict) -> SetupState:
     runs = connection.execute(
         "SELECT COUNT(*) FROM activities WHERE sport = 'Running'"
     ).fetchone()[0]
+    from .training_background import reported_background, calibration_activity
+    background = reported_background(config)
+    calibrated = (calibration_activity(connection,config,
+        reported_at=datetime.fromisoformat(config['training_background_reported_at']))
+        if background and config.get('training_background_reported_at') else None)
     profile = config.get("profile") or {}
     zones = config.get("zones") or {}
     zone_method = (config.get("setup") or {}).get("zone_method")
@@ -284,23 +356,21 @@ def setup_state(connection, config: dict) -> SetupState:
     maximum_hr = config.get("max_hr")
     resting_hr = config.get("resting_hr")
     max_hr_source = str(profile.get("max_hr_source") or "estimated")
-    target_hr = config.get("target_hr")
     zone_2 = zones.get("z2")
-    target_in_z2 = bool(
-        zone_2 and target_hr and int(zone_2[0]) <= int(target_hr) <= int(zone_2[1])
-    )
 
     steps = [
         SetupStepState(
             SetupStep.RUNS,
-            "Add your runs",
-            complete=runs > 0,
+            "Record your first easy run" if background and not calibrated else "Add your runs",
+            complete=bool(calibrated) if background else runs > 0,
             detail=(
+                'Starting training is self-reported. Record one normal easy run with GPS and heart rate to calibrate the full plan.'
+                if background and not calibrated else
                 f"{runs} running activities imported."
                 if runs
                 else (
-                    "No runs yet. Import recent TCX or FIT files, or complete the scheduled "
-                    "10–30-minute conversational Zone 2 run or run/walk."
+                    "Import recent FIT, TCX or GPX activity files, or a Garmin ZIP, or use Sync. No history? "
+                    "Finish personal details and heart-rate setup before a baseline run."
                 )
             ),
             blocking=True,
@@ -332,20 +402,9 @@ def setup_state(connection, config: dict) -> SetupState:
             ),
         ),
         SetupStepState(
-            SetupStep.COMPARISON_HR,
-            "Comparison heart rate",
-            complete=SetupStep.COMPARISON_HR in confirmed,
-            detail=(
-                f"Every pace-at-heart-rate figure is evaluated at {target_hr} bpm"
-                + ("." if target_in_z2 else ", which is outside your Z2 — most runs will need extrapolating.")
-                if target_hr
-                else "Not set."
-            ),
-        ),
-        SetupStepState(
             SetupStep.PROFILE,
             "About you",
-            complete=bool(profile.get("birth_date") and profile.get("sex") and profile.get("weight_lb")),
+            complete=bool(profile.get("birth_date") and profile.get("sex") and profile.get("weight_lb") and profile.get("height_in")),
             detail=(
                 "Used only for the VO₂ estimate, which needs weight, sex and age."
                 if profile
@@ -357,7 +416,9 @@ def setup_state(connection, config: dict) -> SetupState:
             "What you are training for",
             complete=SetupStep.GOAL in confirmed,
             detail=(
-                f"Currently {str(coaching.get('training_goal', 'general_fitness')).replace('_', ' ')}."
+                f"Currently {str(config.get('race_preparation', {}).get('distance', 'general_fitness')).replace('_', ' ')}."
+                + (' Race preparation is a saved draft, not an active calendar.'
+                   if config.get('race_preparation', {}).get('distance', 'general_fitness') != 'general_fitness' else '')
             ),
         ),
         SetupStepState(
@@ -373,6 +434,20 @@ def setup_state(connection, config: dict) -> SetupState:
             ),
         ),
     ]
+    from .adaptive.live_bridge import enabled as adaptive_enabled
+    if adaptive_enabled(config):
+        steps.insert(-1, SetupStepState(
+            SetupStep.PROGRESSION,
+            "Running progression",
+            complete=SetupStep.PROGRESSION in confirmed,
+            detail="Long-run goal guides progression; run frequency guides how training is spread across days.",
+        ))
+    # History gates analysis/planning, not personal calibration. New athletes
+    # must have their profile and zones before a first run is suggested.
+    order = [SetupStep.PROFILE, SetupStep.HEART_RATE, SetupStep.ZONES,
+             SetupStep.COMPARISON_HR, SetupStep.GOAL, SetupStep.PROGRESSION,
+             SetupStep.WEATHER, SetupStep.RUNS]
+    steps.sort(key=lambda step: order.index(step.step))
     return SetupState(complete=all(step.complete for step in steps), steps=steps)
 
 

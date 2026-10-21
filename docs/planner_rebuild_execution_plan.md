@@ -1,5 +1,10 @@
 # Planner rebuild execution plan
 
+**Historical baseline/rebuild record.** The active work queue is now the
+[consolidated scheduler plan](adaptive_scheduler_plan.md). Preserve the experiments
+and results below; do not treat their unchecked tasks or old baseline-selection
+instructions as a competing current plan.
+
 ## Objective
 
 Build from the smallest validated planner baseline and recover progression,

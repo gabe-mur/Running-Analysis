@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import sqlite3
+from .workout_detection import recorded_laps,usable_recorded_laps,recorded_continuous_work
 
 
 @dataclass(frozen=True)
@@ -14,6 +16,7 @@ class ContinuousQualityPhase:
     distance_miles: float | None
     average_hr_bpm: float | None
     maximum_hr_bpm: float | None
+    structure: str = 'interior_work'
 
     @property
     def end_offset_seconds(self) -> float:
@@ -31,45 +34,36 @@ def detect_continuous_quality_phase(
     config: dict,
     activity_id: int,
 ) -> ContinuousQualityPhase | None:
-    """Find a sustained interior work lap bounded by warm-up and cool-down.
+    """Find recorded sustained work, including a progression without cooldown.
 
     This is the same deliberately conservative rule used by workout analysis:
-    the work must be an interior 8--40 minute lap with at least Z3 average HR.
+    work is an 8--40 minute lap with at least Z3 average HR. A terminal
+    progression additionally needs an explicit manual boundary and both pace
+    and HR contrast with the preceding warm-up.
     The elapsed offset lets the fitness model reject every post-work window,
     including a cooldown whose pace and HR have merely stabilized while the
     athlete is still recovering.
     """
 
-    laps = connection.execute(
-        """
-        SELECT lap_index,total_time_s,distance_m,average_hr_bpm,maximum_hr_bpm
-        FROM laps WHERE activity_id=? ORDER BY lap_index
-        """,
-        (activity_id,),
-    ).fetchall()
-    if len(laps) < 3:
-        return None
+    laps=usable_recorded_laps(recorded_laps(connection,activity_id))
     z3_floor = float(config["zones"]["z3"][0])
-    candidates = [
-        (position, row)
-        for position, row in enumerate(laps[1:-1], start=1)
-        if 8 * 60 <= float(row["total_time_s"] or 0) <= 40 * 60
-        and row["average_hr_bpm"] is not None
-        and float(row["average_hr_bpm"]) >= z3_floor
-    ]
-    if not candidates:
+    found=recorded_continuous_work(laps,z3_floor)
+    if found is None:
         return None
-    position, selected = max(
-        candidates,
-        key=lambda item: (
-            float(item[1]["average_hr_bpm"]),
-            float(item[1]["total_time_s"]),
-        ),
-    )
+    position,structure=found
+    selected=laps[position]
+    if selected['average_hr_bpm'] is None or float(selected['average_hr_bpm'])<z3_floor:
+        return None
+    offset=sum(float(row['total_time_s']) for row in laps[:position])
+    if 'start_time_utc' in selected.keys() and selected['start_time_utc'] and laps[0]['start_time_utc']:
+        # FIT timer duration excludes pauses; a recorded start is the correct
+        # elapsed offset rather than silently shifting work into an earlier lap.
+        offset=(datetime.fromisoformat(str(selected['start_time_utc']))-
+            datetime.fromisoformat(str(laps[0]['start_time_utc']))).total_seconds()
     distance_m = float(selected["distance_m"] or 0)
     return ContinuousQualityPhase(
         lap_index=int(selected["lap_index"]),
-        start_offset_seconds=sum(float(row["total_time_s"] or 0) for row in laps[:position]),
+        start_offset_seconds=offset,
         duration_seconds=float(selected["total_time_s"]),
         distance_miles=distance_m / 1609.344 if distance_m > 0 else None,
         average_hr_bpm=(
@@ -82,4 +76,5 @@ def detect_continuous_quality_phase(
             if selected["maximum_hr_bpm"] is not None
             else None
         ),
+        structure=structure,
     )

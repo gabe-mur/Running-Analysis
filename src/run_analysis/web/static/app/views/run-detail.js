@@ -11,13 +11,17 @@ function renderAdjustment(observation, workoutType) {
     const quality = ["intervals", "tempo_threshold", "race"].includes(workoutType);
     return `<article class="wide-card"><p class="eyebrow">Aerobic fitness estimate</p><h2>${quality ? "Analyzed as a workout" : "No comparable pace"}</h2><p>${quality ? "Intervals and races count toward training load, but their changing effort is not compared with steady aerobic runs." : "This run still counts toward your mileage and training load. Its sensor data did not support a fair pace-at-HR comparison."}</p></article>`;
   }
-  const sign = observation.environmental_adjustment_min_mile >= 0 ? "+" : "−";
-  const seconds = Math.abs(observation.environmental_adjustment_min_mile * 60);
+  if(observation.pace_basis==='observed_comparable') return `<article class="wide-card audit-card"><div class="card-heading"><div><p class="eyebrow">Observed aerobic pace</p><h2>${observation.standardized_pace_at_target_hr.display} near ${targetHrLabel()}</h2></div><span class="quality ${observation.confidence}">${evidenceLabel(observation.confidence)}</span></div><p>${Number.isFinite(observation.observed_average_hr_bpm)?`Sampled HR: ${number(observation.observed_average_hr_bpm,0)} bpm. `:''}Comparable Z2 running, without pace corrections for hills or weather.</p></article>`;
+  const shared = observation.pace_basis === 'shared-aerobic-comparison-v1';
+  const adjustment = shared ? observation.standardized_pace_at_target_hr.minutes_per_mile
+    - observation.raw_pace_at_target_hr.minutes_per_mile : observation.environmental_adjustment_min_mile;
+  const sign = adjustment >= 0 ? "+" : "−";
+  const seconds = Math.abs(adjustment * 60);
   const contributions = observation.contributions.map((item) => `
     <li><span>${titleCase(item.name)}</span><strong>${item.minutes_per_mile >= 0 ? "+" : "−"}${Math.abs(item.minutes_per_mile * 60).toFixed(0)} sec/mi</strong><small>${evidenceLabel(item.confidence)} · ${escapeHtml(item.evidence)}</small></li>`).join("");
   return `<article class="wide-card audit-card">
     <div class="card-heading"><div><p class="eyebrow">Aerobic fitness estimate</p><h2>${observation.standardized_pace_at_target_hr.display} at ${targetHrLabel()}</h2></div><span class="quality ${observation.confidence}">${evidenceLabel(observation.confidence)}</span></div>
-    <div class="equation"><span><strong>${observation.raw_pace_at_target_hr.display}</strong><small>before conditions</small></span><b>${sign} ${seconds.toFixed(0)} sec/mi</b><span><strong>${observation.standardized_pace_at_target_hr.display}</strong><small>after conditions</small></span></div>
+    <div class="equation"><span><strong>${observation.raw_pace_at_target_hr.display}</strong><small>${shared?'recorded sections':'before conditions'}</small></span><b>${sign} ${seconds.toFixed(0)} sec/mi</b><span><strong>${observation.standardized_pace_at_target_hr.display}</strong><small>${shared?'comparable pace':'after conditions'}</small></span></div>
     <details><summary>See the adjustments</summary><ul class="contribution-list">${contributions}</ul></details>
   </article>`;
 }
@@ -90,22 +94,33 @@ function cadenceCard(cadence) {
  * this surfaces it here rather than making the athlete go and look, and links
  * through for the rest of the week.
  */
-function renderNextRun(weekly) {
+export function renderSavedNextRun(state) {
+  const weekly = state?.schedule;
+  if (state?.needs_refresh) {
+    return `<a class="assessment next-run-panel" href="#next-run" data-saved-next-run><p class="eyebrow">Your next run</p><h2>Plan needs updating</h2><p class="next-run-detail">Open Weekly Plan to update your next run.</p><span class="panel-action">Weekly plan →</span></a>`;
+  }
+  if (weekly?.planner_status === 'review_required') {
+    return `<a class="assessment next-run-panel" href="#next-run" data-saved-next-run><p class="eyebrow">Your next run</p><h2>Review your plan</h2><span class="panel-action">Weekly plan →</span></a>`;
+  }
   if (!weekly) {
-    return `<a class="assessment next-run-panel" href="#next-run"><p class="eyebrow">Your next run</p><h2>No plan yet</h2><p class="next-run-detail">Once a few runs are in, a seven-day plan is built from them.</p><span class="panel-action">Weekly plan →</span></a>`;
+    return `<a class="assessment next-run-panel" href="#next-run" data-saved-next-run><p class="eyebrow">Your next run</p><h2>No plan yet</h2><p class="next-run-detail">Once a few runs are in, a seven-day plan is built from them.</p><span class="panel-action">Weekly plan →</span></a>`;
   }
   const next = weekly.days.find((day) => day.recommendation);
   const headline = next ? next.recommendation.title : "Nothing scheduled";
   const when = next ? calendarDateLabel(next.date) : "";
   const distance = next?.recommendation.distance_range_miles;
   const duration = next?.recommendation.duration_range_minutes;
-  const extent = distance
+  const extent = next?.recommendation.distance_target_miles != null
+    ? `${number(next.recommendation.distance_target_miles)} mi`
+    : distance
     ? `${number(distance[0])}–${number(distance[1])} mi`
     : duration
       ? `${number(duration[0], 0)}–${number(duration[1], 0)} min`
       : "";
-  const week = `${weekly.run_count} ${weekly.run_count === 1 ? "run" : "runs"} · ${number(weekly.projected_distance_range_miles[0])}–${number(weekly.projected_distance_range_miles[1])} mi`;
-  return `<a class="assessment next-run-panel" href="#next-run">
+  const weeklyMiles=weekly.visible_7d_scheduled_miles!=null?number(weekly.visible_7d_scheduled_miles)
+    : weekly.projected_distance_range_miles.map(value=>number(value)).filter((value,index,values)=>index===0||value!==values[0]).join('–');
+  const week = `${weekly.run_count} ${weekly.run_count === 1 ? "run" : "runs"} · ${weeklyMiles} mi`;
+  return `<a class="assessment next-run-panel" href="#next-run" data-saved-next-run>
     <p class="eyebrow">Your next run</p>
     <h2>${escapeHtml(headline)}</h2>
     <p class="next-run-detail">${escapeHtml([when, extent].filter(Boolean).join(" · "))}</p>
@@ -115,13 +130,21 @@ function renderNextRun(weekly) {
 }
 
 
+let runRequestSequence=0, nextRunRequestSequence=0;
+export async function refreshSavedNextRun(fetcher=api) {
+  const panel=view.querySelector('[data-saved-next-run]');
+  if(!panel) return;
+  const sequence=++nextRunRequestSequence, hash=globalThis.location?.hash;
+  const state=await fetcher('/api/weekly-schedule/saved');
+  if(sequence===nextRunRequestSequence && panel.isConnected!==false && globalThis.location?.hash===hash)
+    panel.outerHTML=renderSavedNextRun(state);
+}
+
 export async function renderRunDetail(activityId) {
+  const sequence=++runRequestSequence;
   loading("Run feedback");
-  const [feedback, weekly] = await Promise.all([
-    api(`/api/runs/${activityId}`),
-    // A missing or not-yet-generated plan must not take the run page down.
-    api("/api/weekly-schedule/latest").catch(() => null),
-  ]);
+  const feedback = await api(`/api/runs/${activityId}`);
+  if(sequence!==runRequestSequence || globalThis.location && location.hash!==`#run/${activityId}`) return;
   const run = feedback.run;
   const difficulty = run.session_difficulty;
   const zoneEntries = Object.entries(difficulty.zone_breakdown.zone_fractions).filter(([, value]) => value > 0);
@@ -139,9 +162,19 @@ export async function renderRunDetail(activityId) {
       <div class="page-heading run-title"><div><p class="eyebrow">${titleCase(run.workout_type)} · ${dataQualityLabel(run.data_quality)} data</p><h1>${number(run.distance_miles)} miles</h1><p>${dateLabel(run.start_time)}</p></div><div class="headline-pace"><strong>${pace(run.moving_pace_min_mile)}</strong><span>${number(run.average_hr_bpm, 0)} bpm average</span></div></div>
       <div class="run-summary-grid">
         <article class="assessment"><p class="eyebrow">How did it go?</p><h2>${escapeHtml(feedback.assessment)}</h2><div class="feedback-columns"><ul class="positive-list">${positives}</ul><ul class="caution-list">${cautions}</ul></div></article>
-        ${renderNextRun(weekly)}
+        <a class="assessment next-run-panel" href="#next-run" data-saved-next-run><p class="eyebrow">Your next run</p><h2>Weekly Plan</h2><span class="panel-action">Weekly plan →</span></a>
       </div>
-      <details class="metadata-editor"><summary>Edit run details</summary><form id="metadata-form"><label>Workout type<select name="workout_type">${["easy","recovery","long","tempo_threshold","intervals","race","run_walk","hike","bike","other","unknown"].map((value) => `<option value="${value}" ${feedback.metadata.workout_type === value ? "selected" : ""}>${titleCase(value)}</option>`).join("")}</select></label><label>Health context<select name="health_tag">${["normal","illness","illness_recovery","injury_affected","other_abnormal"].map((value) => `<option value="${value}" ${feedback.metadata.health_tag === value ? "selected" : ""}>${titleCase(value)}</option>`).join("")}</select></label><label>Effort (1–10)<input type="number" min="1" max="10" name="perceived_exertion" value="${feedback.metadata.perceived_exertion ?? ""}" placeholder="Optional"></label><label>Use in fitness trend<select name="include_in_model"><option value="auto" ${feedback.metadata.include_in_model === null ? "selected" : ""}>Decide automatically</option><option value="true" ${feedback.metadata.include_in_model === true ? "selected" : ""}>Use</option><option value="false" ${feedback.metadata.include_in_model === false ? "selected" : ""}>Do not use</option></select></label>${postalField}<label class="notes-label">Notes<textarea name="notes" rows="2">${escapeHtml(feedback.metadata.notes)}</textarea></label><button type="submit">Save changes</button><span id="metadata-status"></span></form></details>
+      <article class="wide-card"><p class="eyebrow">Post-run feedback</p>
+        <p>Whole-session effort: <strong>${difficulty.perceived_exertion == null ? "Not reported" : `${number(difficulty.perceived_exertion, 1)} / 10`}</strong>${feedback.metadata.effort_source?.startsWith("fit:") ? " · imported from FIT" : feedback.metadata.effort_source === "manual" ? " · your entry" : ""}.
+        Feeling during the run: <strong>${feedback.metadata.workout_feel == null ? "Not reported" : `${number(feedback.metadata.workout_feel, 0)} / 100 (bad → good)`}</strong>${feedback.metadata.feeling_source ? " · imported from FIT" : ""}.</p>
+        <p>Effort and feeling are distinct; neither is a recovery percentage.</p>
+        ${feedback.metadata.feedback_conflict ? "<p>Imported sources disagree on a rating. The preferred source is shown; you can override effort below.</p>" : ""}
+        <form id="effort-form"><label>How hard was the entire run? (0 = no exertion, 10 = maximum)
+          <input name="effort" type="number" min="0" max="10" step="0.1" value="${difficulty.perceived_exertion ?? ""}" placeholder="Optional — skip if unsure">
+        </label><button type="submit">Save effort</button><span id="effort-status"></span></form>
+        <small>Leave blank to use the imported rating, if available. Current readiness is still reported separately on the weekly plan.</small>
+      </article>
+      <details class="metadata-editor"><summary>Edit run details</summary><form id="metadata-form"><label>Workout type<select name="workout_type">${["easy","recovery","long","tempo_threshold","intervals","race","run_walk","hike","bike","other","unknown"].map((value) => `<option value="${value}" ${feedback.metadata.workout_type === value ? "selected" : ""}>${titleCase(value)}</option>`).join("")}</select></label><label>Health context<select name="health_tag">${["normal","illness","illness_recovery","injury_affected","other_abnormal"].map((value) => `<option value="${value}" ${feedback.metadata.health_tag === value ? "selected" : ""}>${titleCase(value)}</option>`).join("")}</select></label><label>Use in fitness trend<select name="include_in_model"><option value="auto" ${feedback.metadata.include_in_model === null ? "selected" : ""}>Decide automatically</option><option value="true" ${feedback.metadata.include_in_model === true ? "selected" : ""}>Use</option><option value="false" ${feedback.metadata.include_in_model === false ? "selected" : ""}>Do not use</option></select></label>${postalField}<label class="notes-label">Notes<textarea name="notes" rows="2">${escapeHtml(feedback.metadata.notes)}</textarea></label><button type="submit">Save changes</button><span id="metadata-status"></span></form></details>
       ${renderAdjustment(run.fitness_observation, run.workout_type)}
       ${renderWorkoutAnalysis(feedback.workout_analysis)}
       <div class="metric-grid">
@@ -157,6 +190,21 @@ export async function renderRunDetail(activityId) {
       ${cadenceCard(feedback.cadence)}
       <article class="wide-card"><p class="eyebrow">Splits from your track data</p><h2>Mile splits</h2><div class="table-scroll"><table><thead><tr><th>Mile</th><th>Distance</th><th>Pace</th><th>HR</th><th>Cadence</th><th>Stride</th><th>Elevation</th></tr></thead><tbody>${splits || '<tr><td colspan="7">No reliable splits.</td></tr>'}</tbody></table></div></article>
     </section>`;
+  // Start after mounting: a plan completed during analysis loading must not be
+  // replaced by an earlier stale saved-plan response. Never run the planner.
+  refreshSavedNextRun().catch(()=>{});
+  // The dedicated feedback form owns effort; unrelated metadata edits must not
+  // copy an imported value into a permanent manual override.
+  view.querySelector("#effort-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const value = new FormData(event.currentTarget).get("effort");
+    const status = view.querySelector("#effort-status");
+    status.textContent = "Saving…";
+    try {
+      await api(`/api/runs/${activityId}/metadata`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ perceived_exertion: value === "" ? null : Number(value) }) });
+      await renderRunDetail(activityId);
+    } catch (error) { status.textContent = error.message; }
+  });
   view.querySelector("#metadata-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const values = new FormData(event.currentTarget);
@@ -164,7 +212,6 @@ export async function renderRunDetail(activityId) {
     const inclusion = values.get("include_in_model");
     const payload = {
       workout_type: values.get("workout_type"), health_tag: values.get("health_tag"),
-      perceived_exertion: values.get("perceived_exertion") ? Number(values.get("perceived_exertion")) : null,
       include_in_model: inclusion === "auto" ? null : inclusion === "true", notes: values.get("notes"),
     };
     if (values.has("postal_code")) payload.postal_code = String(values.get("postal_code") || "").trim() || null;

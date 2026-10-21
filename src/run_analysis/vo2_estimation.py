@@ -154,6 +154,38 @@ def _propagated_sigma(evaluate, inputs: dict[str, float], sigmas: dict[str, floa
     return math.sqrt(total)
 
 
+def reserve_fitness_level(pace_min_mile: float, uncertainty_95_min_mile: float, config: dict) -> dict:
+    """Stable level-scale prototype using the existing primary equation only.
+
+    No equation-pooling weights can move this point estimate as measurement
+    uncertainty changes. This is a VO2-equivalent performance scale, not an
+    independently validated maximal oxygen uptake measurement. It deliberately
+    leaves the existing public VO2 estimator and its historical series intact.
+    """
+    try:
+        pace=float(pace_min_mile);uncertainty=float(uncertainty_95_min_mile)
+        maximum=float(config['max_hr']);resting=float(config['resting_hr']);target=float(config['target_hr'])
+    except (TypeError,ValueError,KeyError):
+        return dict(available=False,reason='Pace and maximum, resting and comparison HR are required.')
+    if not all(math.isfinite(v) for v in (pace,uncertainty,maximum,resting,target)) or pace<=0 or uncertainty<0 or maximum<=resting:
+        return dict(available=False,reason='Valid pace and heart-rate settings are required.')
+    fraction=(target-resting)/(maximum-resting)
+    if not MINIMUM_RESERVE_FRACTION<=fraction<=MAXIMUM_RESERVE_FRACTION:
+        return dict(available=False,reason='Comparison HR is outside the submaximal equation’s supported reserve range.')
+    if _speed_m_min(pace)<ACSM_RUNNING_FLOOR_M_MIN:
+        return dict(available=False,reason='Current pace is outside the running equation’s supported range; adjusted pace remains available.')
+    def evaluate(values):
+        cost=acsm_running_vo2(_speed_m_min(values['pace']))+values['equation']
+        return vo2_max_from_reserve(cost,target,resting,values['maximum_hr'])
+    inputs=dict(pace=pace,maximum_hr=maximum,equation=0.)
+    max_sigma=MAX_HR_SD_BPM.get(str((config.get('profile') or {}).get('max_hr_source') or 'estimated').casefold(),MAX_HR_SD_BPM['estimated'])
+    sigma=_propagated_sigma(evaluate,inputs,dict(pace=uncertainty/1.96,maximum_hr=max_sigma,equation=ACSM_SEE_ML_KG_MIN))
+    value=evaluate(inputs)
+    return dict(available=True,value=value,estimated_range_95=[max(0.,value-1.96*sigma),value+1.96*sigma],
+        adjusted_pace_min_mile=pace,method='ACSM running cost + heart-rate-reserve extrapolation',
+        units='VO2-equivalent',laboratory_measurement=False)
+
+
 def _sentence_list(items: list[str]) -> str:
     if len(items) <= 1:
         return "".join(items)
@@ -390,7 +422,7 @@ def estimate_local_vo2(
     )
     contributors = []
     if pace_sigma:
-        contributors.append("your standardized pace's own uncertainty")
+        contributors.append("your comparable pace's own uncertainty")
     contributors.append(
         "a measured maximum heart rate" if max_hr_source == "measured"
         else "an unmeasured maximum heart rate, which is the largest single contributor"
@@ -401,7 +433,7 @@ def estimate_local_vo2(
         value_ml_kg_min=round(value, 1),
         uncertainty_95_ml_kg_min=round(uncertainty_95, 1),
         method=(
-            "ACSM running equation at your standardized pace, extrapolated to maximum by "
+            "ACSM running equation at your comparable aerobic pace, extrapolated to maximum by "
             "heart-rate reserve (Swain & Leutholtz), cross-checked against George et al."
         ),
         confidence=confidence,
@@ -415,6 +447,7 @@ def estimate_local_vo2(
             + "."
         ),
         limitations=[
+            "Recorded aerobic pace is sampled near the comparison HR, not normalized to exactly that HR; conditions and sampled HR differences can bias this estimate.",
             "This is a unit conversion of your pace-at-heart-rate evidence, not a second "
             "opinion about it; it moves with that trend by construction.",
             "The heart-rate-reserve extrapolation assumes a linear oxygen-uptake/heart-rate "

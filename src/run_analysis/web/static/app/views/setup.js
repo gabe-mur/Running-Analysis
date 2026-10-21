@@ -2,35 +2,24 @@
 // the few questions whose answers every other number depends on, shows what
 // each answer does before it is saved, and says plainly when it is guessing.
 //
-// One form, one save. Saving step by step meant a half-configured state was
-// reachable and the on-screen values could fall behind what was stored, so
-// everything is reviewed together and written in a single request.
+// One form, one save action. Calibration is written together; planner
+// preferences use their separate ledger transaction with explicit partial-
+// failure reporting. Nothing is confirmed before its save succeeds.
 
 import { api, primeSettings } from "../api.js";
 import { view, loading } from "../dom.js";
 import { escapeHtml } from "../format.js";
+import { plannerSetupSection, readPlannerPreferences } from "../planner-settings.js";
+import { saveSetupSettings } from "../setup-save.js";
+import { ageFromBirthDate, baselineInstructions } from '../setup-baseline.js';
+import { setupDeviceCard } from '../setup-device.js';
+import { trainingBackgroundFields, bindTrainingBackground, readTrainingBackground } from '../training-background.js';
+import { ZONE_NAMES, MANUAL_METHODS, profileFields, heartRateFields, bindZoneSteppers, bindHeartRateSource, syncZoneEditStatus } from '../setup-fields.js';
+import { bindRacePreparation, racePreparationFields, readRacePreparation } from '../race-settings.js';
 
-const ZONE_METHODS = [
-  ["device", "Copy from my watch", "What your watch already shows mid-run. Best option if you have it — two sets of zones means two answers to the same question."],
-  ["heart_rate_reserve", "Calculate from max and resting", "Karvonen. Uses both numbers, so a low resting pulse moves your easy zone where it belongs."],
-  ["percent_max", "Calculate from max only", "Percent of maximum. Cruder, but it needs one number instead of two."],
-  ["custom", "Enter my own", "From a lab test, a field test, or a coach."],
-];
-
-const GOALS = [
-  ["general_fitness", "General fitness"],
-  ["5k", "5K"],
-  ["10k", "10K"],
-  ["half_marathon", "Half marathon"],
-  ["marathon", "Marathon"],
-];
-
-const ZONE_NAMES = ["z1", "z2", "z3", "z4", "z5"];
-const MANUAL_METHODS = ["device", "custom"];
-
-//: Every step this page covers. Saving reviews all of them at once, so they
-//: are confirmed together rather than one at a time.
-const COVERED_STEPS = ["heart_rate", "zones", "comparison_hr", "goal", "weather"];
+// Calibration steps are confirmed together. Progression is confirmed only
+// after the adaptive preferences transaction has succeeded.
+const COVERED_STEPS = ["profile", "heart_rate", "zones", "goal", "weather"];
 
 function stepRow(step) {
   const state = step.complete ? "done" : step.blocking ? "blocked" : "todo";
@@ -58,91 +47,62 @@ export async function renderSetup() {
     max_hr_source: settings.profile?.max_hr_source ?? "estimated",
     method: settings.setup?.zone_method ?? "device",
     zones: Object.fromEntries(ZONE_NAMES.map((name) => [name, { ...settings.zones[name] }])),
-    comparison_hr: settings.target_hr,
   };
 
-  // Nothing below can be answered well without data: the comparison heart rate
-  // is picked from where the athlete's own history has evidence, so with no
-  // runs the page would be asking questions it cannot help them answer.
-  const blocked = state.steps.find((step) => step.blocking && !step.complete);
+  const blocked = state.steps.find((step) => step.step === 'runs' && !step.complete);
+  const chooseHistory = blocked && !settings.training_background && !['profile', 'heart_rate', 'zones'].every(name =>
+    state.steps.some(step => step.step === name && step.complete));
   view.innerHTML = `
     <section class="page narrow setup-page">
       <div class="page-heading"><div>
         <p class="eyebrow">Setup</p>
-        <h1>${blocked ? "Add your runs first" : state.complete ? "You are set up" : "Two numbers decide everything else"}</h1>
+        <h1>${state.complete ? "You are set up" : "Set up your training"}</h1>
         <p>${blocked
-          ? "The app will not invent a beginner mileage target. Import existing history if you have it; otherwise complete the scheduled 10–30-minute conversational Zone 2 run or run/walk and upload it."
+          ? "Have recent runs? Import them first. If not, we’ll help you set up your heart-rate zones before your first baseline run."
           : state.complete
           ? "Every setting below has been confirmed rather than defaulted. Change any of them any time."
-          : "Your heart-rate zones decide what counts as easy, and your comparison heart rate is where every pace figure is measured. Until you confirm them, the app is using defaults that may not describe you."}</p>
+          : "Confirm your personal details, heart-rate zones and training preferences."}</p>
       </div></div>
 
-      ${blocked ? `<article class="wide-card setup-blocked">
-        <p class="eyebrow">First</p>
-        <h2>Measure a baseline instead of guessing one</h2>
-        <p>If you have recent history, drop <b>.tcx</b> or <b>.fit</b> files anywhere on this page, or use <b>Upload Runs</b> at the top right. Garmin Connect and Strava both export them.</p>
-        <p>If you have no history, complete the scheduled 10–30-minute conversational Zone 2 run or run/walk without chasing a prescribed distance. Stop for pain, fatigue, and/or elevated heart rate and end the run at a maximum of 30 minutes.</p>
-        <p class="chart-note">Long, hard, race, and health-affected runs are not reused as baseline sessions. Your comparison heart rate also waits for actual easy-running evidence.</p>
-      </article>` : ""}
+      ${setupDeviceCard()}
 
-      <article class="wide-card" id="setup-checklist">${checklistMarkup(state)}</article>
+      ${blocked ? `<article class="wide-card setup-block" id="setup-import">
+        <h2>Add your runs first</h2>
+        <p>Drop FIT, TCX or GPX activity files, or a Garmin ZIP, anywhere on this page, or choose <b>Upload Runs</b> at the top right.</p>
+        <p>Already connected Intervals.icu? Use the <b>Sync</b> button next to Upload Runs.</p>
+        ${chooseHistory ? '<button type="button" id="setup-no-history">I don’t have recorded runs</button>' : ''}
+      </article>` : ''}
 
-      <form id="setup-form">
+      <article class="wide-card" id="setup-checklist" ${chooseHistory ? 'hidden' : ''}>${checklistMarkup(state)}</article>
+
+      <form id="setup-form" ${chooseHistory ? 'hidden' : ''}>
+        ${settings.planner?.status !== 'adopted' && (blocked || settings.training_background || settings.beginner_start) ? trainingBackgroundFields(settings) : ''}
         <section class="wide-card setup-block">
           <p class="eyebrow">Step 1</p>
-          <h2>Maximum and resting heart rate</h2>
-          <p class="chart-note">Everything below is derived from these, so a wrong max quietly shifts every zone and the VO₂ estimate with it.</p>
-          <div class="setup-fields">
-            <label>Maximum heart rate<input type="number" name="max_hr" min="100" max="250" value="${draft.max_hr}" required></label>
-            <label>Resting heart rate<input type="number" name="resting_hr" min="25" max="120" value="${draft.resting_hr}" required></label>
-            <label>Where the max came from<select name="max_hr_source">
-              <option value="measured" ${draft.max_hr_source === "measured" ? "selected" : ""}>Measured in a hard effort</option>
-              <option value="estimated" ${draft.max_hr_source === "estimated" ? "selected" : ""}>Estimated from my age</option>
-            </select><small>Measured narrows the VO₂ range considerably. An age formula is right on average and wrong for individuals by about 7 bpm.</small></label>
-          </div>
+          <h2>About you</h2>
+          <p class="chart-note">Used for your fitness estimate and an age-based maximum HR estimate if needed.</p>
+          <div class="setup-fields">${profileFields(settings.profile)}</div>
         </section>
 
         <section class="wide-card setup-block">
           <p class="eyebrow">Step 2</p>
           <h2>Heart-rate zones</h2>
-          <div class="method-options">${ZONE_METHODS.map(([value, label, detail]) => `
-            <label class="method-option ${draft.method === value ? "chosen" : ""}" data-method="${value}">
-              <input type="radio" name="method" value="${value}" ${draft.method === value ? "checked" : ""}>
-              <b>${escapeHtml(label)}</b><small>${escapeHtml(detail)}</small>
-            </label>`).join("")}</div>
-          <div class="zone-inputs" id="zone-inputs" ${MANUAL_METHODS.includes(draft.method) ? "" : "hidden"}>
-            ${ZONE_NAMES.map((name) => `<label>${name.toUpperCase()}
-              <span class="zone-pair">
-                <input type="number" name="${name}_min" min="40" max="250" value="${draft.zones[name].minimum_bpm}">
-                <input type="number" name="${name}_max" min="40" max="250" value="${draft.zones[name].maximum_bpm}">
-              </span></label>`).join("")}
-          </div>
+          ${heartRateFields(settings, {method: draft.method})}
           <div id="zone-preview" class="zone-preview-slot"></div>
         </section>
 
         <section class="wide-card setup-block">
           <p class="eyebrow">Step 3</p>
-          <h2>Comparison heart rate</h2>
-          <p class="chart-note">Every "pace at X bpm" figure is measured here. Runs far from it have to be extrapolated, so the best choice is wherever your own history has the most evidence inside Z2.</p>
-          <div id="comparison-recommendation" class="chart-note">${blocked ? "Waiting on your first runs. Upload some and this will recommend a value from your own easy running." : "Reading your history"}</div>
-          <div class="setup-fields">
-            <label>Comparison heart rate<input type="number" name="target_hr" min="80" max="200" value="${draft.comparison_hr}" required></label>
-          </div>
-          <button type="button" id="use-recommended" disabled>Use recommended</button>
-        </section>
-
-        <section class="wide-card setup-block">
-          <p class="eyebrow">Step 4</p>
           <h2>What you are training for</h2>
-          <p class="chart-note">Changes what the plan prioritises. It never overrides a health or load guardrail.</p>
           <div class="setup-fields">
-            <label>Goal<select name="training_goal">${GOALS.map(([value, label]) => `<option value="${value}" ${settings.coaching.training_goal === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select>
-            <small>A race goal needs a date and a target pace, which are set on the Settings page.</small></label>
+            ${racePreparationFields(settings.race_preparation,settings.planner,{setup:true})}
           </div>
         </section>
 
+        ${plannerSetupSection(settings.planner, {step: 4})}
+
         <section class="wide-card setup-block">
-          <p class="eyebrow">Step 5</p>
+          <p class="eyebrow">Step ${settings.planner ? 5 : 4}</p>
           <h2>Weather and privacy</h2>
           <p class="chart-note">Heat and humidity change your pace at a given heart rate, so weather makes the comparison fairer. Only a date and a rounded, randomly offset location are ever sent — never your route.</p>
           <div class="setup-toggles">
@@ -157,8 +117,20 @@ export async function renderSetup() {
           <span class="form-status" id="setup-status"></span>
         </div>
       </form>
+      <div id="setup-baseline" ${chooseHistory ? 'hidden' : ''}>${baselineInstructions(state, settings)}</div>
     </section>`;
 
+  bindRacePreparation(view.querySelector('#setup-form'),api,{planner:settings.planner});
+  bindTrainingBackground(view.querySelector('#setup-form'));
+  view.querySelector('#setup-no-history')?.addEventListener('click', () => {
+    for (const id of ['setup-form', 'setup-checklist', 'setup-baseline']) {
+      view.querySelector(`#${id}`).hidden = false;
+    }
+    view.querySelector('#setup-import').hidden = true;
+    const birthDate = view.querySelector('[name="profile_birth_date"]');
+    birthDate.scrollIntoView({block: 'center'});
+    birthDate.focus({preventScroll: true});
+  });
   wire(draft, settings);
 }
 
@@ -166,12 +138,13 @@ function wire(draft, settings) {
   const form = view.querySelector("#setup-form");
   const el = (selector) => view.querySelector(selector);
   const field = (name) => form.elements[name];
+  const syncSteppers = bindZoneSteppers(form);
+  const hrSource = bindHeartRateSource(form, draft.method);
 
   function readDraft() {
     draft.max_hr = Number(field("max_hr").value);
     draft.resting_hr = Number(field("resting_hr").value);
     draft.max_hr_source = field("max_hr_source").value;
-    draft.comparison_hr = Number(field("target_hr").value);
     if (MANUAL_METHODS.includes(draft.method)) {
       for (const name of ZONE_NAMES) {
         draft.zones[name] = {
@@ -185,7 +158,7 @@ function wire(draft, settings) {
   // The preview is the feedback loop, so it runs on its own rather than
   // behind a button: a section whose only control is disabled reads as broken.
   let pending = null;
-  let sequence = 0;
+  let sequence = 0, watchRecorded = false;
   function schedulePreview() {
     clearTimeout(pending);
     pending = setTimeout(runPreview, 300);
@@ -202,53 +175,54 @@ function wire(draft, settings) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           method: draft.method,
-          max_hr: draft.max_hr,
-          resting_hr: draft.resting_hr,
+          ...(draft.method !== 'device' ? {max_hr: draft.max_hr, resting_hr: draft.resting_hr} : {}),
           ...(MANUAL_METHODS.includes(draft.method) ? { boundaries: draft.zones } : {}),
         }),
       });
       // A slower earlier request must not overwrite a newer answer.
-      if (ticket !== sequence) return;
+      if (ticket !== sequence) return false;
       draft.zones = preview.zones;
       renderPreview(preview);
+      return true;
     } catch (error) {
       if (ticket !== sequence) return;
       slot.innerHTML = `<p class="chart-note error-text">${escapeHtml(error.message)}</p>`;
+      return false;
     }
   }
 
   function renderPreview(preview) {
-    const rows = ZONE_NAMES.map((name) => {
+    hrSource.imported(preview);
+    readDraft();
+    watchRecorded = Boolean(preview.watch_recorded_at);
+    for (const name of ZONE_NAMES) {
       const zone = preview.zones[name];
-      return `<tr class="${name === "z2" ? "zone-highlight" : ""}"><td>${name.toUpperCase()}</td><td>${zone.minimum_bpm}–${zone.maximum_bpm} bpm</td></tr>`;
-    }).join("");
-    const recommendation = preview.comparison_hr;
-    el("#zone-preview").innerHTML = `<div class="zone-preview">
-      <table class="zone-table"><tbody>${rows}</tbody></table>
-      <div class="zone-effect">
-        <p class="eyebrow">What these zones do to your comparison heart rate</p>
-        <p><strong>${recommendation.recommended_bpm ?? "—"}${recommendation.recommended_bpm ? " bpm" : ""}</strong></p>
-        <p class="chart-note">${escapeHtml(recommendation.rationale)}</p>
-      </div>
-    </div>`;
-    updateRecommendation(recommendation);
+      el(`[data-zone="${name}"] [data-zone-current]`).textContent = `${zone.minimum_bpm}–${zone.maximum_bpm} bpm`;
+      if (!MANUAL_METHODS.includes(draft.method) || watchRecorded) {
+        field(`${name}_min`).value = zone.minimum_bpm;
+        field(`${name}_max`).value = zone.maximum_bpm;
+      }
+    }
+    syncZoneInputs();
+    el("#zone-preview").innerHTML = '';
   }
 
-  let recommended = null;
-  function updateRecommendation(recommendation) {
-    recommended = recommendation.recommended_bpm ?? null;
-    const target = el("#comparison-recommendation");
-    if (target) target.textContent = recommendation.rationale;
-    const button = el("#use-recommended");
-    if (button) button.disabled = !recommended;
+  function syncZoneInputs() {
+    for (const name of ZONE_NAMES) {
+      field(`${name}_min`).readOnly = field(`${name}_max`).readOnly = !MANUAL_METHODS.includes(draft.method)
+        || (draft.method === 'device' && watchRecorded);
+    }
+    syncSteppers();
+    syncZoneEditStatus(form, draft.method);
   }
 
   view.querySelectorAll('input[name="method"]').forEach((input) =>
     input.addEventListener("change", () => {
       draft.method = input.value;
+      hrSource.sync(draft.method);
       view.querySelectorAll(".method-option").forEach((option) =>
         option.classList.toggle("chosen", option.dataset.method === draft.method));
-      el("#zone-inputs").hidden = !MANUAL_METHODS.includes(draft.method);
+      syncZoneInputs();
       runPreview();
     }),
   );
@@ -257,8 +231,29 @@ function wire(draft, settings) {
     field(name).addEventListener("input", schedulePreview));
   el("#zone-inputs").addEventListener("input", schedulePreview);
 
-  el("#use-recommended").addEventListener("click", () => {
-    if (recommended) field("target_hr").value = recommended;
+  el('#estimate-max-hr').addEventListener('click', async () => {
+    const status = el('#max-hr-estimate-status');
+    const age = ageFromBirthDate(field('profile_birth_date').value);
+    if (age === null) {
+      status.textContent = 'Enter a valid birth date above first.';
+      return;
+    }
+    const button = el('#estimate-max-hr');
+    button.disabled = true;
+    const birthDate = field('profile_birth_date').value;
+    const method = draft.method;
+    try {
+      const estimate = await api(`/api/setup/max-hr?age_years=${age}`);
+      if (field('profile_birth_date').value !== birthDate || draft.method !== method) return;
+      field('max_hr').value = estimate.estimated_max_hr;
+      field('max_hr_source').value = 'estimated';
+      status.textContent = 'Age estimate—not a measured maximum.';
+      await runPreview();
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
   });
 
   form.addEventListener("submit", async (event) => {
@@ -270,33 +265,47 @@ function wire(draft, settings) {
     status.className = "form-status";
     button.disabled = true;
     try {
-      // One request. Partial saves were how the page could end up showing a
-      // comparison heart rate that no longer matched the stored zones.
-      const updated = await api("/api/settings", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      // Resolve the current inputs before saving; a pending older preview must
+      // not let new HR values be saved with stale calculated zones.
+      clearTimeout(pending);
+      if (!await runPreview()) throw new Error('Check your heart-rate zones before saving.');
+      if (ageFromBirthDate(field('profile_birth_date').value) === null) throw new Error('Enter a valid birth date.');
+      // Calibration still saves together; adaptive preferences use their own
+      // ledger transaction. A failed second save is explicitly reported.
+      const preferences = settings.planner?.status === 'adopted' ? readPlannerPreferences(form,settings.planner,{setup:true}) : null;
+      const background = readTrainingBackground(form);
+      const updated = await saveSetupSettings(settings, {
+          ...(background !== undefined ? {training_background:background, beginner_start:background===null} : {}),
           max_hr: draft.max_hr,
           resting_hr: draft.resting_hr,
-          target_hr: draft.comparison_hr,
           zones: draft.zones,
-          profile: settings.profile
-            ? { ...settings.profile, max_hr_source: draft.max_hr_source }
-            : undefined,
-          coaching: { ...settings.coaching, training_goal: field("training_goal").value },
+          profile: {
+            birth_date: field('profile_birth_date').value,
+            sex: field('profile_sex').value,
+            weight_lb: Number(field('profile_weight_lb').value),
+            height_in: Number(field('profile_height_in').value),
+            max_hr_source: draft.max_hr_source,
+          },
+          race_preparation: readRacePreparation(form),
           historical_weather_enabled: field("historical_weather_enabled").checked,
           forecast_weather_enabled: field("forecast_weather_enabled").checked,
           weather_privacy_radius_km: Number(field("weather_privacy_radius_km").value),
-          setup: { confirmed_steps: COVERED_STEPS, zone_method: draft.method },
-        }),
-      });
+          setup: { confirmed_steps: COVERED_STEPS, zone_method: draft.method, comparison_hr_mode: 'automatic' },
+      }, preferences, api, {applyTrainingGoal: true});
+      Object.assign(settings, updated);
       primeSettings(updated);
-      status.textContent = updated.recalculation.length ? "Saved, and your runs were re-analysed." : "Saved.";
+      status.textContent = updated.recalculation.some(step => step.status === 'failed')
+        ? 'Settings saved; some analysis needs attention.'
+        : updated.recalculation.some(step => step.name === 'goal_activation' && step.status === 'deferred')
+        ? 'Saved. Add your runs next; apply your training goal once a starting plan is available.'
+        : 'Setup saved.';
+      if (updated.planner?.preferences_pending) status.textContent += " Running preferences apply on the next plan update.";
       status.className = "form-status ok";
       // Refresh only the checklist. Re-rendering the whole page under someone
       // who just pressed Save throws away their scroll position for nothing.
       const refreshed = await api("/api/setup");
       el("#setup-checklist").innerHTML = checklistMarkup(refreshed);
+      el('#setup-baseline').innerHTML = baselineInstructions(refreshed, settings);
     } catch (error) {
       status.textContent = error.message;
       status.className = "form-status error-text";
@@ -305,5 +314,6 @@ function wire(draft, settings) {
     }
   });
 
+  syncZoneInputs();
   runPreview();
 }

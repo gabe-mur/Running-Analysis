@@ -51,7 +51,7 @@ def sync_overrides(connection: sqlite3.Connection, path: str | Path) -> int:
                     _boolean(row["illness"]),
                     row["notes"].strip() or None,
                     row.get("health_tag", "").strip() or ("illness" if _boolean(row["illness"]) else "normal"),
-                    int(row["perceived_exertion"]) if row.get("perceived_exertion", "").strip() else None,
+                    float(row["perceived_exertion"]) if row.get("perceived_exertion", "").strip() else None,
                 ),
             )
             count += 1

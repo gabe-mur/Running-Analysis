@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from contextlib import contextmanager
+from contextvars import ContextVar
 from math import atan2, cos, degrees, radians, sin
 from typing import Any
 import json
@@ -19,6 +21,50 @@ from .processing import _load_points
 from .weather import interpolate_hourly, wind_components
 
 METERS_PER_MILE = 1609.344
+
+# Owned by one comparison build, not a process-wide cache of mutable tracks.
+# All three window passes read the same prepared intervals without modifying
+# them. The scope is discarded even when normalization fails.
+_PREPARATION = ContextVar('model_window_preparation', default=None)
+
+
+@contextmanager
+def window_preparation_scope(connection, config):
+    current = _PREPARATION.get()
+    if current is not None and current[0] is connection and current[1] is config:
+        yield
+        return
+    token = _PREPARATION.set((connection, config, {}))
+    try:
+        yield
+    finally:
+        _PREPARATION.reset(token)
+
+
+def _activity_window_inputs(connection, activity, config, check_elevation):
+    scope = _PREPARATION.get()
+    # Autocommit reads can see another writer between passes. Reuse only in a
+    # pinned transaction, and never across writes made by this connection.
+    cache = (scope[2] if scope is not None and scope[0] is connection
+             and scope[1] is config and connection.in_transaction else None)
+    from .elevation_quality import tile_signature
+    settings=json.dumps((config.get('moving_time'),config.get('elevation')),sort_keys=True)
+    key = (int(activity['id']), activity['creator'], check_elevation, connection.total_changes,
+           settings, tile_signature(connection,config) if check_elevation else ())
+    if cache is not None and key in cache:
+        return cache[key]
+    points = _load_points(connection, int(activity['id']))
+    movement = classify_movement(points, config['moving_time'])
+    quality = None
+    if check_elevation:
+        from .elevation_quality import prepare_terrain, tile_directory
+        quality = prepare_terrain(points, movement.intervals, config, activity['creator'], tile_directory(connection, config))
+    else:
+        attach_elevation_deltas(points, movement.intervals, float(config['elevation']['smoothing_window_meters']))
+    result = movement, quality, _hourly_for_activity(connection, int(activity['id']))
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def _hourly_for_activity(connection: sqlite3.Connection, activity_id: int) -> dict:
@@ -259,8 +305,7 @@ class _WindowAccumulator:
             return None, "missing_window_time"
         moment = start + (end - start) / 2
         weather = interpolate_hourly(hourly, moment)
-        if weather["temperature_f"] is None:
-            return None, "missing_window_weather"
+        # Weather is context, not a prerequisite for observed aerobic pace.
         bearing = None
         if self.bearing_distance >= float(config["segmentation"]["minimum_bearing_distance_meters"]):
             bearing = (degrees(atan2(self.bearing_x, self.bearing_y)) + 360.0) % 360.0
@@ -428,16 +473,17 @@ def load_model_window_sets(
     connection: sqlite3.Connection,
     config: dict,
     window_seconds: tuple[int, ...],
+    *, check_elevation: bool = False,
 ) -> tuple[dict[int, list[dict[str, Any]]], dict[int, dict[str, int]]]:
     activities = connection.execute(
         """
-        SELECT a.id,a.activity_id,a.start_time_utc,m.previous_7d_miles,m.previous_28d_miles,
+        SELECT a.id,a.activity_id,a.creator,a.start_time_utc,m.previous_7d_miles,m.previous_28d_miles,
                m.days_since_previous_run,m.days_since_previous_hard_run,
                m.moving_pace_min_mile AS run_moving_pace,m.moving_average_hr_bpm,
                COALESCE(o.health_tag,'normal') AS health_tag,aw.weather_quality,
                COALESCE(o.workout_type,m.detected_workout_type,'unknown') AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
-        JOIN activity_weather aw ON aw.activity_id=a.id
+        LEFT JOIN activity_weather aw ON aw.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
         LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
@@ -448,16 +494,14 @@ def load_model_window_sets(
     results = {seconds: [] for seconds in window_seconds}
     diagnostics = {seconds: {} for seconds in window_seconds}
     for activity in activities:
-        points = _load_points(connection, int(activity["id"]))
-        movement = classify_movement(points, config["moving_time"])
-        attach_elevation_deltas(
-            points, movement.intervals, float(config["elevation"]["smoothing_window_meters"])
-        )
-        hourly = _hourly_for_activity(connection, int(activity["id"]))
+        movement, quality, hourly = _activity_window_inputs(connection, activity, config, check_elevation)
         for seconds in window_seconds:
             rows, counters = _windows_for_intervals(
                 movement.intervals, activity, hourly, seconds, config
             )
+            if quality is not None:
+                for row in rows:
+                    row['terrain_quality'] = quality
             results[seconds].extend(rows)
             target = diagnostics[seconds]
             for name, count in counters.items():
@@ -475,18 +519,22 @@ def load_overlapping_model_windows(
     *,
     window_seconds: int,
     stride_seconds: int,
+    check_elevation: bool = False,
+    hr_response: bool = False,
+    settled_context: bool = False,
+    response_calibration: dict | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Load overlapping windows for the primary run-level prediction."""
 
     activities = connection.execute(
         """
-        SELECT a.id,a.activity_id,a.start_time_utc,m.previous_7d_miles,m.previous_28d_miles,
+        SELECT a.id,a.activity_id,a.creator,a.start_time_utc,m.previous_7d_miles,m.previous_28d_miles,
                m.days_since_previous_run,m.days_since_previous_hard_run,
                m.moving_pace_min_mile AS run_moving_pace,m.moving_average_hr_bpm,
                COALESCE(o.health_tag,'normal') AS health_tag,aw.weather_quality,
                COALESCE(o.workout_type,m.detected_workout_type,'unknown') AS workout_type
         FROM activities a JOIN activity_metrics m ON m.activity_id=a.id
-        JOIN activity_weather aw ON aw.activity_id=a.id
+        LEFT JOIN activity_weather aw ON aw.activity_id=a.id
         LEFT JOIN run_overrides o ON o.activity_id=a.activity_id
         LEFT JOIN activity_plan_matches ap ON ap.activity_id=a.id
         LEFT JOIN planned_workout_history ph ON ph.id=ap.planned_workout_id
@@ -497,19 +545,40 @@ def load_overlapping_model_windows(
     rows: list[dict[str, Any]] = []
     diagnostics: dict[str, int] = {}
     for activity in activities:
-        points = _load_points(connection, int(activity["id"]))
-        movement = classify_movement(points, config["moving_time"])
-        attach_elevation_deltas(
-            points, movement.intervals, float(config["elevation"]["smoothing_window_meters"])
-        )
+        movement, quality, hourly = _activity_window_inputs(connection, activity, config, check_elevation)
         activity_rows, counters = _overlapping_windows_for_intervals(
             movement.intervals,
             activity,
-            _hourly_for_activity(connection, int(activity["id"])),
+            hourly,
             window_seconds,
             stride_seconds,
             config,
         )
+        # Descriptive continuity for the performance prototype, not a new gate
+        # or fatigue correction. Reuse the movement already extracted here.
+        restarts = [offset/60 for offset in _pause_restarts(movement.intervals, config)]
+        continuity = dict(long_stop_count=len(restarts), restart_moving_minutes=restarts,
+            minimum_stop_seconds=float(config['model'].get('post_pause_minimum_stop_seconds', DEFAULT_POST_PAUSE_MINIMUM_STOP_SECONDS)),
+            existing_suppression_seconds=float(config['model'].get('post_pause_suppression_moving_seconds', DEFAULT_POST_PAUSE_SUPPRESSION_MOVING_SECONDS)))
+        for row in activity_rows:
+            row['comparison_continuity'] = continuity
+        if hr_response:
+            from .hr_response_alignment import context_for_windows
+            context_for_windows(movement.intervals, activity_rows, config)
+        if settled_context:
+            from .settled_effort import annotate_settled_context
+            annotate_settled_context(movement.intervals, activity_rows, config)
+        if response_calibration is not None and activity_rows and movement.intervals:
+            from .aerobic_response_evidence import blocks_from_intervals
+            blocks, coverage = blocks_from_intervals(movement.intervals, config, response_calibration,
+                hourly=hourly, terrain_quality=quality, block_seconds=10.)
+            context = dict(blocks=blocks, coverage=coverage,
+                origin_epoch=movement.intervals[0].start.timestamp_utc.timestamp())
+            for row in activity_rows:
+                row['_aerobic_response'] = context
+        if quality is not None:
+            for row in activity_rows:
+                row['terrain_quality'] = quality
         rows.extend(activity_rows)
         for key, value in counters.items():
             diagnostics[key] = diagnostics.get(key, 0) + value

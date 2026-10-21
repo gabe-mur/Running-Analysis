@@ -16,7 +16,7 @@ from .workload import update_workloads
 from .training_load import calculate_session_load
 from .workout_detection import detect_structured_workout
 
-PROCESSOR_VERSION = "phase3-v11-prescription-is-not-execution"
+PROCESSOR_VERSION = "phase3-v12-recorded-progression-and-hill-work"
 
 
 @dataclass(slots=True)
@@ -163,6 +163,14 @@ def _eligibility(
     override: sqlite3.Row | dict[str, object] | None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
+    # GPX may be a hike/ride or lack any sport metadata. Do not let this new
+    # import path silently feed unidentified activities into running fitness.
+    # Explicit user inclusion can still resolve the contextual ambiguity.
+    if 'data_quality_json' in row.keys():
+        source_quality = json.loads(row['data_quality_json'] or '{}')
+        if ('gpx_distance_derived_from_coordinates' in source_quality.get('parse_warnings', [])
+                and row['sport'] != 'Running'):
+            reasons.append('gpx_activity_type_not_running')
     thresholds = config["model"]
     total_points = len(points)
     gps_coverage = sum(point.gps_valid for point in points) / total_points if total_points else 0.0
@@ -314,11 +322,22 @@ def _insert_segments(connection: sqlite3.Connection, activity_id: int, segments:
 
 
 def process_activities(
-    connection: sqlite3.Connection, config: dict, force: bool = False
+    connection: sqlite3.Connection, config: dict, force: bool = False, *,
+    activity_ids: tuple[int, ...] | None = None,
 ) -> ProcessingSummary:
+    """Process all activities, or explicitly scoped internal IDs for a repair.
+
+    Targeted repairs must not reset unrelated fitted performance observations.
+    Normal upload processing retains its existing all-activity behavior.
+    """
+    if activity_ids is not None and any(type(i) is not int or i <= 0 for i in activity_ids):
+        raise ValueError('Positive internal activity IDs required')
     initialize(connection)
     fingerprint = _fingerprint(config)
     activities = connection.execute("SELECT * FROM activities ORDER BY start_time_utc_epoch, id").fetchall()
+    if activity_ids is not None:
+        selected_ids=set(activity_ids)
+        activities=[row for row in activities if row['id'] in selected_ids]
     summary = ProcessingSummary(discovered_activities=len(activities))
     for row in activities:
         override = connection.execute(

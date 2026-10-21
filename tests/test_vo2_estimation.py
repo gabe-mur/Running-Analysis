@@ -9,6 +9,7 @@ from run_analysis.vo2_estimation import (
     estimate_local_vo2,
     george_vo2_max,
     vo2_max_from_reserve,
+    reserve_fitness_level,
 )
 from run_analysis.web.schemas import (
     ConfidenceLevel,
@@ -72,6 +73,37 @@ def test_reserve_extrapolation_inverts_the_percent_hrr_identity() -> None:
         submaximal_vo2=30.0, submaximal_hr=122.5, resting_hr=55, maximum_hr=190
     )
     assert submaximal == pytest.approx(3.5 + (30.0 - 3.5) * 2, abs=0.01)
+
+
+def test_fitness_level_reuses_primary_equation_and_rises_with_faster_adjusted_pace():
+    level=reserve_fitness_level(10.,.4,_config())
+    assert level['value']==pytest.approx(vo2_max_from_reserve(acsm_running_vo2(160.9344),145,55,190))
+    assert reserve_fitness_level(9.5,.4,_config())['value']>level['value']
+    assert level['units']=='VO2-equivalent'
+    assert level['laboratory_measurement'] is False
+
+
+def test_fitness_level_precision_does_not_move_point_or_shrink_shared_error_to_zero():
+    tight=reserve_fitness_level(10.,0.,_config())
+    wide=reserve_fitness_level(10.,1.,_config())
+    assert wide['value']==tight['value']
+    assert wide['estimated_range_95'][0]<tight['estimated_range_95'][0]<tight['value']
+    assert wide['estimated_range_95'][1]>tight['estimated_range_95'][1]>tight['value']
+    measured=reserve_fitness_level(10.,0.,_config(profile={'max_hr_source':'measured'}))
+    assert measured['value']==tight['value']
+    assert measured['estimated_range_95'][1]<tight['estimated_range_95'][1]
+
+
+@pytest.mark.parametrize('pace,uncertainty,config',[
+    (13.,.4,_config()),(0.,.4,_config()),(10.,-.1,_config()),
+    (float('nan'),.4,_config()),(10.,.4,{}),(10.,.4,_config(target_hr=190)),
+])
+def test_fitness_level_does_not_extrapolate_unsupported_inputs(pace,uncertainty,config):
+    assert reserve_fitness_level(pace,uncertainty,config)['available'] is False
+
+
+def test_fitness_level_does_not_depend_on_legacy_equation_blend_demographics():
+    assert reserve_fitness_level(10.,.4,_config(profile={}))==reserve_fitness_level(10.,.4,_config())
 
 
 def test_estimate_pools_two_agreeing_equations() -> None:

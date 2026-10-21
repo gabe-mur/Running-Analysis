@@ -28,14 +28,28 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import gzip
 import io
+import math
 
 from .activity_assembly import finish_activity
 from .cadence import FIT_ONE_SIDED_CADENCE_SOURCE
-from .models import Activity, Lap, ParsedTCX, Trackpoint
+from .models import Activity, ActivitySensorStream, RRBatch, Lap, ParsedTCX, Trackpoint
 
 #: FIT timestamps are seconds since 1989-12-31T00:00:00Z. Some files carry
 #: already-converted datetimes, which is why this is applied conditionally.
 FIT_EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
+
+PERFORMANCE_RECORD_FIELDS = frozenset(('power', 'vertical_oscillation', 'stance_time',
+    'stance_time_percent', 'step_length', 'vertical_ratio', 'respiration_rate'))
+PERFORMANCE_SESSION_FIELDS = frozenset(('avg_power', 'max_power', 'normalized_power', 'total_work',
+    'avg_vertical_oscillation', 'avg_stance_time', 'avg_stance_time_percent', 'avg_step_length',
+    'avg_vertical_ratio', 'avg_respiration_rate', 'min_respiration_rate', 'max_respiration_rate'))
+
+
+def _performance_fields(frame, allowed):
+    """Retain decoder units and values without deriving a fitness interpretation."""
+    return {f.name: dict(value=f.value, units=f.units) for f in frame.fields
+            if f.name in allowed and isinstance(f.value, (float,int))
+            and not isinstance(f.value,bool) and math.isfinite(f.value)}
 
 #: Semicircles to degrees: the field is a signed 32-bit fraction of a turn.
 SEMICIRCLE_TO_DEGREES = 180.0 / (2**31)
@@ -173,30 +187,71 @@ def parse_fit(path: str | Path, default_timezone: str = "America/New_York") -> P
     session: dict = {}
     file_id: dict = {}
     device: dict = {}
+    sensor_stream = ActivitySensorStream()
+    preceding_record = None
+    pending_batches: list[RRBatch] = []
+    message_index = 0
+    zone_reports: list[dict] = []
+    session_count = 0
 
     with fitdecode.FitReader(_open(source_path)) as reader:
         for frame in reader:
             if frame.frame_type != fitdecode.FIT_FRAME_DATA:
                 continue
+            message_index += 1
             values = {f.name: f.value for f in frame.fields}
             if frame.name == "record":
+                at = _as_datetime(values.get("timestamp"))
+                if at is not None:
+                    for batch in pending_batches:
+                        batch.following_record_utc = at
+                    pending_batches.clear()
+                    preceding_record = at
                 trackpoints.append(_record_to_trackpoint(values, len(laps), len(trackpoints)))
+                extra = _performance_fields(frame, PERFORMANCE_RECORD_FIELDS)
+                if at is not None and extra:
+                    sensor_stream.performance_records.append(dict(timestamp_utc=at, fields=extra))
+            elif frame.name == "hrv":
+                raw = values.get("time", ())
+                raw = raw if isinstance(raw, (tuple, list)) else (raw,)
+                batch = RRBatch(message_index, tuple(raw), preceding_record)
+                sensor_stream.rr_batches.append(batch)
+                pending_batches.append(batch)
             elif frame.name == "lap":
                 laps.append(_lap(values, len(laps)))
             elif frame.name == "session":
+                session_count += 1
                 session = values
+                sensor_stream.session_fields = {k: values.get(k) for k in (
+                    "workout_rpe", "workout_feel", "total_training_effect",
+                    "total_anaerobic_training_effect", "total_timer_time")}
+                sensor_stream.performance_session_fields = _performance_fields(frame, PERFORMANCE_SESSION_FIELDS)
+            elif frame.name == "time_in_zone" and values.get('reference_mesg') == 'session':
+                # This is the activity's recorded zone configuration, not the
+                # time-in-zone totals or its highest observed heart rate.
+                zone_reports.append({k: values.get(k) for k in (
+                    'reference_index', 'hr_zone_high_boundary', 'hr_calc_type',
+                    'max_heart_rate', 'resting_heart_rate', 'threshold_heart_rate')})
             elif frame.name == "file_id":
                 file_id = values
-            elif frame.name == "device_info" and values.get("manufacturer") and not device:
-                device = values
+            elif frame.name == "device_info":
+                if values.get("manufacturer") and not device:
+                    device = values
+                sensor_stream.devices.append({k: values.get(k) for k in (
+                    "device_index", "timestamp", "manufacturer", "garmin_product",
+                    "antplus_device_type", "source_type", "software_version")})
             elif frame.name == "event" and values.get("event") == "timer":
                 stamp = _as_datetime(values.get("timestamp"))
                 event_type = str(values.get("event_type") or "")
                 if stamp and event_type in {"start", "stop", "stop_all", "stop_disable", "stop_disable_all"}:
                     events.append(TimerEvent(stamp, stopped=event_type != "start"))
+                    sensor_stream.timer_events.append(dict(timestamp=stamp, event_type=event_type))
 
     if not trackpoints:
         warnings.append("fit_no_record_messages")
+    from .watch_zones import extract_watch_hr
+    sensor_stream.watch_hr = extract_watch_hr(zone_reports,
+        sport=session.get('sport'), session_count=session_count)
     recorded = _apply_timer_pauses(trackpoints, timer_pauses(events))
     if recorded:
         warnings.append("stopped_time_from_recorded_timer_events")
@@ -210,6 +265,7 @@ def parse_fit(path: str | Path, default_timezone: str = "America/New_York") -> P
         laps=laps or _synthetic_lap(session, trackpoints),
         trackpoints=trackpoints,
         parse_warnings=warnings,
+        sensor_stream=sensor_stream,
     )
     finish_activity(activity, default_timezone)
     return ParsedTCX([activity], [], sorted(set(warnings)), "binary/fit")

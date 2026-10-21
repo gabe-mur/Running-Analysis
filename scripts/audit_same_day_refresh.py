@@ -42,6 +42,15 @@ def _shape(schedule: WeeklyScheduleResponse) -> str:
 def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--single-clock",
+        help="Audit one local HH:MM decision time instead of the full sweep.",
+    )
+    parser.add_argument(
+        "--show-diagnostics",
+        action="store_true",
+        help="Print compact optimizer winner and stability evidence.",
+    )
     args = parser.parse_args()
     root = args.project_root.resolve()
     config = load_config(root / "config.yaml")
@@ -172,7 +181,11 @@ def main() -> None:
             "Frozen day-0 weather; unchanged history, targets, future-day "
             "states, and prior warm start. Only today's feasible time set changes."
         )
-        for clock_hour, clock_minute in ((1, 0), (7, 30), (11, 45), (12, 5), (17, 48)):
+        sweep_clocks = ((1, 0), (7, 30), (11, 45), (12, 5), (17, 48))
+        if args.single_clock:
+            parsed_clock = time.fromisoformat(args.single_clock)
+            sweep_clocks = ((parsed_clock.hour, parsed_clock.minute),)
+        for clock_hour, clock_minute in sweep_clocks:
             clock = datetime.combine(
                 day,
                 time(clock_hour, clock_minute),
@@ -207,6 +220,34 @@ def main() -> None:
                 f"{clock.strftime('%H:%M')} slots {feasible}: {_shape(schedule)}",
                 flush=True,
             )
+            if args.show_diagnostics and schedule.planner_diagnostics:
+                diagnostics = schedule.planner_diagnostics
+                print(
+                    json.dumps(
+                        {
+                            "unconstrained": (
+                                diagnostics.unconstrained_winning_candidate.model_dump()
+                                if diagnostics.unconstrained_winning_candidate
+                                else None
+                            ),
+                            "stable": (
+                                diagnostics.near_term_stable_candidate.model_dump()
+                                if diagnostics.near_term_stable_candidate
+                                else None
+                            ),
+                            "selected": (
+                                diagnostics.winning_candidate.model_dump()
+                                if diagnostics.winning_candidate
+                                else None
+                            ),
+                            "stability_applied": (
+                                diagnostics.stability_tie_break_applied
+                            ),
+                        },
+                        default=str,
+                    ),
+                    flush=True,
+                )
     finally:
         connection.close()
 

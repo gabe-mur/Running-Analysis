@@ -247,6 +247,23 @@ def acute_to_prior_weekly_ratio(sessions: Iterable[TrainingSession], as_of: date
     return acute_value / prior_week if prior_week > 0 else None
 
 
+def _daily_distance_windows(daily: dict[date, float], start: date, end: date):
+    """Exact 7/28-day sums in O(days + 35 * populated days).
+
+    Collect contributions in the original dictionary order and use built-in
+    sum, preserving its compensated summation behavior on newer Python too.
+    """
+    count = max(0, (end - start).days + 1)
+    seven, twenty_eight = [[] for _ in range(count)], [[] for _ in range(count)]
+    for day, miles in daily.items():
+        offset = (day - start).days
+        for i in range(max(0, offset), min(count, offset + 7)):
+            seven[i].append(miles)
+        for i in range(max(0, offset), min(count, offset + 28)):
+            twenty_eight[i].append(miles)
+    return [sum(values) for values in seven], [sum(values) for values in twenty_eight]
+
+
 def distance_capacity(
     sessions: Iterable[TrainingSession],
     as_of: datetime,
@@ -279,13 +296,13 @@ def distance_capacity(
         day = item.start_time.astimezone(as_of.tzinfo).date()
         daily[day] = daily.get(day, 0.0) + item.distance_miles
     history_start = max(min(daily), end - timedelta(days=lookback_days - 1))
+    seven_windows, twenty_eight_windows = _daily_distance_windows(daily, history_start, end)
     last_completed_end = acute_start.astimezone(as_of.tzinfo).date()
     best_value = 0.0
     completed_windows: list[tuple[date, float]] = []
     candidate = history_start
     while candidate <= last_completed_end:
-        window_start = candidate - timedelta(days=27)
-        value = sum(miles for day, miles in daily.items() if window_start <= day <= candidate) / 4.0
+        value = twenty_eight_windows[(candidate - history_start).days] / 4.0
         completed_windows.append((candidate, value))
         # A rolling 28-day total often stays flat across adjacent dates. Keep
         # the latest equally strong endpoint so retention is measured from the
@@ -309,12 +326,7 @@ def distance_capacity(
     recent_confirmation = 0.0
     candidate = history_start
     while candidate <= end:
-        seven_start = candidate - timedelta(days=6)
-        seven = sum(
-            miles
-            for day, miles in daily.items()
-            if seven_start <= day <= candidate
-        )
+        seven = seven_windows[(candidate - history_start).days]
         confirmation = min(seven, best_value)
         age_days = max(0, (end - candidate).days)
         confirmation *= 0.5 ** (

@@ -78,7 +78,7 @@ def update_run_metadata(
         "workout_type": str(values["workout_type"] or ""),
         "illness": _text_bool(values["illness"]),
         "health_tag": str(values["health_tag"] or "normal"),
-        "perceived_exertion": str(values["perceived_exertion"] or ""),
+        "perceived_exertion": str(values["perceived_exertion"]) if values["perceived_exertion"] is not None else "",
         "notes": str(values["notes"] or ""),
     }
     # The default overrides file lives in the repository root. Protect the

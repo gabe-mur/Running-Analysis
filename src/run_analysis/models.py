@@ -7,6 +7,8 @@ from datetime import datetime
 
 from .cadence import cadence_spm
 
+SENSOR_EXTRACTION_VERSION = 3
+
 
 @dataclass(slots=True)
 class Trackpoint:
@@ -52,6 +54,31 @@ class Lap:
 
 
 @dataclass(slots=True)
+class RRBatch:
+    """Source-order FIT intervals in seconds, not timestamped/cleaned beats."""
+
+    message_index: int
+    intervals_seconds: tuple[float | None, ...]
+    preceding_record_utc: datetime | None = None
+    following_record_utc: datetime | None = None
+
+
+@dataclass(slots=True)
+class ActivitySensorStream:
+    extraction_version: int = SENSOR_EXTRACTION_VERSION
+    rr_batches: list[RRBatch] = field(default_factory=list)
+    devices: list[dict] = field(default_factory=list)
+    timer_events: list[dict] = field(default_factory=list)
+    session_fields: dict = field(default_factory=dict)
+    watch_hr: dict = field(default_factory=dict)
+    # Source measurements only. Not inputs to canonical fitness or planning.
+    performance_records: list[dict] = field(default_factory=list)
+    performance_session_fields: dict = field(default_factory=dict)
+    alignment_status: str = "source_anchors_only"
+    dfa_status: str = "deferred"
+
+
+@dataclass(slots=True)
 class Activity:
     activity_id: str | None
     sport: str
@@ -76,6 +103,7 @@ class Activity:
     cadence_quality: str = "cadence_missing"
     distance_source: str = "unknown"
     parse_warnings: list[str] = field(default_factory=list)
+    sensor_stream: ActivitySensorStream | None = None
 
 
 @dataclass(slots=True)
@@ -84,4 +112,3 @@ class ParsedTCX:
     namespaces: list[str]
     warnings: list[str]
     encoding: str
-
